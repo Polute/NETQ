@@ -454,7 +454,7 @@ def run_receiver(args):
                 struct.pack_into(TS_FORMAT, outbuf, 0, ts_recv_ns)
                 ts_ack_sent_ns = time.time_ns()
                 conn.sendall(outbuf)
-                last_sender_to_receiver = max(0, ts_recv_ns - ts_emit_ns)
+                last_sender_to_receiver = max(0, abs(ts_recv_ns - ts_emit_ns))
                 last_recv_to_ack = max(0, ts_ack_sent_ns - ts_recv_ns)
                 if i >= warmup:
                     sender_to_receiver_samples.append(last_sender_to_receiver)

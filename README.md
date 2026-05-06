@@ -125,3 +125,49 @@ Timing arrows mapping (fast sender output):
   |                      ts_recv_ns   |
   |                 ┌-----------------|  receiver_to_ack_send
   |<-------- total_receiver_view --------->|
+```
+
+Remote Proxmox VM through SSH jump host
+
+The examples below keep the ports visible and redact usernames, hosts, and IP
+addresses.
+
+Receiver on PC, sender on VM:
+
+First, open the reverse SSH tunnel from the PC:
+
+```bash
+ssh -J <jump-user>@<jump-host> -o Compression=no -R 7401:127.0.0.1:7401 <vm-user>@<vm-private-ip>
+```
+
+On the PC, run the receiver:
+
+```bash
+sudo python minimal_epr_fast.py receiver
+```
+
+On the VM, run the sender:
+
+```bash
+sudo python3 /home/<vm-user>/minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7401
+```
+
+Sender on PC, receiver on VM:
+
+First, open the local SSH tunnel from the PC:
+
+```bash
+ssh -J <jump-user>@<jump-host> -L 7402:127.0.0.1:7402 <vm-user>@<vm-private-ip>
+```
+
+On the PC, run the sender:
+
+```bash
+sudo python3 minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7402
+```
+
+On the VM, run the receiver:
+
+```bash
+sudo python3 minimal_epr_fast.py receiver --listen-host 127.0.0.1 --listen-port 7402
+```
