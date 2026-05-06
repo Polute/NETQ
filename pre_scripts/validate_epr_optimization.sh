@@ -7,7 +7,7 @@ SENDER="$PYTHON /home/giicc/NETQ/pre_scripts/minimal_epr_sender.py"
 RECEIVER="$PYTHON /home/giicc/NETQ/pre_scripts/minimal_epr_receiver.py"
 
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║   EPR Performance: Output Buffering Optimization Validation ║"
+echo "║  EPR Performance: Output Buffering Optimization Validation ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 

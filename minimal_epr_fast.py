@@ -11,22 +11,27 @@ TS_SIZE = struct.calcsize(TS_FORMAT)
 
 
 def parse_args():
+    """Parse CLI arguments for sender/receiver modes.
+
+    Returns:
+        argparse.Namespace: Parsed arguments for the selected role.
+    """
     parser = argparse.ArgumentParser(
         description="Fast4 unified: sender/receiver with persistent one-socket and low-jitter options."
     )
     subparsers = parser.add_subparsers(dest="role", required=True)
 
     sender = subparsers.add_parser("sender", help="Run in sender mode.")
-    sender.add_argument("--receiver-host", required=True)
-    sender.add_argument("--receiver-port", type=int, required=True)
+    sender.add_argument("--receiver-host", default="127.0.0.1")
+    sender.add_argument("--receiver-port", type=int, default=7401)
     sender.add_argument("--count", type=int, default=1000)
     sender.add_argument("--warmup", type=int, default=50)
     sender.add_argument("--connect-timeout", type=float, default=10.0)
     sender.add_argument("--detect-timeout", type=float, default=30.0)
     sender.add_argument("--detect-interval", type=float, default=0.05)
     sender.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
-    sender.add_argument("--rt-priority", type=int, default=None, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
-    sender.add_argument("--sock-buf", type=int, default=0, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
+    sender.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
+    sender.add_argument("--sock-buf", type=int, default=4096, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
     sender.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
     sender.add_argument("--show-arrows", action="store_true", help="Print per-arrow timing table at the end.")
     sender.add_argument("--werner-min", type=float, default=0.2)
@@ -40,8 +45,8 @@ def parse_args():
     receiver.add_argument("--warmup", type=int, default=50)
     receiver.add_argument("--accept-timeout", type=float, default=30.0)
     receiver.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
-    receiver.add_argument("--rt-priority", type=int, default=None, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
-    receiver.add_argument("--sock-buf", type=int, default=0, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
+    receiver.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
+    receiver.add_argument("--sock-buf", type=int, default=4096, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
     receiver.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
     receiver.add_argument("--werner-min", type=float, default=0.2)
     receiver.add_argument("--t1-ns", type=float, default=1_000_000.0)
@@ -52,6 +57,13 @@ def parse_args():
 
 
 def enable_low_latency_socket(sock, sock_buf=0, busy_poll_us=0):
+    """Apply low-latency socket options on an already-created socket.
+
+    Args:
+        sock (socket.socket): TCP socket to configure.
+        sock_buf (int): Buffer size for send/recv if > 0.
+        busy_poll_us (int): SO_BUSY_POLL microseconds if supported.
+    """
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
@@ -75,6 +87,12 @@ def enable_low_latency_socket(sock, sock_buf=0, busy_poll_us=0):
 
 
 def apply_cpu_rt(cpu=None, rt_priority=None):
+    """Pin process to a CPU and/or apply RT scheduling.
+
+    Args:
+        cpu (int | None): CPU index to pin, or None to skip.
+        rt_priority (int | None): SCHED_FIFO priority, or None to skip.
+    """
     if cpu is not None:
         os.sched_setaffinity(0, {int(cpu)})
     if rt_priority is not None:
@@ -83,6 +101,12 @@ def apply_cpu_rt(cpu=None, rt_priority=None):
 
 
 def recv_exact_into(sock, buf):
+    """Receive exactly len(buf) bytes into a preallocated buffer.
+
+    Args:
+        sock (socket.socket): TCP socket to read from.
+        buf (bytearray): Destination buffer.
+    """
     view = memoryview(buf)
     n = 0
     while n < len(buf):
@@ -93,6 +117,20 @@ def recv_exact_into(sock, buf):
 
 
 def connect_receiver_until_ready(host, port, connect_timeout, detect_timeout, detect_interval, sock_buf, busy_poll_us):
+    """Probe until a receiver is reachable, then return a connected socket.
+
+    Args:
+        host (str): Receiver host/IP.
+        port (int): Receiver port.
+        connect_timeout (float): Timeout per connect attempt (seconds).
+        detect_timeout (float): Total time to keep retrying (seconds).
+        detect_interval (float): Sleep between attempts (seconds).
+        sock_buf (int): Socket buffer size if > 0.
+        busy_poll_us (int): SO_BUSY_POLL microseconds if supported.
+
+    Returns:
+        socket.socket: Connected socket ready for send/recv.
+    """
     deadline = time.monotonic() + max(0.0, detect_timeout)
     last_error = None
     while time.monotonic() < deadline:
@@ -112,6 +150,12 @@ def connect_receiver_until_ready(host, port, connect_timeout, detect_timeout, de
 
 
 def percentile(sorted_vals, p):
+    """Return the nearest-rank percentile from a sorted list.
+
+    Args:
+        sorted_vals (list[float|int]): Sorted values.
+        p (float): Percentile in [0, 1].
+    """
     if not sorted_vals:
         return 0
     idx = int((len(sorted_vals) - 1) * p)
@@ -119,6 +163,12 @@ def percentile(sorted_vals, p):
 
 
 def percentile_inverse(sorted_vals, p):
+    """Return inverse percentile so higher values map to lower p.
+
+    Args:
+        sorted_vals (list[float|int]): Sorted values.
+        p (float): Percentile in [0, 1].
+    """
     if not sorted_vals:
         return 0
     idx = int((len(sorted_vals) - 1) * (1.0 - p))
@@ -126,6 +176,14 @@ def percentile_inverse(sorted_vals, p):
 
 
 def clamp_werner(value):
+    """Clamp Werner parameter to [0, 1] and reject NaN/inf.
+
+    Args:
+        value (float): Input value.
+
+    Returns:
+        float: Clamped value in [0, 1].
+    """
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -136,6 +194,16 @@ def clamp_werner(value):
 
 
 def werner_from_age_ns(age_ns, werner_min, t1_ns):
+    """Compute Werner parameter from EPR age and decay timescale.
+
+    Args:
+        age_ns (float): Age in nanoseconds.
+        werner_min (float): Minimum Werner floor.
+        t1_ns (float): Decay timescale in ns.
+
+    Returns:
+        float: Werner parameter in [0, 1].
+    """
     w_min = clamp_werner(werner_min)
     age_ns = max(0.0, float(age_ns))
     if t1_ns <= 0:
@@ -145,10 +213,24 @@ def werner_from_age_ns(age_ns, werner_min, t1_ns):
 
 
 def fmt_ns(v):
+    """Format nanoseconds as 'ns (s)'.
+
+    Args:
+        v (float|int): Value in nanoseconds.
+
+    Returns:
+        str: Formatted string.
+    """
     return f"{int(v)} ({int(v) / 1e9:.9f} s)"
 
 
 def print_sender_total_table(round_trip_ns, label):
+    """Print a total-only timing block for sender arrows.
+
+    Args:
+        round_trip_ns (int): Round-trip time in ns.
+        label (str): Label suffix for the block.
+    """
     print("")
     print(f"timing_arrows_{label}")
     print("segment                         ns")
@@ -156,6 +238,13 @@ def print_sender_total_table(round_trip_ns, label):
 
 
 def print_receiver_table(sender_to_receiver_ns, recv_to_ack_ns, label):
+    """Print receiver timing block with two segments and total.
+
+    Args:
+        sender_to_receiver_ns (int): Sender to receiver time in ns.
+        recv_to_ack_ns (int): Receiver processing/ack time in ns.
+        label (str): Label suffix for the block.
+    """
     total_view_ns = max(0, sender_to_receiver_ns + recv_to_ack_ns)
     print("")
     print(f"receiver_timing_{label}")
@@ -166,34 +255,55 @@ def print_receiver_table(sender_to_receiver_ns, recv_to_ack_ns, label):
 
 
 def print_receiver_group(label, sender_to_receiver_ns, recv_to_ack_ns, total_view_ns, werner):
+    """Print receiver group block for a given percentile bucket.
+
+    Args:
+        label (str): Group label (p50/p95/p99/min/max/last).
+        sender_to_receiver_ns (int): Sender to receiver time in ns.
+        recv_to_ack_ns (int): Receiver processing/ack time in ns.
+        total_view_ns (int): Sum of the two segments in ns.
+        werner (float): Werner parameter for the group.
+    """
     print("")
     print(f"receiver_{label}")
-    print("segment                         ns (s)")
-    print(f"sender_to_receiver              {fmt_ns(sender_to_receiver_ns)}")
-    print(f"receiver_to_ack_send            {fmt_ns(recv_to_ack_ns)}")
-    print(f"total_receiver_view             {fmt_ns(total_view_ns)}")
-    print(f"werner                           {werner:.6f}")
+    print("segment\t\t\t\t\t ns (s)")
+    print(f"sender_to_receiver\t\t\t{fmt_ns(sender_to_receiver_ns)}")
+    print(f"receiver_to_ack_send\t\t\t{fmt_ns(recv_to_ack_ns)}")
+    print(f"total_receiver_view\t\t\t{fmt_ns(total_view_ns)}")
+    print(f"werner\t\t\t\t\t{werner:.6f}")
     print("")
 
 
 def print_sender_group(label, round_trip_ns, emit_to_remote_ns, werner):
+    """Print sender group block for a given percentile bucket.
+
+    Args:
+        label (str): Group label (p50/p95/p99/min/max/last).
+        round_trip_ns (int): Round-trip time in ns.
+        emit_to_remote_ns (int): Sender to receiver time in ns.
+        werner (float): Werner parameter for the group.
+    """
     print("")
     print(f"sender_{label}")
-    print("segment                         ns (s)")
-    print(f"t_recv_ns                      {fmt_ns(emit_to_remote_ns)}")
-    print(f"total_round_trip_perf           {fmt_ns(round_trip_ns)}")
-    print(f"werner                           {werner:.6f}")
+    print("segment\t\t\t\t\t ns (s)")
+    print(f"t_recv_ns\t\t\t\t{fmt_ns(emit_to_remote_ns)}")
+    print(f"total_round_trip_perf\t\t\t{fmt_ns(round_trip_ns)}")
+    print(f"werner\t\t\t\t\t{werner:.6f}")
     print("")
 
 
 def run_sender(args):
+    """Run sender loop and print summarized timing/werner output.
+
+    Args:
+        args (argparse.Namespace): Parsed sender arguments.
+    """
     apply_cpu_rt(args.cpu, args.rt_priority)
     count = max(1, int(args.count))
     warmup = max(0, min(int(args.warmup), count - 1))
     rtt_perf_samples = []
     emit_to_remote_samples = []
     werner_samples = []
-    sample_tuples = []
     last_emit_to_remote = 0
     last_round_trip_perf = 0
     outbuf = bytearray(TS_SIZE)
@@ -212,33 +322,28 @@ def run_sender(args):
             ts_emit_ns = time.time_ns()
             struct.pack_into(TS_FORMAT, outbuf, 0, ts_emit_ns)
             t_rtt0 = time.perf_counter_ns()
-            t_send0 = time.perf_counter_ns()
             sock.sendall(outbuf)
-            send_call_ns = time.perf_counter_ns() - t_send0
             recv_exact_into(sock, inbuf)
             t_rtt1 = time.perf_counter_ns()
             ts_remote_update_ns = struct.unpack(TS_FORMAT, inbuf)[0]
             last_emit_to_remote = max(0, ts_remote_update_ns - ts_emit_ns)
             last_round_trip_perf = max(0, t_rtt1 - t_rtt0)
-            last_werner = werner_from_age_ns(last_emit_to_remote, args.werner_min, args.t1_ns)
             if i >= warmup:
                 rtt_perf_samples.append(last_round_trip_perf)
                 emit_to_remote_samples.append(last_emit_to_remote)
-                werner_samples.append(last_werner)
-                sample_tuples.append(
-                    (last_round_trip_perf, last_emit_to_remote, last_werner)
-                )
 
     rtt = sorted(rtt_perf_samples)
     e2r = sorted(emit_to_remote_samples)
+    werner_samples = [
+        werner_from_age_ns(age_ns, args.werner_min, args.t1_ns)
+        for age_ns in emit_to_remote_samples
+    ]
     w_sorted = sorted(werner_samples)
     local_werner = werner_from_age_ns(last_emit_to_remote, args.werner_min, args.t1_ns)
-    if sample_tuples:
-        min_s2r_sample = min(sample_tuples, key=lambda x: x[1])
-        max_werner_sample = max(sample_tuples, key=lambda x: x[2])
+    if w_sorted:
+        max_werner_sample = max(werner_samples)
     else:
-        min_s2r_sample = (0, 0, 0.0)
-        max_werner_sample = (0, 0, 0.0)
+        max_werner_sample = 0.0
 
     if args.quiet:
         print(f"exchanges={count}")
@@ -265,7 +370,7 @@ def run_sender(args):
             "min",
             min(rtt) if rtt else 0,
             min(e2r) if e2r else 0,
-            max_werner_sample[2],
+            max_werner_sample,
         )
         print_sender_group(
             "max",
@@ -274,7 +379,7 @@ def run_sender(args):
             min(w_sorted) if w_sorted else 0.0,
         )
         print_sender_group("last", last_round_trip_perf, last_emit_to_remote, local_werner)
-        print(f"sender_werner_max={max_werner_sample[2]:.6f}")
+        print(f"sender_werner_max={max_werner_sample:.6f}")
         # Timing arrows omitted to avoid redundant output with sender_* groups.
         return 0
 
@@ -302,7 +407,7 @@ def run_sender(args):
         "min",
         min(rtt) if rtt else 0,
         min(e2r) if e2r else 0,
-        max_werner_sample[2],
+        max_werner_sample,
     )
     print_sender_group(
         "max",
@@ -311,12 +416,17 @@ def run_sender(args):
         min(w_sorted) if w_sorted else 0.0,
     )
     print_sender_group("last", last_round_trip_perf, last_emit_to_remote, local_werner)
-    print(f"sender_werner_max={max_werner_sample[2]:.6f}")
+    print(f"sender_werner_max={max_werner_sample:.6f}")
     # Timing arrows omitted to avoid redundant output with sender_* groups.
     return 0
 
 
 def run_receiver(args):
+    """Run receiver loop and print summarized timing/werner output.
+
+    Args:
+        args (argparse.Namespace): Parsed receiver arguments.
+    """
     apply_cpu_rt(args.cpu, args.rt_priority)
     count = max(1, int(args.count))
     warmup = max(0, min(int(args.warmup), count - 1))
@@ -324,7 +434,6 @@ def run_receiver(args):
     total_view_samples = []
     sender_to_receiver_samples = []
     werner_samples = []
-    sample_tuples = []
     last_sender_to_receiver = 0
     inbuf = bytearray(TS_SIZE)
     outbuf = bytearray(TS_SIZE)
@@ -344,28 +453,27 @@ def run_receiver(args):
                 ts_recv_ns = time.time_ns()
                 struct.pack_into(TS_FORMAT, outbuf, 0, ts_recv_ns)
                 ts_ack_sent_ns = time.time_ns()
-                t0 = time.perf_counter_ns()
                 conn.sendall(outbuf)
-                _ack_send_ns = time.perf_counter_ns() - t0
                 last_sender_to_receiver = max(0, ts_recv_ns - ts_emit_ns)
                 last_recv_to_ack = max(0, ts_ack_sent_ns - ts_recv_ns)
-                last_werner = werner_from_age_ns(last_sender_to_receiver, args.werner_min, args.t1_ns)
                 if i >= warmup:
                     sender_to_receiver_samples.append(last_sender_to_receiver)
                     recv_to_ack_samples.append(last_recv_to_ack)
                     total_view_samples.append(last_sender_to_receiver + last_recv_to_ack)
-                    werner_samples.append(last_werner)
-                    sample_tuples.append((last_sender_to_receiver, last_recv_to_ack, last_werner))
 
     s2r = sorted(sender_to_receiver_samples)
     r2a = sorted(recv_to_ack_samples)
     total_view = sorted(total_view_samples)
+    werner_samples = [
+        werner_from_age_ns(age_ns, args.werner_min, args.t1_ns)
+        for age_ns in sender_to_receiver_samples
+    ]
     w_sorted = sorted(werner_samples)
     local_werner = werner_from_age_ns(last_sender_to_receiver, args.werner_min, args.t1_ns)
-    if sample_tuples:
-        max_werner_sample = max(sample_tuples, key=lambda x: x[2])
+    if w_sorted:
+        max_werner_sample = max(werner_samples)
     else:
-        max_werner_sample = (0, 0, 0.0)
+        max_werner_sample = 0.0
 
     last_total_view = max(0, last_sender_to_receiver + last_recv_to_ack)
     s2r_min = min(s2r) if s2r else 0
@@ -401,7 +509,7 @@ def run_receiver(args):
             s2r_min,
             r2a_min,
             total_view_min,
-            max_werner_sample[2],
+            max_werner_sample,
         )
         print_receiver_group(
             "max",
@@ -417,7 +525,7 @@ def run_receiver(args):
             last_total_view,
             local_werner,
         )
-        print(f"receiver_werner_max={max_werner_sample[2]:.6f}")
+        print(f"receiver_werner_max={max_werner_sample:.6f}")
         return 0
 
     print("receiver_mode=fast4")
@@ -448,7 +556,7 @@ def run_receiver(args):
         s2r_min,
         r2a_min,
         total_view_min,
-        max_werner_sample[2],
+        max_werner_sample,
     )
     print_receiver_group(
         "max",
@@ -464,11 +572,12 @@ def run_receiver(args):
         last_total_view,
         local_werner,
     )
-    print(f"receiver_werner_max={max_werner_sample[2]:.6f}")
+    print(f"receiver_werner_max={max_werner_sample:.6f}")
     return 0
 
 
 def main():
+    """Entrypoint for sender/receiver roles."""
     args = parse_args()
     if args.role == "sender":
         return run_sender(args)

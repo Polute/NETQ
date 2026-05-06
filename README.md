@@ -2,6 +2,42 @@ Fast unified (minimal_epr_fast.py)
 
 This repo concentrates the final fast EPR-over-TCP version focused on latency and consistent measurement. Earlier test scripts live in pre_scripts/ with their own README files for historical reference and comparisons.
 
+Arguments (summary of -h)
+
+Sender mode:
+
+- --receiver-host: Receiver host/IP to connect to.
+- --receiver-port: Receiver TCP port.
+- --count: Number of exchanges to run.
+- --warmup: Initial exchanges to ignore in stats.
+- --connect-timeout: Timeout per connect attempt (seconds).
+- --detect-timeout: Total time to keep probing for receiver (seconds).
+- --detect-interval: Delay between probe attempts (seconds).
+- --cpu: Pin this process to a CPU core.
+- --rt-priority: Set SCHED_FIFO priority (1-99). Needs sudo.
+- --sock-buf: Set SO_SNDBUF/SO_RCVBUF if > 0.
+- --busy-poll-us: Set SO_BUSY_POLL in microseconds if supported.
+- --show-arrows: Print timing arrows tables.
+- --werner-min: Minimum Werner floor.
+- --t1-ns: Werner decay timescale in ns.
+- --quiet: Reduce output to summary tables.
+
+Receiver mode:
+
+- --listen-host: Bind address for the receiver.
+- --listen-port: Bind port for the receiver.
+- --count: Number of exchanges to run.
+- --warmup: Initial exchanges to ignore in stats.
+- --accept-timeout: Time to wait for sender to connect (seconds).
+- --cpu: Pin this process to a CPU core.
+- --rt-priority: Set SCHED_FIFO priority (1-99). Needs sudo.
+- --sock-buf: Set SO_SNDBUF/SO_RCVBUF if > 0.
+- --busy-poll-us: Set SO_BUSY_POLL in microseconds if supported.
+- --werner-min: Minimum Werner floor.
+- --t1-ns: Werner decay timescale in ns.
+- --show-arrows: Print receiver timing table.
+- --quiet: Reduce output to summary tables.
+
 Receiver (with sudo for RT):
 
     sudo python minimal_epr_fast.py receiver \
@@ -36,6 +72,29 @@ Sender (with sudo for RT):
       --werner-min 0.2 \
       --t1-ns 1000000.0 \
       --quiet
+
+Best sweep results (mean p50 RTT from run_fast_sweep.sh):
+
+Defaults in minimal_epr_fast.py were chosen from the sweep results produced by run_fast_sweep.sh.
+
+- Best overall: count=1000, detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+- Best by count:
+  - count=1000: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+  - count=3000: detect_interval=0.05, busy_poll=0, rt_priority=50, sock_buf=0
+- Best by detect_interval:
+  - 0.01: detect_interval=0.01, busy_poll=25, rt_priority=50, sock_buf=0
+  - 0.05: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+  - 0.1: detect_interval=0.1, busy_poll=0, rt_priority=50, sock_buf=4096
+- Best by busy_poll:
+  - 0: detect_interval=0.05, busy_poll=0, rt_priority=50, sock_buf=0
+  - 25: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+  - 50: detect_interval=0.05, busy_poll=50, rt_priority=50, sock_buf=0
+- Best by rt_priority:
+  - 50: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+- Best by sock_buf:
+  - 0: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=0
+  - 4096: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
+  - 65536: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=65536
 
 Note
 
