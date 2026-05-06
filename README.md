@@ -1,5 +1,7 @@
 Fast unified (minimal_epr_fast.py)
 
+This repo concentrates the final fast EPR-over-TCP version focused on latency and consistent measurement. Earlier test scripts live in pre_scripts/ with their own README files for historical reference and comparisons.
+
 Receiver (with sudo for RT):
 
     sudo python minimal_epr_fast.py receiver \
