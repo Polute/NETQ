@@ -1,0 +1,60 @@
+{
+    "madrid_demo": {
+        "nodes": {
+            "Alice": {
+                "app_socket": [
+                    "localhost",
+                    9100
+                ],
+                "cqc_socket": [
+                    "localhost",
+                    9101
+                ],
+                "vnode_socket": [
+                    "localhost",
+                    9102
+                ]
+            },
+            "Bob": {
+                "app_socket": [
+                    "localhost",
+                    9110
+                ],
+                "cqc_socket": [
+                    "localhost",
+                    9111
+                ],
+                "vnode_socket": [
+                    "localhost",
+                    9112
+                ]
+            },
+            "Charlie": {
+                "app_socket": [
+                    "localhost",
+                    9120
+                ],
+                "cqc_socket": [
+                    "localhost",
+                    9121
+                ],
+                "vnode_socket": [
+                    "localhost",
+                    9122
+                ]
+            }
+        },
+        "topology": {
+            "Alice": [
+                "Charlie"
+            ],
+            "Bob": [
+                "Charlie"
+            ],
+            "Charlie": [
+                "Alice",
+                "Bob"
+            ]
+        }
+    }
+}

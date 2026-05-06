@@ -1,0 +1,33 @@
+{
+    "network_name": "madrid_demo",
+    "defaults": {
+        "host": "localhost"
+    },
+    "nodes": [
+        {
+            "name": "Alice",
+            "host": "localhost",
+            "base_port": 9100
+        },
+        {
+            "name": "Bob",
+            "host": "localhost",
+            "base_port": 9110
+        },
+        {
+            "name": "Charlie",
+            "host": "localhost",
+            "base_port": 9120
+        }
+    ],
+    "links": [
+        [
+            "Alice",
+            "Charlie"
+        ],
+        [
+            "Charlie",
+            "Bob"
+        ]
+    ]
+}
