@@ -1,0 +1,161 @@
+VM Ethernet Test Results
+
+Setup
+
+- PC/WSL side: 10.10.10.1
+- Ubuntu VM side: 10.10.10.2
+- Direct Ethernet cable through the Proxmox bridge.
+- Benchmark script: minimal_epr_fast.py
+
+Connection commands
+
+Receiver on VM, sender on PC:
+
+```bash
+sudo python3 minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7402
+sudo python3 minimal_epr_fast.py sender --receiver-host 10.10.10.2 --receiver-port 7402
+```
+
+Receiver on PC, sender on VM:
+
+```bash
+sudo python3 minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7401
+sudo python3 minimal_epr_fast.py sender --receiver-host 10.10.10.1 --receiver-port 7401
+```
+
+Initial issue: clock offset without effective NTP
+
+At first, the receiver reported sender_to_receiver delays around 4-5 seconds.
+This was not a real network delay. It happened because sender_to_receiver was
+computed from timestamps taken on two different machines:
+
+```text
+sender_to_receiver = receiver_time_ns - sender_time_ns
+```
+
+The PC/WSL clock and the Ubuntu VM clock were not synchronized. The VM was using
+NTP in configuration, but it was not actually receiving valid NTP packets:
+
+```text
+Packet count: 0
+System clock synchronized: no
+```
+
+Because of that, the benchmark interpreted the clock offset as if it were
+network latency. This also forced the Werner value down to the configured
+minimum in many runs.
+
+NTP correction
+
+Windows was configured as a local NTP server on the Ethernet link:
+
+```text
+10.10.10.1:123/udp
+```
+
+The VM was then configured to use 10.10.10.1 as its NTP server. After fixing
+this, the VM started receiving NTP packets:
+
+```text
+Server: 10.10.10.1
+Packet count: 26
+System clock synchronized: yes
+Offset: +196us
+Delay: 1.360ms
+Jitter: 8.205ms
+```
+
+Ethernet cable results after NTP
+
+After NTP started working, sender_to_receiver no longer showed multi-second
+delays. However, it still varied between runs, for example:
+
+```text
+sender_to_receiver p50 ~= 0.55 ms
+sender_to_receiver p50 ~= 3.72 ms
+sender_to_receiver p50 ~= 4.81 ms
+sender_to_receiver p50 ~= 10.75 ms
+sender_to_receiver p50 ~= 18-22 ms in some runs
+```
+
+These variations are still mostly caused by clock synchronization error and NTP
+jitter, not by the Ethernet cable itself. Windows Time plus systemd-timesyncd is
+good enough to remove the 4-5 second offset, but it is not precise enough for a
+reliable one-way latency measurement in the microsecond or low-millisecond
+range.
+
+More reliable latency measurement
+
+The sender-side round-trip measurement is more reliable because it uses one
+local monotonic clock:
+
+```text
+total_round_trip_perf p50 ~= 0.6-0.9 ms
+total_round_trip_perf p95 ~= 1.0-1.9 ms
+total_round_trip_perf p99 ~= 1.7-3.6 ms
+```
+
+This is the best current estimate of the real Ethernet benchmark behavior. A
+rough one-way estimate would be:
+
+```text
+one_way_estimate ~= total_round_trip_perf / 2
+```
+
+WSL-side observations
+
+Additional runs from the WSL side show the same pattern. When WSL runs the
+sender towards the VM receiver, the cross-machine timestamp field can stay in
+the 10-22 ms range:
+
+```text
+t_recv_ns p50 ~= 10.8-20.8 ms
+total_round_trip_perf p50 ~= 0.64-0.76 ms
+```
+
+When WSL runs the receiver and the VM sends to 10.10.10.1, the receiver-side
+cross-machine timestamp also stays in the 13-27 ms range in some runs:
+
+```text
+sender_to_receiver p50 ~= 13.0-27.2 ms
+```
+
+These WSL-side results reinforce the same conclusion: the Ethernet RTT is still
+around the sub-millisecond to low-millisecond range, while the one-way timestamp
+fields are dominated by remaining clock offset/jitter between WSL/Windows and
+the VM.
+
+Why Werner changes so much
+
+The default Werner decay timescale is very aggressive:
+
+```text
+t1_ns = 1,000,000 ns = 1 ms
+werner_min = 0.2
+```
+
+With this scale, small changes in the measured age strongly affect the Werner
+value:
+
+```text
+0.1 ms -> high Werner
+0.5 ms -> around 0.6-0.7
+1.0 ms -> around 0.5
+3-5 ms -> close to 0.2
+10+ ms -> minimum 0.2
+```
+
+Therefore, when sender_to_receiver is contaminated by clock offset or NTP jitter,
+the Werner value can jump from around 0.9 to the minimum 0.2 between runs.
+
+Conclusion
+
+- The direct Ethernet cable works.
+- The original 4-5 second delay was caused by unsynchronized clocks, not by the
+  network.
+- NTP through Windows fixed the large clock offset.
+- Remaining sender_to_receiver variations are caused mainly by clock jitter and
+  the limits of Windows Time/systemd-timesyncd synchronization.
+- For latency, prefer sender total_round_trip_perf.
+- For a stable Werner value, avoid basing it on cross-machine wall-clock
+  timestamps unless a more precise clock synchronization method is used.
