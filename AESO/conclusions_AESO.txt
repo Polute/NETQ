@@ -1,0 +1,16 @@
+=== Conclusions (AESO) ===
+
+- The core latency distribution is stable and tight across runs (p50 on the order of ~0.08-0.11 ms).
+- Tail latency is the main source of variability: p99 grows to ~0.19-0.20 ms, with rare spikes up to ~0.7 ms.
+- Both clients show similar distributions, which suggests the repeater is the dominant source of jitter rather than a single client.
+- Werner percentiles mirror the latency tail: lower Werner values align with higher delay samples.
+- CSV and plot artifacts consistently show localized spike windows rather than uniform random noise.
+
+=== Observed Issues / Notes ===
+
+- There is a recurrent spike window around count indices ~480-500 where delays jump in multiple runs.
+- The spike window is visible in the per-count plots and CSVs, indicating a systemic jitter source rather than outliers.
+- Spikes dominate the p99/max metrics even when medians remain stable.
+- Parallel send mode on the repeater increases jitter compared to sequential sends.
+
+Raw per-run outputs are intentionally omitted here. All run data is preserved in csv/ and plots/.
