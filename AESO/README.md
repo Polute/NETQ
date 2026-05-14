@@ -82,6 +82,54 @@ Examples:
     python plot_delay_hist.py --last
     python plot_delay_hist.py csv/delay_hist_client_1.csv
 
+Filtered/outlier plots:
+
+The normal plots keep every sample. To make the spike windows easier to inspect,
+the plotter can also write extra per-count PNGs:
+
+- plots/counter_filtered/ : delay vs count with slow samples removed from the view
+- plots/counter_outliers/ : delay vs count with all samples kept and slow samples highlighted
+
+Create only the extra filtered/outlier PNGs, leaving the existing normal plots untouched:
+
+    python plot_delay_hist.py --filtered-only --last
+
+With --filtered-only --last, a CSV is skipped when both extra PNGs already exist:
+
+    plots/counter_filtered/<csv_name>_seq_filtered.png
+    plots/counter_outliers/<csv_name>_seq_outliers.png
+
+Create normal plots plus the extra filtered/outlier PNGs:
+
+    python plot_delay_hist.py --filtered --last
+
+Create filtered/outlier PNGs for one CSV:
+
+    python plot_delay_hist.py --filtered-only csv/delay_hist_client_1_14.csv
+
+Use a manual delay threshold in microseconds:
+
+    python plot_delay_hist.py --filtered-only --filter-threshold-us 500
+
+Use a stricter or looser automatic MAD threshold:
+
+    python plot_delay_hist.py --filtered-only --mad-scale 12
+    python plot_delay_hist.py --filtered-only --mad-scale 6
+
+Run count variations:
+
+    sudo python minimal_epr_fast.py repeater --count 1000 --quiet
+    sudo python minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --repeater-id 0 --count 1000 --quiet --cpu 5 --plot
+    sudo python minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --repeater-id 0 --count 1000 --quiet --cpu 7 --plot
+
+    sudo python minimal_epr_fast.py repeater --count 500 --quiet
+    sudo python minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --repeater-id 0 --count 500 --quiet --cpu 5 --plot
+    sudo python minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --repeater-id 0 --count 500 --quiet --cpu 7 --plot
+
+    sudo python minimal_epr_fast.py repeater --count 400 --quiet
+    sudo python minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --repeater-id 0 --count 400 --quiet --cpu 5 --plot
+    sudo python minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --repeater-id 0 --count 400 --quiet --cpu 7 --plot
+
 Notes
 
 - The repeater sends: timestamp, peer id, 2 correction bits, and w_swap.
