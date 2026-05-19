@@ -1,16 +1,85 @@
 === Conclusions (AESO) ===
 
-- The core latency distribution is stable and tight across runs (p50 on the order of ~0.08-0.11 ms).
-- Tail latency is the main source of variability: p99 grows to ~0.19-0.20 ms, with rare spikes up to ~0.7 ms.
-- Both clients show similar distributions, which suggests the repeater is the dominant source of jitter rather than a single client.
-- Werner percentiles mirror the latency tail: lower Werner values align with higher delay samples.
-- CSV and plot artifacts consistently show localized spike windows rather than uniform random noise.
+Current interpretation:
 
-=== Observed Issues / Notes ===
+- The fast path is much tighter than the first notes suggested. In the recent
+  2000-count CSVs, the median delay is typically ~20-21 us for client 1 and
+  ~25-31 us for client 2.
+- The main instability is still tail latency, not the median. Raw p99 commonly
+  stays around ~90-205 us in the recent 2000-count runs, but occasional maxima
+  can still reach hundreds of us and, in one run, several ms.
+- The delay jumps are localized in count windows, not uniformly spread noise.
+  This points to runtime/OS scheduling pauses, kernel/network wakeup jitter, or
+  other host activity more than to the EPR swap calculation itself.
+- The wall-clock timestamp is taken on the repeater and received on the client.
+  If different machines are used, clock sync can affect the absolute delta.
+  However, the repeated count-window pattern looks more like process/scheduler
+  jitter than pure clock drift.
+- Both clients often show related tail behavior, but not always with the same
+  magnitude. The repeater remains a likely shared contributor, while per-client
+  wakeup/scheduling effects can also add delay.
 
-- There is a recurrent spike window around count indices ~480-500 where delays jump in multiple runs.
-- The spike window is visible in the per-count plots and CSVs, indicating a systemic jitter source rather than outliers.
-- Spikes dominate the p99/max metrics even when medians remain stable.
-- Parallel send mode on the repeater increases jitter compared to sequential sends.
+=== Count Comparison ===
 
-Raw per-run outputs are intentionally omitted here. All run data is preserved in csv/ and plots/.
+- 500-count runs are the weakest choice because they end around the recurrent
+  ~480-500 spike window.
+- 400-count runs can look very clean, especially after filtering, but they avoid
+  the later spike window and are less representative.
+- 1500-count runs are solid.
+- 2000-count runs are currently the best overall choice: low median, good raw
+  p99, and enough samples that isolated spikes are not over-weighted.
+
+Best practical baseline:
+
+    --count 2000
+
+=== Filtered Plots ===
+
+- Filtered plots are useful to see the core fast path without the tail dominating
+  the y-axis.
+- They should not replace the raw plots. Always compare the removed-sample count
+  printed by plot_delay_hist.py.
+- Some very tight runs get an aggressive automatic threshold with
+  median + 8*MAD, so filtered p99/max can look excellent while removing a large
+  fraction of samples. Treat those as "core path" plots, not full-run latency.
+- For the recent 2000-count runs, filtered p99 is often in the ~20-90 us range,
+  depending on how aggressive the automatic threshold is for that CSV.
+
+=== Runtime Changes / Run Labels ===
+
+- CSV suffixes before _26 were run without the PYTHONUNBUFFERED/PYTHONMALLOC
+  environment change and without the GC/preallocation changes.
+- CSV suffixes _26 through _32 were run with:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python ...
+
+  and with the first GC change, where GC was disabled before the client
+  connection helper and re-enabled after the run.
+- CSV suffixes _33 through _35 were run with the corrected GC scope, where GC is
+  disabled only around the critical send/receive loops and restored afterward.
+- The current code also preallocates client-side sample storage. During the
+  receive loop the client assigns into fixed-size lists instead of growing lists
+  with append().
+- CSV writing remains after the socket loop, so disk I/O is outside the measured
+  receive path.
+
+Expected effect of the runtime changes:
+
+- Less Python allocator/GC noise during the critical section.
+- No fix for OS scheduler, IRQ, TCP wakeup, CPU frequency, or cross-machine clock
+  effects.
+- Remaining spikes after these changes should be interpreted primarily as host
+  runtime/OS/network jitter unless a code-level timestamp issue is identified.
+
+=== Notes ===
+
+- Raw and filtered plots answer different questions:
+  raw = full observed latency including tails;
+  filtered = core fast path after removing slow samples from the view.
+- Werner percentiles mirror the delay tail because the Werner decay depends on
+  elapsed time. Delay spikes therefore also show up as lower Werner values.
+- Parallel send mode should still be treated cautiously; thread barriers and
+  sender-thread scheduling can add jitter compared with sequential sends.
+
+Raw per-run outputs are intentionally omitted here. All run data is preserved in
+csv/ and plots/.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import gc
 import math
 import os
 import ctypes
@@ -26,28 +27,30 @@ def parse_args():
     repeater.add_argument("--listen-port-a", type=int, default=7401)
     repeater.add_argument("--listen-host-b", default="0.0.0.0")
     repeater.add_argument("--listen-port-b", type=int, default=7402)
-    repeater.add_argument("--count", type=int, default=1000)
+    repeater.add_argument("--count", type=int, default=2000)
     repeater.add_argument("--accept-timeout", type=float, default=30.0)
     repeater.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
     repeater.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
-    repeater.add_argument("--sock-buf", type=int, default=4096, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
+    repeater.add_argument("--sock-buf", type=int, default=65536, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
     repeater.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
     repeater.add_argument("--repeater-id", type=int, default=0)
     repeater.add_argument("--client-a-id", type=int, default=1)
     repeater.add_argument("--client-b-id", type=int, default=2)
     repeater.add_argument("--werner-ar", type=float, default=None)
     repeater.add_argument("--werner-br", type=float, default=None)
-    repeater.add_argument("--t1-ns", type=float, default=1_000_000.0)
     repeater.add_argument("--parallel", action="store_true", help="Send to A/B in parallel threads.")
     repeater.add_argument("--cpu-a", type=int, default=2, help="Pin sender thread A to this CPU core.")
     repeater.add_argument("--cpu-b", type=int, default=3, help="Pin sender thread B to this CPU core.")
     repeater.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
     repeater.add_argument("--quiet", action="store_true")
+    repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
+    repeater.add_argument("--plot-prefix", default="repeater_send_hist", help="Prefix for repeater send timing CSV outputs.")
+    repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
 
     client = subparsers.add_parser("client", help="Run in client mode.")
     client.add_argument("--repeater-host", default="127.0.0.1")
     client.add_argument("--repeater-port", type=int, default=7401)
-    client.add_argument("--count", type=int, default=1000)
+    client.add_argument("--count", type=int, default=2000)
     client.add_argument("--warmup", type=int, default=50)
     client.add_argument("--connect-timeout", type=float, default=10.0)
     client.add_argument("--detect-timeout", type=float, default=30.0)
@@ -63,6 +66,8 @@ def parse_args():
     client.add_argument("--plot-prefix", default="delay_hist_client", help="Prefix for plot outputs.")
     client.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
     client.add_argument("--quiet", action="store_true")
+    client.add_argument("--t1-ns", type=float, default=1_000_000.0)
+    client.add_argument("--diag", action="store_true", help="Measure extra client loop/recv timing diagnostics.")
 
     return parser.parse_args()
 
@@ -141,22 +146,19 @@ def percentile_inverse(sorted_vals, p):
     return sorted_vals[idx]
 
 
-def clamp_werner(value):
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
+def stddev(vals, mean_value):
+    if not vals:
         return 0.0
-    if not math.isfinite(value):
-        return 0.0
-    return max(0.0, min(1.0, value))
+    return math.sqrt(sum((v - mean_value) ** 2 for v in vals) / len(vals))
 
 
 def decay_werner(base, age_ns, t1_ns):
     if t1_ns <= 0:
-        return clamp_werner(base)
-    age_ns = max(0.0, float(age_ns))
+        raise ValueError("t1_ns must be positive")
+    if age_ns < 0:
+        raise ValueError("age_ns cannot be negative")
     decayed = float(base) * math.exp(-age_ns / float(t1_ns))
-    return clamp_werner(decayed)
+    return decayed
 
 
 def set_thread_affinity(cpu):
@@ -195,6 +197,11 @@ def fmt_ts_emit(ts_ns):
     return f"{tm.tm_min:02d}:{tm.tm_sec:02d}.{ns_part:09d}"
 
 
+def fmt_state(state):
+    local_id, werner, peer_id = state
+    return f"({local_id},{werner:.6f},{peer_id})"
+
+
 def print_client_group(label, delta_ns, werner):
     print("")
     print(f"client_{label}")
@@ -215,7 +222,7 @@ def print_client_message_state(label, delta_ns, msg, state_out, count_idx=None):
             msg[0], fmt_ts_emit(msg[0]), msg[1], msg[2], msg[3]
         )
     )
-    print(f"state_out=({state_out[0]:.6f},{state_out[1]})")
+    print(f"state_out={fmt_state(state_out)}")
 
 
 def run_repeater(args):
@@ -225,19 +232,22 @@ def run_repeater(args):
         args.werner_ar = float(input("werner_ar: ").strip())
     if args.werner_br is None:
         args.werner_br = float(input("werner_br: ").strip())
-    w_ar_init = clamp_werner(args.werner_ar)
-    w_br_init = clamp_werner(args.werner_br)
-    state_ar = (w_ar_init, args.client_a_id)
-    state_br = (w_br_init, args.client_b_id)
+    w_ar_init = args.werner_ar
+    w_br_init = args.werner_br
+    state_ar = (args.repeater_id, w_ar_init, args.client_a_id)
+    state_br = (args.repeater_id, w_br_init, args.client_b_id)
     last_ar_ns = time.monotonic_ns()
     last_br_ns = time.monotonic_ns()
-    outbuf = bytearray(MSG_SIZE)
     outbuf_a = bytearray(MSG_SIZE)
     outbuf_b = bytearray(MSG_SIZE)
-    last_state_in_ar = (w_ar_init, args.client_a_id)
-    last_state_in_br = (w_br_init, args.client_b_id)
+    last_state_in_ar = state_ar
+    last_state_in_br = state_br
     last_msg_a = (0, 0, 0, 0.0)
     last_msg_b = (0, 0, 0, 0.0)
+    send_a_block_samples = [0] * count if args.diag else []
+    send_b_block_samples = [0] * count if args.diag else []
+    send_gap_ab_samples = [0] * count if args.diag else []
+    correction_bits_samples = [random.randrange(4) for _ in range(count)]
 
     def accept_one(host, port):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -254,74 +264,136 @@ def run_repeater(args):
     conn_a = accept_one(args.listen_host_a, args.listen_port_a)
     conn_b = accept_one(args.listen_host_b, args.listen_port_b)
 
-    def update_round_state(now_ns):
-        w_ar = decay_werner(w_ar_init, now_ns - last_ar_ns, args.t1_ns)
-        w_br = decay_werner(w_br_init, now_ns - last_br_ns, args.t1_ns)
-        state_ar_local = (w_ar, args.client_a_id)
-        state_br_local = (w_br, args.client_b_id)
+    def update_round_state(now_ns, correction_bits):
+        state_ar_local = (args.repeater_id, w_ar_init, args.client_a_id)
+        state_br_local = (args.repeater_id, w_br_init, args.client_b_id)
         ts_emit_ns_local = time.time_ns()
-        correction_bits_local = random.randint(0, 3)
-        w_swap_local = clamp_werner(state_ar_local[0] * state_br_local[0])
-        return state_ar_local, state_br_local, ts_emit_ns_local, correction_bits_local, w_swap_local
+        w_swap_local = 1
+        return state_ar_local, state_br_local, ts_emit_ns_local, correction_bits, w_swap_local
 
     if args.parallel:
         barrier_ready = threading.Barrier(3)
         barrier_done = threading.Barrier(3)
 
-        def sender_thread(conn, buffer_ref, cpu_pin):
+        def sender_thread(conn, buffer_ref, cpu_pin, send_block_samples):
             set_thread_affinity(cpu_pin)
-            for _ in range(count):
+            for idx in range(count):
                 barrier_ready.wait()
-                conn.sendall(buffer_ref)
+                if args.diag:
+                    pre_send_ns = time.monotonic_ns()
+                    conn.sendall(buffer_ref)
+                    send_block_samples[idx] = time.monotonic_ns() - pre_send_ns
+                else:
+                    conn.sendall(buffer_ref)
                 barrier_done.wait()
 
-        with conn_a, conn_b:
-            t_a = threading.Thread(target=sender_thread, args=(conn_a, outbuf_a, args.cpu_a), daemon=True)
-            t_b = threading.Thread(target=sender_thread, args=(conn_b, outbuf_b, args.cpu_b), daemon=True)
-            t_a.start()
-            t_b.start()
-            for _ in range(count):
-                now_ns = time.monotonic_ns()
-                state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(now_ns)
-                last_state_in_ar = state_ar
-                last_state_in_br = state_br
-                last_ar_ns = now_ns
-                last_br_ns = now_ns
-                struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
-                last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
-                barrier_ready.wait()
-                barrier_done.wait()
-                if args.count_interval > 0:
-                    time.sleep(args.count_interval)
-            t_a.join()
-            t_b.join()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with conn_a, conn_b:
+                t_a = threading.Thread(
+                    target=sender_thread,
+                    args=(conn_a, outbuf_a, args.cpu_a, send_a_block_samples),
+                    daemon=True,
+                )
+                t_b = threading.Thread(
+                    target=sender_thread,
+                    args=(conn_b, outbuf_b, args.cpu_b, send_b_block_samples),
+                    daemon=True,
+                )
+                t_a.start()
+                t_b.start()
+                for idx in range(count):
+                    now_ns = time.monotonic_ns()
+                    state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(
+                        now_ns, correction_bits_samples[idx]
+                    )
+                    last_state_in_ar = state_ar
+                    last_state_in_br = state_br
+                    last_ar_ns = now_ns
+                    last_br_ns = now_ns
+                    struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
+                    struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                    last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
+                    last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                    barrier_ready.wait()
+                    barrier_done.wait()
+                    if args.diag:
+                        send_gap_ab_samples[idx] = 0
+                    if args.count_interval > 0:
+                        time.sleep(args.count_interval)
+                t_a.join()
+                t_b.join()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
     else:
-        with conn_a, conn_b:
-            for _ in range(count):
-                now_ns = time.monotonic_ns()
-                state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(now_ns)
-                last_state_in_ar = state_ar
-                last_state_in_br = state_br
-                last_ar_ns = now_ns
-                last_br_ns = now_ns
-                struct.pack_into(MSG_FORMAT, outbuf, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                conn_a.sendall(outbuf)
-                last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                struct.pack_into(MSG_FORMAT, outbuf, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
-                conn_b.sendall(outbuf)
-                last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
-                if args.count_interval > 0:
-                    time.sleep(args.count_interval)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with conn_a, conn_b:
+                for idx in range(count):
+                    now_ns = time.monotonic_ns()
+                    state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(
+                        now_ns, correction_bits_samples[idx]
+                    )
+                    last_state_in_ar = state_ar
+                    last_state_in_br = state_br
+                    last_ar_ns = now_ns
+                    last_br_ns = now_ns
+                    struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
+                    if args.diag:
+                        pre_send_a_ns = time.monotonic_ns()
+                        conn_a.sendall(outbuf_a)
+                        post_send_a_ns = time.monotonic_ns()
+                        send_a_block_samples[idx] = post_send_a_ns - pre_send_a_ns
+                    else:
+                        conn_a.sendall(outbuf_a)
+                    last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
+                    struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                    if args.diag:
+                        pre_send_b_ns = time.monotonic_ns()
+                        send_gap_ab_samples[idx] = pre_send_b_ns - pre_send_a_ns
+                        conn_b.sendall(outbuf_b)
+                        send_b_block_samples[idx] = time.monotonic_ns() - pre_send_b_ns
+                    else:
+                        conn_b.sendall(outbuf_b)
+                    last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                    if args.count_interval > 0:
+                        time.sleep(args.count_interval)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    if args.plot:
+        os.makedirs("csv", exist_ok=True)
+        base = args.plot_prefix
+        suffix = ""
+        idx = 1
+        while os.path.exists(os.path.join("csv", f"{base}{suffix}.csv")):
+            idx += 1
+            suffix = f"_{idx}"
+        csv_path = os.path.join("csv", f"{base}{suffix}.csv")
+        with open(csv_path, "w", encoding="utf-8") as handle:
+            if args.diag:
+                handle.write("count_idx,send_a_block_ns,send_b_block_ns,send_gap_ab_ns\n")
+                for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns) in enumerate(
+                    zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples), start=1
+                ):
+                    handle.write(f"{count_idx},{send_a_ns},{send_b_ns},{send_gap_ab_ns}\n")
+            else:
+                handle.write("count_idx\n")
+                for count_idx in range(1, count + 1):
+                    handle.write(f"{count_idx}\n")
+        print(f"repeater_plot=data_saved ({csv_path})")
 
     if not args.quiet:
         print("repeater_mode=fast3")
         print(f"exchanges={count}")
         print(f"repeater_id={args.repeater_id}")
     print("")
-    print(f"state_ar_start=({w_ar_init:.6f},{args.client_a_id})")
-    print(f"state_br_start=({w_br_init:.6f},{args.client_b_id})")
+    print(f"state_ar_start={fmt_state((args.repeater_id, w_ar_init, args.client_a_id))}")
+    print(f"state_br_start={fmt_state((args.repeater_id, w_br_init, args.client_b_id))}")
     print("")
     print("repeater_last")
     print("msg_a=(ts_emit_ns={}, ts_emit={}, peer_id={}, bits={:02b}, w_swap={:.6f})".format(
@@ -331,11 +403,11 @@ def run_repeater(args):
         last_msg_b[0], fmt_ts_emit(last_msg_b[0]), last_msg_b[1], last_msg_b[2], last_msg_b[3]
     ))
     print("")
-    print(f"state_in_ar=({last_state_in_ar[0]:.6f},{last_state_in_ar[1]})")
-    print(f"state_in_br=({last_state_in_br[0]:.6f},{last_state_in_br[1]})")
+    print(f"state_in_ar={fmt_state(last_state_in_ar)}")
+    print(f"state_in_br={fmt_state(last_state_in_br)}")
     print("")
-    print("state_out_ar=(0.000000,None)")
-    print("state_out_br=(0.000000,None)")
+    print(f"state_out_ar={fmt_state((args.repeater_id, 0.0, None))}")
+    print(f"state_out_br={fmt_state((args.repeater_id, 0.0, None))}")
     return 0
 
 
@@ -343,15 +415,19 @@ def run_client(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
     count = max(1, int(args.count))
     warmup = max(0, min(int(args.warmup), count - 1))
-    delta_samples = []
-    werner_samples = []
-    sample_msgs = []
-    delta_records = []
+    sample_count = count - warmup
+    delta_samples = [0] * sample_count
+    werner_samples = [0.0] * sample_count
+    sample_msgs = [None] * sample_count
+    delta_record_counts = [0] * sample_count
+    loop_gap_samples = [0] * sample_count if args.diag else []
+    recv_block_samples = [0] * sample_count if args.diag else []
     last_delta = 0
     last_werner = 0.0
     last_msg = (0, 0, 0, 0.0)
-    last_state_out = (0.0, 0)
+    last_state_out = (args.client_id, 0.0, None)
     inbuf = bytearray(MSG_SIZE)
+    sample_idx = 0
 
     with connect_repeater_until_ready(
         args.repeater_host,
@@ -362,33 +438,64 @@ def run_client(args):
         args.sock_buf,
         args.busy_poll_us,
     ) as sock:
-        for i in range(count):
-            recv_exact_into(sock, inbuf)
-            ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
-            ts_recv_ns = time.time_ns()
-            w_swap = clamp_werner(w_swap)
-            peer_id = int(peer_id)
-            correction_bits = int(correction_bits)
-            last_msg = (ts_emit_ns, peer_id, correction_bits, w_swap)
-            last_state_out = (w_swap, peer_id)
-            last_delta = max(0, ts_recv_ns - ts_emit_ns)
-            last_werner = w_swap
-            if i >= warmup:
-                delta_samples.append(last_delta)
-                werner_samples.append(last_werner)
-                sample_msgs.append((last_delta, i + 1, last_msg, last_state_out))
-                delta_records.append((i + 1, last_delta))
-            if args.count_interval > 0:
-                time.sleep(args.count_interval)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            prev_loop_ns = time.monotonic_ns() if args.diag else 0
+            for i in range(count):
+                if args.diag:
+                    loop_now_ns = time.monotonic_ns()
+                    loop_gap_ns = loop_now_ns - prev_loop_ns
+                    prev_loop_ns = loop_now_ns
+                    pre_recv_ns = time.monotonic_ns()
+                    recv_exact_into(sock, inbuf)
+                    recv_block_ns = time.monotonic_ns() - pre_recv_ns
+                else:
+                    recv_exact_into(sock, inbuf)
+                ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
+                ts_recv_ns = time.time_ns()
+                w_swap = float(w_swap)
+                w_swap = decay_werner(float(w_swap), ts_recv_ns - ts_emit_ns, args.t1_ns)**2
+                peer_id = int(peer_id)
+                correction_bits = int(correction_bits)
+                last_msg = (ts_emit_ns, peer_id, correction_bits, w_swap)
+                last_state_out = (args.client_id, w_swap, peer_id)
+                last_delta = max(0, ts_recv_ns - ts_emit_ns)
+                last_werner = w_swap
+                if i >= warmup:
+                    delta_samples[sample_idx] = last_delta
+                    werner_samples[sample_idx] = last_werner
+                    sample_msgs[sample_idx] = (last_delta, i + 1, last_msg, last_state_out)
+                    delta_record_counts[sample_idx] = i + 1
+                    if args.diag:
+                        loop_gap_samples[sample_idx] = loop_gap_ns
+                        recv_block_samples[sample_idx] = recv_block_ns
+                    sample_idx += 1
+                if args.count_interval > 0:
+                    time.sleep(args.count_interval)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    delta_samples = delta_samples[:sample_idx]
+    werner_samples = werner_samples[:sample_idx]
+    sample_msgs = sample_msgs[:sample_idx]
+    delta_record_counts = delta_record_counts[:sample_idx]
+    if args.diag:
+        loop_gap_samples = loop_gap_samples[:sample_idx]
+        recv_block_samples = recv_block_samples[:sample_idx]
 
     delta_sorted = sorted(delta_samples)
     w_sorted = sorted(werner_samples)
-    mean_delay = int(sum(delta_samples) / len(delta_samples)) if delta_samples else 0
+    mean_delay_raw = sum(delta_samples) / len(delta_samples) if delta_samples else 0.0
+    mean_delay = int(mean_delay_raw)
     mean_werner = sum(werner_samples) / len(werner_samples) if werner_samples else 0.0
+    std_delay = stddev(delta_samples, mean_delay_raw)
+    std_werner = stddev(werner_samples, mean_werner)
 
     def pick_by_delta(samples, want_max=False):
         if not samples:
-            return (0, 0, (0, 0, 0, 0.0), (0.0, 0))
+            return (0, 0, (0, 0, 0, 0.0), (args.client_id, 0.0, None))
         return max(samples, key=lambda item: item[0]) if want_max else min(samples, key=lambda item: item[0])
 
     min_sample = pick_by_delta(sample_msgs, want_max=False)
@@ -404,20 +511,28 @@ def run_client(args):
             suffix = f"_{idx}"
         csv_path = os.path.join("csv", f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
-            handle.write("count_idx,delay_ns\n")
-            for count_idx, delay_ns in delta_records:
-                handle.write(f"{count_idx},{delay_ns}\n")
+            if args.diag:
+                handle.write("count_idx,delay_ns,loop_gap_ns,recv_block_ns\n")
+                for idx, delay_ns, loop_gap_ns, recv_block_ns in zip(
+                    delta_record_counts, delta_samples, loop_gap_samples, recv_block_samples
+                ):
+                    handle.write(f"{idx},{delay_ns},{loop_gap_ns},{recv_block_ns}\n")
+            else:
+                handle.write("count_idx,delay_ns\n")
+                for idx, delay_ns in zip(delta_record_counts, delta_samples):
+                    handle.write(f"{idx},{delay_ns}\n")
         print(f"plot=data_saved ({csv_path})")
 
     if args.quiet:
         print(f"exchanges={count}")
         print(f"warmup={warmup}")
-        print(f"state_in=({clamp_werner(args.werner_in):.6f},{args.repeater_id})")
+        print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
         print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50))
-        print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95))
         print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90))
+        print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95))
         print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99))
         print_client_group("mean", mean_delay, mean_werner)
+        print_client_group("std", std_delay, std_werner)
         print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1])
         print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1])
         print_client_message_state("last", last_delta, last_msg, last_state_out)
@@ -426,12 +541,13 @@ def run_client(args):
     print("client_mode=fast3")
     print(f"exchanges={count} warmup={warmup}")
     print(f"client_id={args.client_id} repeater_id={args.repeater_id}")
-    print(f"state_in=({clamp_werner(args.werner_in):.6f},{args.repeater_id})")
+    print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
     print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50))
     print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95))
     print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90))
     print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99))
     print_client_group("mean", mean_delay, mean_werner)
+    print_client_group("std", std_delay, std_werner)
     print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1])
     print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1])
     print_client_message_state("last", last_delta, last_msg, last_state_out)

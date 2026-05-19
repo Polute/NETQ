@@ -1,0 +1,110 @@
+=== AESO v2 Improvements ===
+
+Files
+
+- minimal_epr_fast_v2.py
+- plot_delay_hist_v2.py
+
+Why v2 exists
+
+v2 is intentionally separated from the current implementation so new protocol
+and measurement changes do not overwrite or mix with existing CSV/PNG results.
+
+Implemented changes
+
+- Explicit v2 protocol header:
+  The repeater sends a one-time CONFIG packet before the hot loop. It includes
+  protocol version, count, warmup, client id, peer id, flags, and t1_ns.
+
+- READY handshake:
+  Each client sends a READY packet after receiving CONFIG. The repeater starts
+  the data loop only after both clients are ready.
+
+- Explicit sequence number:
+  Each data message includes seq. CSVs store both seq and count_idx so runs can
+  be checked for ordering or alignment issues.
+
+- Per-socket timestamp:
+  The repeater now takes ts_emit_ns immediately before each socket sendall().
+  Client 1 and client 2 no longer share a single timestamp for the same round.
+
+- Separate output namespace:
+  v2 client CSVs are written under csv_v2/ by default.
+  v2 CSV names use the default prefix delay_hist_client_v2.
+  v2 plots are written under plots_v2/ by default.
+
+- Critical-loop GC control:
+  Python GC is disabled only around the critical send/receive loops and restored
+  afterward.
+
+- Preallocated client storage:
+  The client assigns samples into fixed-size lists during the receive loop
+  instead of growing lists with append().
+
+- CSV writing remains outside the measured receive loop.
+
+Current limitations
+
+- v2 intentionally rejects --parallel. The sequential sender gives cleaner timing
+  semantics for per-socket timestamps and avoids barrier/thread scheduling noise.
+- v2 does not remove OS scheduler, IRQ, TCP wakeup, CPU frequency, or clock-sync
+  effects.
+
+Run commands
+
+Repeater:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python minimal_epr_fast_v2.py repeater \
+      --count 2000 \
+      --warmup 50 \
+      --quiet
+
+Client 1:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python minimal_epr_fast_v2.py client \
+      --repeater-port 7401 \
+      --client-id 1 \
+      --repeater-id 0 \
+      --quiet \
+      --cpu 5 \
+      --plot
+
+Client 2:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python minimal_epr_fast_v2.py client \
+      --repeater-port 7402 \
+      --client-id 2 \
+      --repeater-id 0 \
+      --quiet \
+      --cpu 7 \
+      --plot
+
+Plot commands
+
+Plot all CSVs in csv_v2/ into plots_v2/:
+
+    python plot_delay_hist_v2.py --last
+
+Create only filtered/outlier plots for missing v2 PNGs:
+
+    python plot_delay_hist_v2.py --filtered-only --last
+
+Plot explicit CSVs, regardless of whether they are inside csv_v2/:
+
+    python plot_delay_hist_v2.py csv_v2/delay_hist_client_v2_1.csv
+    python plot_delay_hist_v2.py csv/delay_hist_client_1_38.csv
+
+Use a custom CSV input directory or plot output directory:
+
+    python plot_delay_hist_v2.py --csv-dir csv_v2 --plots-dir plots_v2 --last
+    python plot_delay_hist_v2.py --csv-dir csv --plots-dir plots_v2_legacy_check --last
+
+CSV schema
+
+v2 CSVs:
+
+    seq,count_idx,delay_ns
+
+Legacy CSVs are still accepted by plot_delay_hist_v2.py:
+
+    count_idx,delay_ns
