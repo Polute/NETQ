@@ -61,6 +61,85 @@ Client B (Bob):
 
 Note: use sudo if you enable --rt-priority or need privileged socket options.
 
+Remote run: repeater + one client on one node, second client on another machine
+
+Use this layout when only one remote machine is available:
+
+- local node: repeater + client 1
+- remote Ubuntu node: client 2
+- SSH reverse tunnel: remote 127.0.0.1:7402 forwards to local 127.0.0.1:7402
+
+Copy the same script version to the remote machine before running mixed-node
+tests:
+
+    scp -J pasarela@kr.ls.fi.upm.es /home/giicc/NETQ/AESO/minimal_epr_fast.py ubuntu22@192.168.0.223:/home/ubuntu22/AESO/minimal_epr_fast.py
+
+Open the SSH tunnel from the local machine:
+
+    ssh -J pasarela@kr.ls.fi.upm.es -o Compression=no -R 7402:127.0.0.1:7402 ubuntu22@192.168.0.223
+
+Terminal 1, local node, repeater:
+
+    cd /home/giicc/NETQ/AESO
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater --werner-ar 1 --werner-br 1 --quiet
+
+Terminal 2, local node, client 1:
+
+    cd /home/giicc/NETQ/AESO
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --quiet --cpu 5 --plot
+
+Terminal 3, remote Ubuntu node, client 2:
+
+    cd /home/ubuntu22/AESO
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --quiet --cpu 1 --plot
+
+All three processes must use the same --count if you override the default.
+On the remote Ubuntu VM used in these tests, only CPUs 0 and 1 were available, so
+client 2 used --cpu 1.
+
+Clock synchronization outside Python
+
+The remote Ubuntu clock was synchronized with chrony:
+
+    sudo apt install -y chrony
+    sudo chronyc -a 'burst 4/4'
+    sudo chronyc makestep
+    chronyc tracking
+    chronyc sources -v
+
+The target state is a small System time/Last offset in chronyc tracking and a
+selected source marked with * in chronyc sources. Windows/WSL time can be harder
+to force because W32Time may be driven by VMICTimeProvider or Local CMOS Clock.
+For WSL runs, keep the host clock stable and use the script-level correction
+below when comparing timestamps across machines.
+
+Clock correction inside Python
+
+By default, no Python clock correction is applied. The client records:
+
+    delay_ns = client_time_ns - repeater_ts_emit_ns
+
+This preserves raw signed delays, including negative values if the clocks are
+offset. To apply an NTP-like pre-run correction, enable --clock-sync on the
+repeater and on both clients:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater --werner-ar 1 --werner-br 1 --quiet --clock-sync --clock-sync-samples 64
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --quiet --cpu 5 --plot --clock-sync --clock-sync-samples 64
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --quiet --cpu 1 --plot --clock-sync --clock-sync-samples 64
+
+The correction estimates repeater_clock - client_clock before the hot receive
+loop. The client output and CSV include clock_offset_ns and clock_sync_rtt_ns so
+bad calibrations can be detected. If the SSH path is asymmetric, the absolute
+one-way value can still be biased.
+
+For comparison plots and stats around the run baseline, keep the raw signed delay
+but center the reported statistics around the median:
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --quiet --cpu 1 --plot --center-delay
+
+--center-delay writes both delay_ns and delay_centered_ns to the CSV. It is useful
+for jitter comparisons, while delay_ns remains the raw signed cross-clock value.
+
 Output
 
 - Repeater prints initial Werner states and the last message/state for A and B.
@@ -77,12 +156,16 @@ Plot data (CSV)
 Use --plot on clients to write per-sample delay data to csv/.
 
 - Output path: csv/delay_hist_client_<client_id>[_N].csv
-- Default columns: count_idx,delay_ns
-- delay_ns is client wall-clock arrival minus the common repeater swap timestamp.
+- Default columns:
+  count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns
+- delay_ns is client wall-clock arrival plus any configured clock offset, minus
+  the common repeater swap timestamp.
+- delay_centered_ns is delay_ns - delay_center_ns. delay_center_ns is 0 unless
+  --center-delay is enabled.
 
 Use --diag together with --plot on clients to write extra receive diagnostics.
 
-- Diagnostic columns: count_idx,delay_ns,loop_gap_ns,recv_block_ns
+- Diagnostic columns add loop_gap_ns and recv_block_ns.
 - loop_gap_ns is the monotonic time between client loop iterations.
 - recv_block_ns is the time spent inside recv_exact_into().
 
@@ -187,8 +270,13 @@ Notes
 - The repeater uses separate A/B message buffers even in sequential mode.
 - Correction bits are precomputed before the hot loop to avoid random-number
   generation in the measured send path.
+- Clients store raw delay and raw w_swap in the receive loop. Werner decay for
+  percentiles/states is computed after the receive loop, so math.exp() is not in
+  the hot receive path.
 - --diag enables extra monotonic timing inside the hot send/receive loops. Use it
   for diagnosis, but leave it off for the cleanest performance baseline.
+- --clock-sync is disabled by default. Enable it on the repeater and both clients
+  only when you want the pre-run clock offset calibration handshake.
 - --parallel creates sender threads once before the count loop. It does not create
   threads per count, but it does add barrier/scheduler overhead. It keeps the
   common swap timestamp while attempting A/B sends in parallel.
@@ -229,6 +317,8 @@ Repeater:
                                         [--count-interval COUNT_INTERVAL]
                                         [--quiet] [--plot]
                                         [--plot-prefix PLOT_PREFIX] [--diag]
+                                        [--clock-sync]
+                                        [--clock-sync-samples CLOCK_SYNC_SAMPLES]
 
     options:
       -h, --help            show this help message and exit
@@ -259,6 +349,10 @@ Repeater:
       --plot-prefix PLOT_PREFIX
                             Prefix for repeater send timing CSV outputs.
       --diag                Measure extra repeater send timing diagnostics.
+      --clock-sync          Enable pre-run clock offset calibration handshake.
+                            Enable it on both clients too.
+      --clock-sync-samples CLOCK_SYNC_SAMPLES
+                            Calibration exchanges used only with --clock-sync.
 
 Client:
 
@@ -276,7 +370,10 @@ Client:
                                       [--werner-in WERNER_IN] [--plot]
                                       [--plot-prefix PLOT_PREFIX]
                                       [--count-interval COUNT_INTERVAL] [--quiet]
-                                      [--t1-ns T1_NS] [--diag]
+                                      [--t1-ns T1_NS] [--diag] [--clock-sync]
+                                      [--clock-sync-samples CLOCK_SYNC_SAMPLES]
+                                      [--clock-offset-ns CLOCK_OFFSET_NS]
+                                      [--center-delay]
 
     options:
       -h, --help            show this help message and exit
@@ -305,3 +402,13 @@ Client:
       --quiet
       --t1-ns T1_NS
       --diag                Measure extra client loop/recv timing diagnostics.
+      --clock-sync          Estimate repeater-clock minus client-clock offset
+                            before the data loop. Repeater and both clients must
+                            enable it.
+      --clock-sync-samples CLOCK_SYNC_SAMPLES
+                            Calibration exchanges used only with --clock-sync.
+      --clock-offset-ns CLOCK_OFFSET_NS
+                            Manual repeater-clock minus client-clock offset. Skips
+                            auto calibration and does not require --clock-sync.
+      --center-delay        Center delay stats around the run median; raw signed
+                            delay stays in CSV.

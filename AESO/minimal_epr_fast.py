@@ -14,6 +14,10 @@ TS_FORMAT = "!Q"
 TS_SIZE = struct.calcsize(TS_FORMAT)
 MSG_FORMAT = "!QIBd"
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
+CLOCK_SYNC_REQUEST_FORMAT = "!Q"
+CLOCK_SYNC_REQUEST_SIZE = struct.calcsize(CLOCK_SYNC_REQUEST_FORMAT)
+CLOCK_SYNC_RESPONSE_FORMAT = "!QQ"
+CLOCK_SYNC_RESPONSE_SIZE = struct.calcsize(CLOCK_SYNC_RESPONSE_FORMAT)
 
 
 def parse_args():
@@ -46,6 +50,8 @@ def parse_args():
     repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
     repeater.add_argument("--plot-prefix", default="repeater_send_hist", help="Prefix for repeater send timing CSV outputs.")
     repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
+    repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run clock offset calibration handshake. Enable it on both clients too.")
+    repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
 
     client = subparsers.add_parser("client", help="Run in client mode.")
     client.add_argument("--repeater-host", default="127.0.0.1")
@@ -68,6 +74,10 @@ def parse_args():
     client.add_argument("--quiet", action="store_true")
     client.add_argument("--t1-ns", type=float, default=1_000_000.0)
     client.add_argument("--diag", action="store_true", help="Measure extra client loop/recv timing diagnostics.")
+    client.add_argument("--clock-sync", action="store_true", help="Estimate repeater-clock minus client-clock offset before the data loop. Repeater and both clients must enable it.")
+    client.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    client.add_argument("--clock-offset-ns", type=int, default=None, help="Manual repeater-clock minus client-clock offset. Skips auto calibration and does not require --clock-sync.")
+    client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
 
     return parser.parse_args()
 
@@ -113,6 +123,36 @@ def recv_exact_into(sock, buf):
         n += got
 
 
+def recv_exact(sock, size):
+    buf = bytearray(size)
+    recv_exact_into(sock, buf)
+    return bytes(buf)
+
+
+def serve_clock_sync(sock, samples):
+    for _ in range(max(0, int(samples))):
+        recv_exact(sock, CLOCK_SYNC_REQUEST_SIZE)
+        t1_ns = time.time_ns()
+        t2_ns = time.time_ns()
+        sock.sendall(struct.pack(CLOCK_SYNC_RESPONSE_FORMAT, t1_ns, t2_ns))
+
+
+def estimate_clock_offset(sock, samples):
+    best = None
+    for _ in range(max(0, int(samples))):
+        t0_ns = time.time_ns()
+        sock.sendall(struct.pack(CLOCK_SYNC_REQUEST_FORMAT, t0_ns))
+        t1_ns, t2_ns = struct.unpack(CLOCK_SYNC_RESPONSE_FORMAT, recv_exact(sock, CLOCK_SYNC_RESPONSE_SIZE))
+        t3_ns = time.time_ns()
+        rtt_ns = (t3_ns - t0_ns) - (t2_ns - t1_ns)
+        offset_ns = ((t1_ns - t0_ns) + (t2_ns - t3_ns)) // 2
+        if best is None or rtt_ns < best[1]:
+            best = (offset_ns, rtt_ns)
+    if best is None:
+        return 0, 0
+    return best
+
+
 def connect_repeater_until_ready(host, port, connect_timeout, detect_timeout, detect_interval, sock_buf, busy_poll_us):
     deadline = time.monotonic() + max(0.0, detect_timeout)
     last_error = None
@@ -156,7 +196,10 @@ def decay_werner(base, age_ns, t1_ns):
     if t1_ns <= 0:
         raise ValueError("t1_ns must be positive")
     if age_ns < 0:
-        raise ValueError("age_ns cannot be negative")
+        # Negative one-way delay means the two host clocks are offset. Keep the
+        # signed delay in the latency CSV/output, but do not abort the run or
+        # apply unphysical negative decay to Werner.
+        age_ns = 0
     decayed = float(base) * math.exp(-age_ns / float(t1_ns))
     return decayed
 
@@ -202,19 +245,19 @@ def fmt_state(state):
     return f"({local_id},{werner:.6f},{peer_id})"
 
 
-def print_client_group(label, delta_ns, werner):
+def print_client_group(label, delta_ns, werner, delay_label="abs_repeater_to_client"):
     print("")
     print(f"client_{label}")
     print("metric\t\t\t\t value")
-    print(f"repeater_to_client\t\t {fmt_ns(delta_ns)}")
+    print(f"{delay_label}\t\t {fmt_ns(delta_ns)}")
     print(f"werner\t\t\t\t {werner:.6f}")
 
 
-def print_client_message_state(label, delta_ns, msg, state_out, count_idx=None):
+def print_client_message_state(label, delta_ns, msg, state_out, count_idx=None, delay_label="signed_repeater_to_client"):
     print("")
     print(f"client_{label}")
     print("metric\t\t\t\t value")
-    print(f"repeater_to_client\t\t {fmt_ns(delta_ns)}")
+    print(f"{delay_label}\t {fmt_ns(delta_ns)}")
     if count_idx is not None:
         print(f"count_idx\t\t\t {count_idx}")
     print(
@@ -263,6 +306,9 @@ def run_repeater(args):
 
     conn_a = accept_one(args.listen_host_a, args.listen_port_a)
     conn_b = accept_one(args.listen_host_b, args.listen_port_b)
+    if args.clock_sync:
+        serve_clock_sync(conn_a, args.clock_sync_samples)
+        serve_clock_sync(conn_b, args.clock_sync_samples)
 
     def update_round_state(now_ns, correction_bits):
         state_ar_local = (args.repeater_id, w_ar_init, args.client_a_id)
@@ -418,6 +464,7 @@ def run_client(args):
     sample_count = count - warmup
     delta_samples = [0] * sample_count
     werner_samples = [0.0] * sample_count
+    werner_raw_samples = [0.0] * sample_count
     sample_msgs = [None] * sample_count
     delta_record_counts = [0] * sample_count
     loop_gap_samples = [0] * sample_count if args.diag else []
@@ -425,6 +472,7 @@ def run_client(args):
     last_delta = 0
     last_werner = 0.0
     last_msg = (0, 0, 0, 0.0)
+    last_raw_msg = (0, 0, 0, 0.0)
     last_state_out = (args.client_id, 0.0, None)
     inbuf = bytearray(MSG_SIZE)
     sample_idx = 0
@@ -438,6 +486,15 @@ def run_client(args):
         args.sock_buf,
         args.busy_poll_us,
     ) as sock:
+        if args.clock_offset_ns is not None:
+            clock_offset_ns = int(args.clock_offset_ns)
+            clock_sync_rtt_ns = 0
+        elif args.clock_sync:
+            clock_offset_ns, clock_sync_rtt_ns = estimate_clock_offset(sock, args.clock_sync_samples)
+        else:
+            clock_offset_ns = 0
+            clock_sync_rtt_ns = 0
+
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
@@ -454,18 +511,15 @@ def run_client(args):
                     recv_exact_into(sock, inbuf)
                 ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
                 ts_recv_ns = time.time_ns()
-                w_swap = float(w_swap)
-                w_swap = decay_werner(float(w_swap), ts_recv_ns - ts_emit_ns, args.t1_ns)**2
+                w_swap_raw = float(w_swap)
                 peer_id = int(peer_id)
                 correction_bits = int(correction_bits)
-                last_msg = (ts_emit_ns, peer_id, correction_bits, w_swap)
-                last_state_out = (args.client_id, w_swap, peer_id)
-                last_delta = max(0, ts_recv_ns - ts_emit_ns)
-                last_werner = w_swap
+                last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+                last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
                 if i >= warmup:
                     delta_samples[sample_idx] = last_delta
-                    werner_samples[sample_idx] = last_werner
-                    sample_msgs[sample_idx] = (last_delta, i + 1, last_msg, last_state_out)
+                    werner_raw_samples[sample_idx] = w_swap_raw
+                    sample_msgs[sample_idx] = (last_delta, i + 1, last_raw_msg, None)
                     delta_record_counts[sample_idx] = i + 1
                     if args.diag:
                         loop_gap_samples[sample_idx] = loop_gap_ns
@@ -478,28 +532,53 @@ def run_client(args):
                 gc.enable()
 
     delta_samples = delta_samples[:sample_idx]
-    werner_samples = werner_samples[:sample_idx]
+    werner_raw_samples = werner_raw_samples[:sample_idx]
     sample_msgs = sample_msgs[:sample_idx]
     delta_record_counts = delta_record_counts[:sample_idx]
     if args.diag:
         loop_gap_samples = loop_gap_samples[:sample_idx]
         recv_block_samples = recv_block_samples[:sample_idx]
 
-    delta_sorted = sorted(delta_samples)
+    delay_center_ns = percentile(sorted(delta_samples), 0.50) if args.center_delay and delta_samples else 0
+    delay_stat_samples = [delay_ns - delay_center_ns for delay_ns in delta_samples]
+
+    werner_samples = [
+        decay_werner(w_swap_raw, max(0, delay_ns), args.t1_ns) ** 2
+        for w_swap_raw, delay_ns in zip(werner_raw_samples, delay_stat_samples)
+    ]
+    sample_msgs = [
+        (
+            delta_ns - delay_center_ns,
+            count_idx,
+            (msg[0], msg[1], msg[2], werner),
+            (args.client_id, werner, msg[1]),
+        )
+        for (delta_ns, count_idx, msg, _), werner in zip(sample_msgs, werner_samples)
+    ]
+    last_stat_delta = last_delta - delay_center_ns
+    last_werner = decay_werner(last_raw_msg[3], max(0, last_stat_delta), args.t1_ns) ** 2
+    last_msg = (last_raw_msg[0], last_raw_msg[1], last_raw_msg[2], last_werner)
+    last_state_out = (args.client_id, last_werner, last_raw_msg[1])
+
+    delay_abs_samples = [abs(delay_ns) for delay_ns in delay_stat_samples]
+    delta_sorted = sorted(delay_abs_samples)
     w_sorted = sorted(werner_samples)
-    mean_delay_raw = sum(delta_samples) / len(delta_samples) if delta_samples else 0.0
+    mean_delay_raw = sum(delay_abs_samples) / len(delay_abs_samples) if delay_abs_samples else 0.0
     mean_delay = int(mean_delay_raw)
     mean_werner = sum(werner_samples) / len(werner_samples) if werner_samples else 0.0
-    std_delay = stddev(delta_samples, mean_delay_raw)
+    std_delay = stddev(delay_abs_samples, mean_delay_raw)
     std_werner = stddev(werner_samples, mean_werner)
 
     def pick_by_delta(samples, want_max=False):
         if not samples:
             return (0, 0, (0, 0, 0, 0.0), (args.client_id, 0.0, None))
-        return max(samples, key=lambda item: item[0]) if want_max else min(samples, key=lambda item: item[0])
+        key = lambda item: abs(item[0])
+        return max(samples, key=key) if want_max else min(samples, key=key)
 
     min_sample = pick_by_delta(sample_msgs, want_max=False)
     max_sample = pick_by_delta(sample_msgs, want_max=True)
+    abs_delay_label = "abs_centered_repeater_to_client" if args.center_delay else "abs_repeater_to_client"
+    signed_delay_label = "signed_centered_repeater_to_client" if args.center_delay else "signed_repeater_to_client"
 
     if args.plot:
         os.makedirs("csv", exist_ok=True)
@@ -512,45 +591,51 @@ def run_client(args):
         csv_path = os.path.join("csv", f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,delay_ns,loop_gap_ns,recv_block_ns\n")
-                for idx, delay_ns, loop_gap_ns, recv_block_ns in zip(
-                    delta_record_counts, delta_samples, loop_gap_samples, recv_block_samples
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns,loop_gap_ns,recv_block_ns\n")
+                for idx, delay_ns, delay_centered_ns, loop_gap_ns, recv_block_ns in zip(
+                    delta_record_counts, delta_samples, delay_stat_samples, loop_gap_samples, recv_block_samples
                 ):
-                    handle.write(f"{idx},{delay_ns},{loop_gap_ns},{recv_block_ns}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_rtt_ns},{loop_gap_ns},{recv_block_ns}\n")
             else:
-                handle.write("count_idx,delay_ns\n")
-                for idx, delay_ns in zip(delta_record_counts, delta_samples):
-                    handle.write(f"{idx},{delay_ns}\n")
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns\n")
+                for idx, delay_ns, delay_centered_ns in zip(delta_record_counts, delta_samples, delay_stat_samples):
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_rtt_ns}\n")
         print(f"plot=data_saved ({csv_path})")
 
     if args.quiet:
         print(f"exchanges={count}")
         print(f"warmup={warmup}")
+        print(f"clock_offset_ns={clock_offset_ns}")
+        print(f"clock_sync_rtt_ns={clock_sync_rtt_ns}")
+        print(f"delay_center_ns={delay_center_ns}")
         print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
-        print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50))
-        print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90))
-        print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95))
-        print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99))
-        print_client_group("mean", mean_delay, mean_werner)
-        print_client_group("std", std_delay, std_werner)
-        print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1])
-        print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1])
-        print_client_message_state("last", last_delta, last_msg, last_state_out)
+        print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)
+        print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90), abs_delay_label)
+        print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95), abs_delay_label)
+        print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99), abs_delay_label)
+        print_client_group("mean", mean_delay, mean_werner, abs_delay_label)
+        print_client_group("std", std_delay, std_werner, abs_delay_label)
+        print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1], signed_delay_label)
+        print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1], signed_delay_label)
+        print_client_message_state("last", last_stat_delta, last_msg, last_state_out, delay_label=signed_delay_label)
         return 0
 
     print("client_mode=fast3")
     print(f"exchanges={count} warmup={warmup}")
     print(f"client_id={args.client_id} repeater_id={args.repeater_id}")
+    print(f"clock_offset_ns={clock_offset_ns}")
+    print(f"clock_sync_rtt_ns={clock_sync_rtt_ns}")
+    print(f"delay_center_ns={delay_center_ns}")
     print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
-    print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50))
-    print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95))
-    print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90))
-    print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99))
-    print_client_group("mean", mean_delay, mean_werner)
-    print_client_group("std", std_delay, std_werner)
-    print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1])
-    print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1])
-    print_client_message_state("last", last_delta, last_msg, last_state_out)
+    print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)
+    print_client_group("p95", percentile(delta_sorted, 0.95), percentile_inverse(w_sorted, 0.95), abs_delay_label)
+    print_client_group("p90", percentile(delta_sorted, 0.90), percentile_inverse(w_sorted, 0.90), abs_delay_label)
+    print_client_group("p99", percentile(delta_sorted, 0.99), percentile_inverse(w_sorted, 0.99), abs_delay_label)
+    print_client_group("mean", mean_delay, mean_werner, abs_delay_label)
+    print_client_group("std", std_delay, std_werner, abs_delay_label)
+    print_client_message_state("min", min_sample[0], min_sample[2], min_sample[3], min_sample[1], signed_delay_label)
+    print_client_message_state("max", max_sample[0], max_sample[2], max_sample[3], max_sample[1], signed_delay_label)
+    print_client_message_state("last", last_stat_delta, last_msg, last_state_out, delay_label=signed_delay_label)
     return 0
 
 
