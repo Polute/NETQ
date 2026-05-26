@@ -1,0 +1,562 @@
+CURRENT CSV CONDITIONS
+======================
+
+Date/context
+------------
+
+These notes describe the current set of CSVs generated with three different
+machines:
+
+    - repeater on the local laptop / WSL machine
+    - client 1 on remote Ubuntu machine 1
+    - client 2 on remote Ubuntu machine 2
+
+The clients reached the local repeater through SSH reverse tunnels.
+
+
+Topology
+--------
+
+Logical experiment topology:
+
+    client 1  <---- TCP/SSH reverse tunnel ----\
+                                             repeater
+    client 2  <---- TCP/SSH reverse tunnel ----/
+
+Actual role placement:
+
+    local laptop / WSL:
+        repeater
+
+    remote Ubuntu machine 1:
+        client --client-id 1
+
+    remote Ubuntu machine 2:
+        client --client-id 2
+
+
+SSH reverse tunnels
+-------------------
+
+Because the repeater was local and the clients were remote, SSH reverse tunnels
+were used.
+
+Rule:
+
+    -R remote_port:local_host:local_port
+
+Meaning:
+
+    a connection to remote 127.0.0.1:remote_port is forwarded to
+    local_host:local_port on the local laptop side.
+
+Client 1 tunnel:
+
+    ssh -J pasarela@kr.ls.fi.upm.es \
+      -o Compression=no \
+      -o IPQoS=lowdelay \
+      -R 7401:127.0.0.1:7401 \
+      ubuntu22@REMOTE_1
+
+Client 2 tunnel:
+
+    ssh -J pasarela@kr.ls.fi.upm.es \
+      -o Compression=no \
+      -o IPQoS=lowdelay \
+      -R 7402:127.0.0.1:7402 \
+      ubuntu22@REMOTE_2
+
+Then each remote client connected to 127.0.0.1, but that local address on the
+remote machine was forwarded back to the local repeater.
+
+
+Repeater command shape
+----------------------
+
+The repeater was run locally:
+
+    cd /home/giicc/NETQ/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+      --listen-host-a 127.0.0.1 \
+      --listen-port-a 7401 \
+      --listen-host-b 127.0.0.1 \
+      --listen-port-b 7402 \
+      --werner-ar 1 \
+      --werner-br 1 \
+      --quiet \
+      --accept-timeout 120
+
+When PTP-style clock synchronization was enabled, the repeater also used:
+
+      --clock-sync \
+      --clock-sync-samples 64
+
+
+Client command shape
+--------------------
+
+Remote client 1:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 127.0.0.1 \
+      --repeater-port 7401 \
+      --client-id 1 \
+      --quiet \
+      --cpu 1 \
+      --plot
+
+Remote client 2:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 127.0.0.1 \
+      --repeater-port 7402 \
+      --client-id 2 \
+      --quiet \
+      --cpu 1 \
+      --plot
+
+When PTP-style clock synchronization was enabled, each client also used:
+
+      --clock-sync \
+      --clock-sync-samples 64
+
+When centered jitter statistics were desired, each client also used:
+
+      --center-delay
+
+
+Script/runtime settings
+-----------------------
+
+Common runtime environment:
+
+    PYTHONUNBUFFERED=1
+    PYTHONMALLOC=malloc
+    sudo
+
+Reason:
+
+    PYTHONUNBUFFERED=1
+        avoids stdout buffering surprises.
+
+    PYTHONMALLOC=malloc
+        uses system malloc instead of Python's pymalloc allocator.
+
+    sudo
+        allows CPU affinity / scheduling / socket-related options to work when
+        the OS requires privileges.
+
+Remote clients used:
+
+    --cpu 1
+
+because the remote Ubuntu machines exposed CPUs 0 and 1.
+
+
+CSV groups
+----------
+
+The currently relevant local CSV directory is:
+
+    AESO/csv/
+
+The older one-remote-client experiment was moved to:
+
+    AESO/csv_1_client_remote/
+
+
+Group: delay_hist_client_1_2.csv and delay_hist_client_2_2.csv
+----------------------------------------------------------------
+
+Topology:
+
+    repeater local
+    client 1 remote machine 1
+    client 2 remote machine 2
+    SSH reverse tunnels with -R
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 64
+    PTP-style exchange before the measured send/receive loop
+
+Centering:
+
+    --center-delay enabled
+
+Pacing:
+
+    no explicit --count-interval mentioned for this run
+
+Interpretation:
+
+    delay_ns is PTP-corrected but still biased by SSH reverse tunnel asymmetry.
+    delay_centered_ns is better for comparing jitter around each run baseline.
+
+Observed behavior:
+
+    client 2 was much cleaner than client 1.
+    client 1 had larger centered jitter and changes of regime.
+
+
+Group: delay_hist_client_1_3.csv and delay_hist_client_2_3.csv
+----------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local repeater and two remote clients
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 64
+
+Centering:
+
+    --center-delay enabled
+
+Pacing:
+
+    repeater used --count-interval 0.001 seconds
+
+Interpretation:
+
+    These CSVs showed a strong ramp/drift during the run.
+    Centered delay began strongly positive and ended strongly negative.
+    The behavior was similar in both clients, so it was likely a common timing
+    effect rather than a single-client issue.
+
+
+Group: delay_hist_client_1_4.csv and delay_hist_client_2_4.csv
+----------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local repeater and two remote clients
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 64
+
+Centering:
+
+    --center-delay enabled
+
+Pacing:
+
+    repeater used --count-interval 0.001 seconds
+
+Interpretation:
+
+    This run should be treated as invalid/outlier.
+    A very large jump of about 2.28 seconds appeared around count 899/900 in both
+    clients.
+
+Likely causes:
+
+    - system clock adjustment during the run
+    - bad PTP offset estimate
+    - VM/WSL/chrony time correction
+    - SSH/tunnel/system scheduling event
+
+
+Group: delay_hist_client_1_5.csv to delay_hist_client_2_7.csv
+--------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local repeater and two remote clients
+
+Sync:
+
+    --clock-sync disabled
+    clock_offset_ns = 0
+    clock_sync_path_delay_ns = 0
+
+Centering:
+
+    --center-delay disabled
+    delay_center_ns = 0
+    delay_centered_ns = delay_ns
+
+Purpose:
+
+    These runs were made without synchronization to inspect the natural raw range
+    and shape of the timestamp series without PTP offset correction.
+
+Interpretation:
+
+    delay_ns cannot be interpreted as physical one-way delay, because it includes
+    the clock differences between:
+
+        local repeater clock
+        remote client 1 clock
+        remote client 2 clock
+
+    However, these CSVs are useful for seeing:
+
+        - drift during a run
+        - range of variation
+        - common jumps shared by both clients
+        - independent route/tunnel behavior per client
+
+Observed behavior:
+
+    Runs 5 and 6 had ranges on the order of tens of milliseconds.
+    Run 7 had a large common jump around 146-147 ms and should be treated as a
+    poorer/outlier run.
+
+
+Group: delay_hist_client_1_8.csv and delay_hist_client_2_8.csv
+--------------------------------------------------------------
+
+Topology:
+
+    three-machine topology
+    local WSL repeater on the laptop
+    remote client 1 through an SSH reverse tunnel
+    remote client 2 through an SSH reverse tunnel
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 256
+
+Centering:
+
+    --center-delay enabled
+
+Meaning:
+
+    delay_ns is the one-way delay after applying the PTP-style clock offset:
+
+        delay_ns = (client_receive_time_ns + clock_offset_ns) - repeater_emit_time_ns
+
+    delay_centered_ns is not the one-way delay. It is only the difference between
+    each corrected delay and the median corrected delay of this run:
+
+        delay_centered_ns = delay_ns - median(delay_ns)
+
+    Therefore delay_centered_ns measures jitter around the run baseline.
+
+Observed summary:
+
+    client 1:
+        clock_offset_ns = 1454594568
+        clock_sync_path_delay_ns = 10775961
+        delay_center_ns = 2328057
+        raw delay p50/p95/p99 ~= 2.328 / 5.753 / 6.644 ms
+        abs centered p50/p95/p99 ~= 0.705 / 3.425 / 4.316 ms
+
+    client 2:
+        clock_offset_ns = 1516879712
+        clock_sync_path_delay_ns = 12236104
+        delay_center_ns = 6072834
+        raw delay p50/p95/p99 ~= 6.073 / 12.260 / 13.100 ms
+        abs centered p50/p95/p99 ~= 2.757 / 6.187 / 7.027 ms
+
+
+Group: delay_hist_client_1_9.csv and delay_hist_client_2_9.csv
+--------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local WSL repeater and two remote clients
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 256
+
+Centering:
+
+    --center-delay enabled
+
+Meaning:
+
+    Same interpretation as group 8:
+
+        delay_ns
+            corrected one-way delay estimate after applying clock_offset_ns
+
+        delay_centered_ns
+            delay_ns minus the run median; useful for jitter, not absolute delay
+
+Observed summary:
+
+    client 1:
+        clock_offset_ns = 1452945336
+        clock_sync_path_delay_ns = 11215391
+        delay_center_ns = 26328977
+        raw delay p50/p95/p99 ~= 26.331 / 41.649 / 42.147 ms
+        abs centered p50/p95/p99 ~= 8.434 / 17.603 / 26.847 ms
+
+    client 2:
+        clock_offset_ns = 1516284376
+        clock_sync_path_delay_ns = 11743514
+        delay_center_ns = 6780293
+        raw delay p50/p95/p99 ~= 6.785 / 13.665 / 14.194 ms
+        abs centered p50/p95/p99 ~= 2.355 / 7.190 / 7.414 ms
+
+
+Group: delay_hist_client_1_10.csv and delay_hist_client_2_10.csv
+---------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local WSL repeater and two remote clients
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 256
+
+Centering:
+
+    Intended condition: without --center-delay.
+
+    CSV metadata warning:
+
+        These CSV files contain non-zero delay_center_ns values, so the saved
+        files indicate that --center-delay was still enabled when this pair was
+        generated.
+
+        client 1 delay_center_ns = 18442538
+        client 2 delay_center_ns = 9487817
+
+Meaning:
+
+    Use delay_ns as the corrected one-way delay estimate. Do not treat
+    delay_centered_ns as physical one-way delay; in these files it is the
+    median-centered jitter series because delay_center_ns is non-zero.
+
+Observed summary:
+
+    client 1:
+        clock_offset_ns = 1449423187
+        clock_sync_path_delay_ns = 10967886
+        raw delay p50/p95/p99 ~= 18.443 / 29.764 / 30.087 ms
+
+    client 2:
+        clock_offset_ns = 1512776246
+        clock_sync_path_delay_ns = 12428638
+        raw delay p50/p95/p99 ~= 9.489 / 13.899 / 14.398 ms
+
+
+Group: delay_hist_client_1_11.csv and delay_hist_client_2_11.csv
+---------------------------------------------------------------
+
+Topology:
+
+    same three-machine topology with local WSL repeater and two remote clients
+
+Sync:
+
+    --clock-sync enabled
+    --clock-sync-samples 256
+
+Centering:
+
+    --center-delay disabled
+    delay_center_ns = 0
+    delay_centered_ns = delay_ns
+
+Meaning:
+
+    This is the cleanest format for absolute corrected one-way delay analysis:
+    there is one delay value per count, delay_ns.
+
+Observed summary:
+
+    client 1:
+        clock_offset_ns = 1445821882
+        clock_sync_path_delay_ns = 11281802
+        raw delay p50/p95/p99 ~= 51.841 / 55.757 / 56.028 ms
+
+    client 2:
+        clock_offset_ns = 1509188742
+        clock_sync_path_delay_ns = 11717506
+        raw delay p50/p95/p99 ~= 38.509 / 91.283 / 91.440 ms
+
+
+Important interpretation notes
+------------------------------
+
+1. PTP-style sync is done before the measured loop.
+
+   It does not run during the send/receive counts. Therefore it does not directly
+   slow down later sends.
+
+2. PTP over SSH reverse tunnels can be biased.
+
+   PTP assumes approximately symmetric path delay:
+
+       master_to_slave_delay ~= slave_to_master_delay
+
+   With SSH reverse tunnels and a jump host, this may be false.
+
+   Offset error is:
+
+       offset_error = (delay_backward - delay_forward) / 2
+
+3. Negative raw delay after PTP correction means the offset estimate is biased.
+
+   A message cannot physically arrive before it was emitted. If corrected
+   delay_ns is largely negative, the offset estimate is not reliable for absolute
+   one-way delay.
+
+4. --center-delay does not fix clocks.
+
+   It computes:
+
+       delay_center_ns = median(delay_ns)
+       delay_centered_ns = delay_ns - delay_center_ns
+
+   It is useful for jitter analysis around a run baseline, not for absolute
+   physical one-way latency.
+
+   In other words:
+
+       delay_ns
+           what each send appears to take after clock-offset correction
+
+       delay_centered_ns
+           how different that send is from the median send in the same run
+
+   So --center-delay is not "the delay of each send". It is a per-count
+   difference from the run median.
+
+5. Different remote clients can have different offsets.
+
+   In the three-machine setup:
+
+       offset_1 = local_repeater_clock - remote_client_1_clock
+       offset_2 = local_repeater_clock - remote_client_2_clock
+
+   Since remote_client_1 and remote_client_2 are different machines, the offsets
+   do not need to match.
+
+
+Best current use of these CSVs
+------------------------------
+
+For absolute one-way delay:
+
+    These CSVs are not reliable unless the three machines are externally
+    synchronized with chrony/PTP/NTP or the SSH tunnel is removed.
+
+For jitter/shape analysis:
+
+    Use delay_centered_ns from the --center-delay runs.
+
+For raw clock-drift/range inspection:
+
+    Use the no-sync runs 5, 6, and 7, but interpret them only as timestamp-series
+    shape/range, not physical delay.

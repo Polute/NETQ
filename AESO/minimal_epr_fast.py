@@ -14,10 +14,12 @@ TS_FORMAT = "!Q"
 TS_SIZE = struct.calcsize(TS_FORMAT)
 MSG_FORMAT = "!QIBd"
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
-CLOCK_SYNC_REQUEST_FORMAT = "!Q"
-CLOCK_SYNC_REQUEST_SIZE = struct.calcsize(CLOCK_SYNC_REQUEST_FORMAT)
-CLOCK_SYNC_RESPONSE_FORMAT = "!QQ"
-CLOCK_SYNC_RESPONSE_SIZE = struct.calcsize(CLOCK_SYNC_RESPONSE_FORMAT)
+CLOCK_SYNC_SYNC_FORMAT = "!Q"
+CLOCK_SYNC_SYNC_SIZE = struct.calcsize(CLOCK_SYNC_SYNC_FORMAT)
+CLOCK_SYNC_DELAY_REQ_FORMAT = "!QQQ"
+CLOCK_SYNC_DELAY_REQ_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_REQ_FORMAT)
+CLOCK_SYNC_DELAY_RESP_FORMAT = "!QQQQ"
+CLOCK_SYNC_DELAY_RESP_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_RESP_FORMAT)
 
 
 def parse_args():
@@ -50,7 +52,7 @@ def parse_args():
     repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
     repeater.add_argument("--plot-prefix", default="repeater_send_hist", help="Prefix for repeater send timing CSV outputs.")
     repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
-    repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run clock offset calibration handshake. Enable it on both clients too.")
+    repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run PTP-style clock offset calibration. Enable it on both clients too.")
     repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
 
     client = subparsers.add_parser("client", help="Run in client mode.")
@@ -74,7 +76,7 @@ def parse_args():
     client.add_argument("--quiet", action="store_true")
     client.add_argument("--t1-ns", type=float, default=1_000_000.0)
     client.add_argument("--diag", action="store_true", help="Measure extra client loop/recv timing diagnostics.")
-    client.add_argument("--clock-sync", action="store_true", help="Estimate repeater-clock minus client-clock offset before the data loop. Repeater and both clients must enable it.")
+    client.add_argument("--clock-sync", action="store_true", help="Estimate repeater-clock minus client-clock offset with a PTP-style exchange before the data loop. Repeater and both clients must enable it.")
     client.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
     client.add_argument("--clock-offset-ns", type=int, default=None, help="Manual repeater-clock minus client-clock offset. Skips auto calibration and does not require --clock-sync.")
     client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
@@ -131,26 +133,50 @@ def recv_exact(sock, size):
 
 def serve_clock_sync(sock, samples):
     for _ in range(max(0, int(samples))):
-        recv_exact(sock, CLOCK_SYNC_REQUEST_SIZE)
+        # PTP-style exchange with the repeater as master:
+        # t1: master Sync transmit, t2: slave Sync receive,
+        # t3: slave Delay_Req transmit, t4: master Delay_Req receive.
         t1_ns = time.time_ns()
-        t2_ns = time.time_ns()
-        sock.sendall(struct.pack(CLOCK_SYNC_RESPONSE_FORMAT, t1_ns, t2_ns))
+        sock.sendall(struct.pack(CLOCK_SYNC_SYNC_FORMAT, t1_ns))
+        t1_echo_ns, t2_ns, t3_ns = struct.unpack(
+            CLOCK_SYNC_DELAY_REQ_FORMAT, recv_exact(sock, CLOCK_SYNC_DELAY_REQ_SIZE)
+        )
+        t4_ns = time.time_ns()
+        if t1_echo_ns != t1_ns:
+            raise ValueError("PTP clock-sync request did not match the Sync timestamp")
+        sock.sendall(struct.pack(CLOCK_SYNC_DELAY_RESP_FORMAT, t1_ns, t2_ns, t3_ns, t4_ns))
 
 
 def estimate_clock_offset(sock, samples):
-    best = None
+    # PTP-style four-timestamp exchange with the repeater as master:
+    # t1: master Sync transmit, t2: slave Sync receive,
+    # t3: slave Delay_Req transmit, t4: master Delay_Req receive.
+    # slave_minus_master = ((t2 - t1) - (t4 - t3)) / 2.
+    # We return master_minus_slave so the client can correct as:
+    # corrected_client_time = client_time + master_minus_slave.
+    offset_total_ns = 0
+    path_delay_total_ns = 0
+    sample_count = 0
     for _ in range(max(0, int(samples))):
-        t0_ns = time.time_ns()
-        sock.sendall(struct.pack(CLOCK_SYNC_REQUEST_FORMAT, t0_ns))
-        t1_ns, t2_ns = struct.unpack(CLOCK_SYNC_RESPONSE_FORMAT, recv_exact(sock, CLOCK_SYNC_RESPONSE_SIZE))
+        (t1_ns,) = struct.unpack(CLOCK_SYNC_SYNC_FORMAT, recv_exact(sock, CLOCK_SYNC_SYNC_SIZE))
+        t2_ns = time.time_ns()
         t3_ns = time.time_ns()
-        rtt_ns = (t3_ns - t0_ns) - (t2_ns - t1_ns)
-        offset_ns = ((t1_ns - t0_ns) + (t2_ns - t3_ns)) // 2
-        if best is None or rtt_ns < best[1]:
-            best = (offset_ns, rtt_ns)
-    if best is None:
+        sock.sendall(struct.pack(CLOCK_SYNC_DELAY_REQ_FORMAT, t1_ns, t2_ns, t3_ns))
+        echoed_t1_ns, echoed_t2_ns, echoed_t3_ns, t4_ns = struct.unpack(
+            CLOCK_SYNC_DELAY_RESP_FORMAT, recv_exact(sock, CLOCK_SYNC_DELAY_RESP_SIZE)
+        )
+        if (echoed_t1_ns, echoed_t2_ns, echoed_t3_ns) != (t1_ns, t2_ns, t3_ns):
+            raise ValueError("PTP clock-sync response did not match the Delay_Req timestamps")
+        master_to_slave_ns = t2_ns - t1_ns
+        slave_to_master_ns = t4_ns - t3_ns
+        mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) // 2
+        offset_ns = (slave_to_master_ns - master_to_slave_ns) // 2
+        offset_total_ns += offset_ns
+        path_delay_total_ns += mean_path_delay_ns
+        sample_count += 1
+    if sample_count == 0:
         return 0, 0
-    return best
+    return offset_total_ns // sample_count, path_delay_total_ns // sample_count
 
 
 def connect_repeater_until_ready(host, port, connect_timeout, detect_timeout, detect_interval, sock_buf, busy_poll_us):
@@ -488,12 +514,12 @@ def run_client(args):
     ) as sock:
         if args.clock_offset_ns is not None:
             clock_offset_ns = int(args.clock_offset_ns)
-            clock_sync_rtt_ns = 0
+            clock_sync_path_delay_ns = 0
         elif args.clock_sync:
-            clock_offset_ns, clock_sync_rtt_ns = estimate_clock_offset(sock, args.clock_sync_samples)
+            clock_offset_ns, clock_sync_path_delay_ns = estimate_clock_offset(sock, args.clock_sync_samples)
         else:
             clock_offset_ns = 0
-            clock_sync_rtt_ns = 0
+            clock_sync_path_delay_ns = 0
 
         gc_was_enabled = gc.isenabled()
         gc.disable()
@@ -591,22 +617,22 @@ def run_client(args):
         csv_path = os.path.join("csv", f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns,loop_gap_ns,recv_block_ns\n")
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n")
                 for idx, delay_ns, delay_centered_ns, loop_gap_ns, recv_block_ns in zip(
                     delta_record_counts, delta_samples, delay_stat_samples, loop_gap_samples, recv_block_samples
                 ):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_rtt_ns},{loop_gap_ns},{recv_block_ns}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns}\n")
             else:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns\n")
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
                 for idx, delay_ns, delay_centered_ns in zip(delta_record_counts, delta_samples, delay_stat_samples):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_rtt_ns}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
         print(f"plot=data_saved ({csv_path})")
 
     if args.quiet:
         print(f"exchanges={count}")
         print(f"warmup={warmup}")
         print(f"clock_offset_ns={clock_offset_ns}")
-        print(f"clock_sync_rtt_ns={clock_sync_rtt_ns}")
+        print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
         print(f"delay_center_ns={delay_center_ns}")
         print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
         print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)
@@ -624,7 +650,7 @@ def run_client(args):
     print(f"exchanges={count} warmup={warmup}")
     print(f"client_id={args.client_id} repeater_id={args.repeater_id}")
     print(f"clock_offset_ns={clock_offset_ns}")
-    print(f"clock_sync_rtt_ns={clock_sync_rtt_ns}")
+    print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
     print(f"delay_center_ns={delay_center_ns}")
     print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
     print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)

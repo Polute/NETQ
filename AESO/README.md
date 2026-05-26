@@ -120,17 +120,36 @@ By default, no Python clock correction is applied. The client records:
     delay_ns = client_time_ns - repeater_ts_emit_ns
 
 This preserves raw signed delays, including negative values if the clocks are
-offset. To apply an NTP-like pre-run correction, enable --clock-sync on the
-repeater and on both clients:
+offset. To apply a PTP-style pre-run correction with the repeater as master
+clock, enable --clock-sync on the repeater and on both clients:
 
     sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater --werner-ar 1 --werner-br 1 --quiet --clock-sync --clock-sync-samples 64
     sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7401 --client-id 1 --quiet --cpu 5 --plot --clock-sync --clock-sync-samples 64
     sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client --repeater-port 7402 --client-id 2 --quiet --cpu 1 --plot --clock-sync --clock-sync-samples 64
 
-The correction estimates repeater_clock - client_clock before the hot receive
-loop. The client output and CSV include clock_offset_ns and clock_sync_rtt_ns so
-bad calibrations can be detected. If the SSH path is asymmetric, the absolute
-one-way value can still be biased.
+The correction follows the PTP four-timestamp exchange:
+
+    t1 = master Sync transmit time
+    t2 = slave Sync receive time
+    t3 = slave Delay_Req transmit time
+    t4 = master Delay_Req receive time
+
+The client estimates:
+
+    slave_minus_master = ((t2 - t1) - (t4 - t3)) / 2
+    master_minus_slave = ((t4 - t3) - (t2 - t1)) / 2
+    mean_path_delay = ((t2 - t1) + (t4 - t3)) / 2
+
+The script stores clock_offset_ns as master_minus_slave, so the client applies it
+as:
+
+    corrected_client_time = client_time + clock_offset_ns
+
+The repeater echoes the Sync/Delay_Req timestamps in the Delay_Resp so the client
+can validate each sync sample. The client averages clock_offset_ns across all
+--clock-sync-samples instead of selecting the lowest-delay sample. The reported
+clock_sync_path_delay_ns is the average PTP mean path delay over those samples.
+If the SSH path is asymmetric, the absolute one-way value can still be biased.
 
 For comparison plots and stats around the run baseline, keep the raw signed delay
 but center the reported statistics around the median:
@@ -157,7 +176,7 @@ Use --plot on clients to write per-sample delay data to csv/.
 
 - Output path: csv/delay_hist_client_<client_id>[_N].csv
 - Default columns:
-  count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_rtt_ns
+  count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns
 - delay_ns is client wall-clock arrival plus any configured clock offset, minus
   the common repeater swap timestamp.
 - delay_centered_ns is delay_ns - delay_center_ns. delay_center_ns is 0 unless
@@ -276,7 +295,7 @@ Notes
 - --diag enables extra monotonic timing inside the hot send/receive loops. Use it
   for diagnosis, but leave it off for the cleanest performance baseline.
 - --clock-sync is disabled by default. Enable it on the repeater and both clients
-  only when you want the pre-run clock offset calibration handshake.
+  only when you want the pre-run PTP-style clock offset calibration handshake.
 - --parallel creates sender threads once before the count loop. It does not create
   threads per count, but it does add barrier/scheduler overhead. It keeps the
   common swap timestamp while attempting A/B sends in parallel.
@@ -349,7 +368,7 @@ Repeater:
       --plot-prefix PLOT_PREFIX
                             Prefix for repeater send timing CSV outputs.
       --diag                Measure extra repeater send timing diagnostics.
-      --clock-sync          Enable pre-run clock offset calibration handshake.
+      --clock-sync          Enable pre-run PTP-style clock offset calibration.
                             Enable it on both clients too.
       --clock-sync-samples CLOCK_SYNC_SAMPLES
                             Calibration exchanges used only with --clock-sync.
@@ -403,8 +422,8 @@ Client:
       --t1-ns T1_NS
       --diag                Measure extra client loop/recv timing diagnostics.
       --clock-sync          Estimate repeater-clock minus client-clock offset
-                            before the data loop. Repeater and both clients must
-                            enable it.
+                            with a PTP-style exchange before the data loop.
+                            Repeater and both clients must enable it.
       --clock-sync-samples CLOCK_SYNC_SAMPLES
                             Calibration exchanges used only with --clock-sync.
       --clock-offset-ns CLOCK_OFFSET_NS
@@ -412,3 +431,83 @@ Client:
                             auto calibration and does not require --clock-sync.
       --center-delay        Center delay stats around the run median; raw signed
                             delay stays in CSV.
+
+Current 3-machine setup: local WSL repeater, two remote clients
+
+Use this setup when the repeater runs on the local WSL/laptop machine and each
+client runs on a different remote Ubuntu machine. Because the clients are remote
+and the repeater is local, use SSH reverse tunnels (-R).
+
+Open one SSH session to remote client 1:
+
+    ssh -J pasarela@kr.ls.fi.upm.es \
+      -o Compression=no \
+      -o IPQoS=lowdelay \
+      -R 7401:127.0.0.1:7401 \
+      ubuntu22@REMOTE_1
+
+Open another SSH session to remote client 2:
+
+    ssh -J pasarela@kr.ls.fi.upm.es \
+      -o Compression=no \
+      -o IPQoS=lowdelay \
+      -R 7402:127.0.0.1:7402 \
+      ubuntu22@REMOTE_2
+
+Then run the repeater locally:
+
+    cd /home/giicc/NETQ/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+      --listen-host-a 127.0.0.1 \
+      --listen-port-a 7401 \
+      --listen-host-b 127.0.0.1 \
+      --listen-port-b 7402 \
+      --werner-ar 1 \
+      --werner-br 1 \
+      --quiet \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --accept-timeout 120
+
+Run client 1 on remote machine 1:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 127.0.0.1 \
+      --repeater-port 7401 \
+      --client-id 1 \
+      --quiet \
+      --cpu 1 \
+      --plot \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --center-delay
+
+Run client 2 on remote machine 2:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 127.0.0.1 \
+      --repeater-port 7402 \
+      --client-id 2 \
+      --quiet \
+      --cpu 1 \
+      --plot \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --center-delay
+
+Notes:
+
+- Replace REMOTE_1 and REMOTE_2 with the two remote machine IPs/hosts.
+- Keep both SSH -R sessions open while the experiment runs.
+- The clients connect to 127.0.0.1 because that remote-local port is forwarded
+  back to the local repeater.
+- --clock-sync-samples 256 makes the pre-run PTP-style offset estimate use more
+  samples than the default.
+- --center-delay is recommended for this SSH reverse-tunnel setup because
+  absolute one-way delay can be biased by path asymmetry, while centered delay is
+  useful for jitter analysis.

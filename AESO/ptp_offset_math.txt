@@ -1,0 +1,705 @@
+PTP OFFSET MATH FOR minimal_epr_fast.py
+=======================================
+
+Goal
+----
+
+The repeater is the master clock.
+Each client is a slave clock.
+
+The client needs to estimate:
+
+    clock_offset_ns = master_clock - slave_clock
+
+Then the client can convert its local receive timestamp into the repeater/master
+time domain:
+
+    corrected_client_time = client_time + clock_offset_ns
+
+and compute:
+
+    delay_ns = corrected_client_time - repeater_ts_emit_ns
+
+
+Clock Diagram
+-------------
+
+Assume two clocks:
+
+    MASTER / REPEATER CLOCK
+    |
+    |---- time axis -------------------------------------------->
+    |
+    |        t1                                t4
+    |        |                                 |
+    |        | Sync                            | Delay_Req received
+    |        v                                 ^
+    |
+    +------------------------------------------------------------
+
+
+    SLAVE / CLIENT CLOCK
+    |
+    |---- time axis -------------------------------------------->
+    |
+    |                    t2                 t3
+    |                    |                  |
+    |                    | Sync received    | Delay_Req
+    |                    v                  ^
+    |
+    +------------------------------------------------------------
+
+
+PTP Message Exchange
+--------------------
+
+The exchange has four timestamps:
+
+    t1 = master time when Sync leaves the repeater
+    t2 = slave time when Sync arrives at the client
+    t3 = slave time when Delay_Req leaves the client
+    t4 = master time when Delay_Req arrives at the repeater
+
+ASCII sequence:
+
+    Repeater / Master                              Client / Slave
+    -----------------                              --------------
+
+        t1
+        |  Sync(t1)
+        |---------------------------------------------->|
+                                                       |
+                                                       | t2
+                                                       |
+                                                       | t3
+        |<----------------------------------------------|
+                          Delay_Req(t1,t2,t3)          |
+        |
+        | t4
+        |
+        |  Delay_Resp(t1,t2,t3,t4)
+        |---------------------------------------------->|
+
+
+Definitions
+-----------
+
+Let:
+
+    M = master clock time
+    S = slave clock time
+
+The offset we want is:
+
+    O = M - S
+
+So:
+
+    M = S + O
+
+Equivalently:
+
+    S = M - O
+
+This document uses:
+
+    t_offset = O = M - S = master_minus_slave
+
+Therefore, when a timestamp is measured on the slave/client clock:
+
+    t_slave = timestamp read from the client clock
+
+the equivalent timestamp in the master/repeater clock domain is:
+
+    t_master_equivalent = t_slave + t_offset
+
+or, using prime notation:
+
+    t'_slave = t_slave + t_offset
+
+where:
+
+    t'_slave means "the slave timestamp converted to master time"
+
+If instead someone defines the offset the opposite way:
+
+    O_slave_minus_master = S - M
+
+then the conversion would be:
+
+    t_master_equivalent = t_slave - O_slave_minus_master
+
+Both are valid conventions, but the sign changes. The script uses the first
+convention:
+
+    clock_offset_ns = master_minus_slave = M - S
+
+so the script must add it:
+
+    corrected_client_time = ts_recv_ns + clock_offset_ns
+
+If O is positive:
+
+    master is ahead of slave
+
+If O is negative:
+
+    slave is ahead of master
+
+
+Path Delay Assumption
+---------------------
+
+PTP estimates offset assuming the path delay is approximately symmetric:
+
+    master_to_slave_delay ~= slave_to_master_delay
+
+Call this one-way path delay:
+
+    d
+
+This is the key assumption. If the path is strongly asymmetric, the offset can be
+biased.
+
+
+Forward Direction: Master -> Slave
+----------------------------------
+
+The master sends Sync at master time:
+
+    t1
+
+The message takes approximately:
+
+    d
+
+to reach the client.
+
+In master-clock terms, the Sync arrives at:
+
+    t1 + d
+
+But the client records the arrival with the slave clock, not the master clock.
+
+Since:
+
+    S = M - O
+
+the client timestamp is:
+
+    t2 = (t1 + d) - O
+
+Rearrange:
+
+    t2 - t1 = d - O
+
+This observed difference contains both:
+
+    path delay d
+    clock offset O
+
+
+Backward Direction: Slave -> Master
+-----------------------------------
+
+The client sends Delay_Req at slave time:
+
+    t3
+
+Convert that to master time:
+
+    M = S + O
+
+So the send time in master-clock terms is:
+
+    t3 + O
+
+The message takes approximately:
+
+    d
+
+to reach the repeater.
+
+The repeater records arrival at master time:
+
+    t4 = t3 + O + d
+
+Rearrange:
+
+    t4 - t3 = O + d
+
+This also contains both:
+
+    path delay d
+    clock offset O
+
+
+Two Equations
+-------------
+
+From the forward direction:
+
+    t2 - t1 = d - O
+
+From the backward direction:
+
+    t4 - t3 = d + O
+
+Let:
+
+    A = t2 - t1
+    B = t4 - t3
+
+Then:
+
+    A = d - O
+    B = d + O
+
+
+Solving For Offset
+------------------
+
+Subtract A from B:
+
+    B - A = (d + O) - (d - O)
+
+The path delay cancels:
+
+    B - A = 2O
+
+Therefore:
+
+    O = (B - A) / 2
+
+Substitute A and B:
+
+    O = ((t4 - t3) - (t2 - t1)) / 2
+
+This is the value used by the script:
+
+    clock_offset_ns = master_minus_slave
+                    = ((t4 - t3) - (t2 - t1)) / 2
+
+
+Solving For Mean Path Delay
+---------------------------
+
+Add A and B:
+
+    A + B = (d - O) + (d + O)
+
+The offset cancels:
+
+    A + B = 2d
+
+Therefore:
+
+    d = (A + B) / 2
+
+Substitute A and B:
+
+    mean_path_delay = ((t2 - t1) + (t4 - t3)) / 2
+
+This is stored as:
+
+    clock_sync_path_delay_ns
+
+
+Why The Client Can Correct Its Clock
+------------------------------------
+
+The client has local receive time:
+
+    client_time = S
+
+The script estimates:
+
+    O = M - S
+
+So the corrected client time is:
+
+    corrected_client_time = S + O
+
+Since:
+
+    O = M - S
+
+then:
+
+    corrected_client_time = S + (M - S)
+
+and the S terms cancel:
+
+    corrected_client_time = M
+
+That is why the client can compare:
+
+    corrected_client_time - repeater_ts_emit_ns
+
+Both terms are now in the master/repeater clock domain.
+
+In the notation used by the code:
+
+    ts_recv_ns
+        timestamp measured on the client/slave clock
+
+    clock_offset_ns
+        master_minus_slave = M - S
+
+    ts_emit_ns
+        timestamp measured on the repeater/master clock
+
+So:
+
+    ts_recv_master_ns = ts_recv_ns + clock_offset_ns
+
+and:
+
+    delay_ns = ts_recv_master_ns - ts_emit_ns
+
+Substitute:
+
+    delay_ns = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+This is exactly what the code does:
+
+    last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+
+Sign Examples
+-------------
+
+Example A: master is ahead of slave
+
+    master time M = 1000 ns
+    slave time  S = 900 ns
+
+Then:
+
+    t_offset = M - S = 100 ns
+
+If the client reads:
+
+    ts_recv_ns = 900 ns
+
+convert it to master time:
+
+    ts_recv_master_ns = ts_recv_ns + t_offset
+                      = 900 + 100
+                      = 1000 ns
+
+So a positive offset is added.
+
+
+Example B: slave is ahead of master
+
+    master time M = 1000 ns
+    slave time  S = 1100 ns
+
+Then:
+
+    t_offset = M - S = -100 ns
+
+If the client reads:
+
+    ts_recv_ns = 1100 ns
+
+convert it to master time:
+
+    ts_recv_master_ns = ts_recv_ns + t_offset
+                      = 1100 + (-100)
+                      = 1000 ns
+
+So a negative offset is still added. Adding a negative value is equivalent to
+subtracting its absolute value.
+
+
+General Formula With +- Notation
+--------------------------------
+
+If a timestamp tn is read from the slave/client clock, then the timestamp in the
+master/repeater clock domain is:
+
+    t'n = tn + t_offset
+
+when:
+
+    t_offset = master - slave
+
+If the offset is defined the other way:
+
+    t_offset_alt = slave - master
+
+then:
+
+    t'n = tn - t_offset_alt
+
+So the generic statement:
+
+    t'n = tn +- t_offset
+
+is correct only if the sign convention is stated. In this project the convention
+is fixed as:
+
+    t_offset = master - slave
+
+therefore the formula is:
+
+    t'n = tn + t_offset
+
+
+Numerical Example
+-----------------
+
+Assume:
+
+    master clock is 100 ns ahead of client
+    O = master - slave = +100 ns
+
+Assume symmetric one-way path delay:
+
+    d = 50 ns
+
+Master sends Sync at:
+
+    t1 = 1000 ns
+
+It arrives at the client in master time:
+
+    1000 + 50 = 1050 ns
+
+But the client clock is 100 ns behind master:
+
+    t2 = 1050 - 100 = 950 ns
+
+So:
+
+    t2 - t1 = 950 - 1000 = -50 ns
+
+Now the client sends Delay_Req at:
+
+    t3 = 2000 ns  (slave time)
+
+In master time that is:
+
+    2000 + 100 = 2100 ns
+
+It arrives after 50 ns:
+
+    t4 = 2150 ns
+
+So:
+
+    t4 - t3 = 2150 - 2000 = 150 ns
+
+Compute offset:
+
+    clock_offset_ns = ((t4 - t3) - (t2 - t1)) / 2
+                    = (150 - (-50)) / 2
+                    = 200 / 2
+                    = 100 ns
+
+Correct.
+
+Compute mean path delay:
+
+    mean_path_delay = ((t2 - t1) + (t4 - t3)) / 2
+                    = (-50 + 150) / 2
+                    = 100 / 2
+                    = 50 ns
+
+Correct.
+
+
+Why Multiple Samples Are Averaged
+---------------------------------
+
+One PTP sample can be distorted by:
+
+    OS scheduling jitter
+    socket wakeup delay
+    TCP queueing
+    VM/WSL pauses
+    interrupt handling
+    SSH tunnel jitter
+
+So the script performs N samples:
+
+    --clock-sync-samples N
+
+For every sample it computes:
+
+    offset_i = ((t4_i - t3_i) - (t2_i - t1_i)) / 2
+    path_i   = ((t2_i - t1_i) + (t4_i - t3_i)) / 2
+
+Then:
+
+    clock_offset_ns = average(offset_i)
+    clock_sync_path_delay_ns = average(path_i)
+
+The average smooths random jitter. It does not remove systematic asymmetry.
+
+
+Important Limitation
+--------------------
+
+The math is exact only if the forward and backward path delays are equal:
+
+    d_forward = d_backward
+
+If not:
+
+    t2 - t1 = d_forward - O
+    t4 - t3 = d_backward + O
+
+Then the estimated offset becomes:
+
+    O_est = O + (d_backward - d_forward) / 2
+
+So any path asymmetry appears as offset error.
+
+This is why PTP works best with stable, symmetric paths and hardware timestamping.
+In this Python/TCP version, it is still useful for estimating the main clock
+offset, but it should not be treated as nanosecond-accurate absolute truth over
+SSH, VMs, WSL, or asymmetric routing.
+
+
+How This Maps To The Script
+---------------------------
+
+In minimal_epr_fast.py:
+
+    serve_clock_sync()
+        runs on the repeater/master
+        sends Sync(t1)
+        receives Delay_Req(t1,t2,t3)
+        captures t4
+        sends Delay_Resp(t1,t2,t3,t4)
+
+    estimate_clock_offset()
+        runs on each client/slave
+        receives t1
+        captures t2
+        captures t3
+        receives t4
+        computes offset_i and path_i
+        returns average offset and average path delay
+
+    run_client()
+        applies:
+
+            last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+This makes the client-side receive timestamp comparable with the repeater-side
+swap timestamp.
+
+
+What --center-delay Does
+------------------------
+
+--center-delay is not a clock synchronization method.
+It does not change clock_offset_ns.
+It does not improve the PTP estimate.
+It is a post-processing step applied after the client has already received all
+messages.
+
+First, the client computes the raw/corrected delay for each sample:
+
+    delay_ns = corrected_client_time - repeater_ts_emit_ns
+
+where:
+
+    corrected_client_time = ts_recv_ns + clock_offset_ns
+
+So:
+
+    delay_ns = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+Then, if --center-delay is enabled, the client computes the run median:
+
+    delay_center_ns = median(delay_ns samples)
+
+and creates a centered delay:
+
+    delay_centered_ns = delay_ns - delay_center_ns
+
+This means the median sample becomes zero or very close to zero.
+
+Example:
+
+    raw delay samples:
+
+        13 ms, 14 ms, 15 ms, 40 ms
+
+    median:
+
+        delay_center_ns = 14 ms
+
+    centered samples:
+
+        -1 ms, 0 ms, +1 ms, +26 ms
+
+The centered values answer a different question:
+
+    "How far is this sample from the typical delay of this run?"
+
+not:
+
+    "What was the absolute one-way delay?"
+
+
+Why min Can Be 0 With --center-delay
+------------------------------------
+
+When --center-delay is enabled, the printed min/max and percentiles use absolute
+distance from the centered delay:
+
+    abs(delay_centered_ns)
+
+If one sample is exactly equal to the median, then:
+
+    delay_centered_ns = delay_ns - delay_center_ns
+                      = median - median
+                      = 0
+
+So a printed min of 0 does not mean the message arrived instantly.
+It means that sample was exactly at the run median.
+
+
+Raw Delay Is Still Preserved
+----------------------------
+
+The CSV keeps both values:
+
+    delay_ns
+        raw/corrected delay in the repeater/master clock domain
+
+    delay_center_ns
+        median used for centering, or 0 if --center-delay is disabled
+
+    delay_centered_ns
+        delay_ns - delay_center_ns
+
+So --center-delay does not destroy the original measurement.
+It only changes which delay series is used for printed stats.
+
+
+Important Consequence For Werner
+--------------------------------
+
+In the current script, Werner decay is computed from the same delay series used
+for statistics:
+
+    without --center-delay:
+        Werner uses delay_ns
+
+    with --center-delay:
+        Werner uses delay_centered_ns
+
+Negative centered delay is clamped to zero for Werner decay, because negative
+physical age is not meaningful.
+
+This means --center-delay is best interpreted as a jitter-analysis mode. It is
+useful for comparing spikes around the run baseline, but it should not be used if
+the goal is to compute physically absolute Werner decay from the raw one-way
+delay.
