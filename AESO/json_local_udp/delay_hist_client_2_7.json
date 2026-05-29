@@ -1,0 +1,117 @@
+{
+  "client_id": 2,
+  "clock_offset_ns": 0,
+  "clock_sync_path_delay_ns": 0,
+  "csv_path": "csv_local_udp/delay_hist_client_2_7.csv",
+  "data_protocol": "udp",
+  "delay_abs_label": "abs_repeater_to_client",
+  "delay_center_ns": 0,
+  "delay_signed_label": "signed_repeater_to_client",
+  "exchanges": 2000,
+  "groups": {
+    "mean": {
+      "delay_ns": 16308,
+      "delay_s": 1.6308e-05,
+      "werner": 0.9680320573572241
+    },
+    "p50": {
+      "delay_ns": 16370,
+      "delay_s": 1.637e-05,
+      "werner": 0.9677882167417939
+    },
+    "p90": {
+      "delay_ns": 17150,
+      "delay_s": 1.715e-05,
+      "werner": 0.9662680488301054
+    },
+    "p95": {
+      "delay_ns": 18338,
+      "delay_s": 1.8338e-05,
+      "werner": 0.9638303358664216
+    },
+    "p99": {
+      "delay_ns": 31074,
+      "delay_s": 3.1074e-05,
+      "werner": 0.9389134279787092
+    },
+    "std": {
+      "delay_ns": 8121.476669980167,
+      "delay_s": 8.121476669980167e-06,
+      "werner": 0.014688220556464996
+    }
+  },
+  "json_path": "json_local_udp/delay_hist_client_2_7.json",
+  "repeater_id": 0,
+  "role": "client",
+  "sample_count": 1932,
+  "samples": {
+    "last": {
+      "count_idx": null,
+      "delay_label": "signed_repeater_to_client",
+      "delay_ns": 16159,
+      "delay_s": 1.6159e-05,
+      "label": "last",
+      "msg": {
+        "bits": 3,
+        "bits_bin": "11",
+        "peer_id": 1,
+        "ts_emit": "34:14.579175561",
+        "ts_emit_ns": 1779960854579175561,
+        "w_swap": 0.9681986459505358
+      },
+      "state_out": {
+        "local_id": 2,
+        "peer_id": 1,
+        "werner": 0.9681986459505358
+      }
+    },
+    "max": {
+      "count_idx": 488,
+      "delay_label": "signed_repeater_to_client",
+      "delay_ns": 142157,
+      "delay_s": 0.000142157,
+      "label": "max",
+      "msg": {
+        "bits": 2,
+        "bits_bin": "10",
+        "peer_id": 1,
+        "ts_emit": "34:14.548722661",
+        "ts_emit_ns": 1779960854548722661,
+        "w_swap": 0.7525303130857648
+      },
+      "state_out": {
+        "local_id": 2,
+        "peer_id": 1,
+        "werner": 0.7525303130857648
+      }
+    },
+    "min": {
+      "count_idx": 1054,
+      "delay_label": "signed_repeater_to_client",
+      "delay_ns": 2169,
+      "delay_s": 2.169e-06,
+      "label": "min",
+      "msg": {
+        "bits": 0,
+        "bits_bin": "00",
+        "peer_id": 1,
+        "ts_emit": "34:14.560976076",
+        "ts_emit_ns": 1779960854560976076,
+        "w_swap": 0.995671395531152
+      },
+      "state_out": {
+        "local_id": 2,
+        "peer_id": 1,
+        "werner": 0.995671395531152
+      }
+    }
+  },
+  "state_in": {
+    "local_id": 2,
+    "peer_id": 0,
+    "werner": 1.0
+  },
+  "udp_lost_est": 18,
+  "udp_received": 1982,
+  "warmup": 50
+}

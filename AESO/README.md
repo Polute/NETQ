@@ -431,12 +431,40 @@ Client:
                             auto calibration and does not require --clock-sync.
       --center-delay        Center delay stats around the run median; raw signed
                             delay stays in CSV.
+      --data-protocol {udp,tcp}
+                            Transport for swapping result messages after TCP/PTP
+                            setup. UDP is the default.
+      --udp-idle-timeout UDP_IDLE_TIMEOUT
+                            Stop waiting for UDP data after this many idle seconds.
+
+UDP data channel
+
+The PTP/control phase still uses TCP. After that setup, the swapping-result
+messages use UDP by default:
+
+    --data-protocol udp
+
+UDP messages include count_idx, so a lost packet is visible as a missing count in
+the CSV instead of being silently renumbered. The client output also prints:
+
+    udp_received
+    udp_lost_est
+
+Use TCP explicitly if the network path does not support UDP:
+
+    --data-protocol tcp
+
+Important: normal SSH -L/-R forwarding is TCP-only. If the clients connect
+through SSH reverse tunnels, UDP data will not cross those tunnels. For UDP, use
+direct IP connectivity between client and repeater, or keep the experiment on
+TCP with --data-protocol tcp.
 
 Current 3-machine setup: local WSL repeater, two remote clients
 
 Use this setup when the repeater runs on the local WSL/laptop machine and each
 client runs on a different remote Ubuntu machine. Because the clients are remote
-and the repeater is local, use SSH reverse tunnels (-R).
+and the repeater is local, use SSH reverse tunnels (-R). This setup is for TCP
+data transport, because SSH -R does not forward UDP.
 
 Open one SSH session to remote client 1:
 
@@ -468,6 +496,7 @@ Then run the repeater locally:
       --quiet \
       --clock-sync \
       --clock-sync-samples 256 \
+      --data-protocol tcp \
       --accept-timeout 120
 
 Run client 1 on remote machine 1:
@@ -483,6 +512,7 @@ Run client 1 on remote machine 1:
       --plot \
       --clock-sync \
       --clock-sync-samples 256 \
+      --data-protocol tcp \
       --center-delay
 
 Run client 2 on remote machine 2:
@@ -498,6 +528,7 @@ Run client 2 on remote machine 2:
       --plot \
       --clock-sync \
       --clock-sync-samples 256 \
+      --data-protocol tcp \
       --center-delay
 
 Notes:
@@ -511,3 +542,239 @@ Notes:
 - --center-delay is recommended for this SSH reverse-tunnel setup because
   absolute one-way delay can be biased by path asymmetry, while centered delay is
   useful for jitter analysis.
+
+UDP setup: direct IP, no SSH port forwarding
+
+Use this when you want the swapping-result messages to use UDP. SSH -L/-R does
+not forward UDP, so the clients must be able to reach the repeater directly by
+IP address and UDP ports 7401/7402 must be allowed by the network/firewall.
+
+On the repeater machine, find its IP address:
+
+    ip -4 addr
+
+Assume the repeater IP is:
+
+    REPEATER_IP
+
+Run the repeater listening on all interfaces:
+
+    cd /home/giicc/NETQ/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+      --listen-host-a 0.0.0.0 \
+      --listen-port-a 7401 \
+      --listen-host-b 0.0.0.0 \
+      --listen-port-b 7402 \
+      --werner-ar 1 \
+      --werner-br 1 \
+      --quiet \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --accept-timeout 120
+
+Run client 1 on remote machine 1:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 10.10.10.1 \
+      --repeater-port 7401 \
+      --client-id 1 \
+      --quiet \
+      --plot \
+      --plot-dir csv_udp_direct \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --connect-timeout 120 \
+      --detect-timeout 120
+
+Run client 2 on remote machine 2:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 10.10.20.1 \
+      --repeater-port 7402 \
+      --client-id 2 \
+      --quiet \
+      --plot \
+      --plot-dir csv_udp_direct \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --connect-timeout 120 \
+      --detect-timeout 120
+
+If the repeater is Windows/WSL, UDP to WSL may need extra networking/firewall
+configuration. The simplest reliable UDP test is all three processes on the
+same host with REPEATER_IP = 127.0.0.1. For remote UDP, prefer a real Linux
+machine as repeater or make sure the host forwards/allows UDP 7401 and 7402.
+
+After the run, plot and check UDP losses:
+
+    python3 plot_delay_hist.py csv_udp_direct --last
+
+This writes plots to:
+
+    plots_udp_direct/
+
+and missing-count plots to:
+
+    plots_udp_direct/udp_missing/
+
+UDP setup through SSH TUN, local repeater and two remote clients
+
+Use this when there is no direct route from the remote clients to the local
+repeater, but you still want UDP packets to cross the SSH connection. This uses
+OpenSSH TUN forwarding (`ssh -w`), not normal `ssh -L` or `ssh -R`.
+
+Topology:
+
+    local repeater:
+        tun0 -> remote client 1 tunnel, local IP 10.10.10.1
+        tun1 -> remote client 2 tunnel, local IP 10.10.20.1
+
+    remote client 1, 192.168.0.223:
+        tun0 remote IP 10.10.10.2
+
+    remote client 2, 192.168.0.226:
+        tun0 remote IP 10.10.20.2
+
+One-time configuration on remote client 1, 192.168.0.223:
+
+    ssh -J pasarela@kr.ls.fi.upm.es ubuntu22@192.168.0.223
+
+    echo 'PermitTunnel yes' | sudo tee /etc/ssh/sshd_config.d/99-permit-tunnel.conf
+    sudo systemctl restart ssh
+
+    sudo ip link delete tun0 2>/dev/null
+    sudo ip tuntap add dev tun0 mode tun user ubuntu22
+    sudo ip addr add 10.10.10.2/30 dev tun0
+    sudo ip link set tun0 up
+    ip addr show tun0
+
+One-time configuration on remote client 2, 192.168.0.226:
+
+    ssh -J pasarela@kr.ls.fi.upm.es ubuntu22@192.168.0.226
+
+    echo 'PermitTunnel yes' | sudo tee /etc/ssh/sshd_config.d/99-permit-tunnel.conf
+    sudo systemctl restart ssh
+
+    sudo ip link delete tun0 2>/dev/null
+    sudo ip tuntap add dev tun0 mode tun user ubuntu22
+    sudo ip addr add 10.10.20.2/30 dev tun0
+    sudo ip link set tun0 up
+    ip addr show tun0
+
+One-time configuration on the local repeater machine:
+
+    sudo ip link delete tun0 2>/dev/null
+    sudo ip tuntap add dev tun0 mode tun user giicc
+    sudo ip addr add 10.10.10.1/30 dev tun0
+    sudo ip link set tun0 up
+    ip addr show tun0
+
+    sudo ip link delete tun1 2>/dev/null
+    sudo ip tuntap add dev tun1 mode tun user giicc
+    sudo ip addr add 10.10.20.1/30 dev tun1
+    sudo ip link set tun1 up
+    ip addr show tun1
+
+Open both SSH TUN connections and keep them open while the experiment runs.
+
+Terminal local 1, tunnel to remote client 1:
+
+    ssh -w 0:0 \
+      -J pasarela@kr.ls.fi.upm.es \
+      -o Tunnel=point-to-point \
+      ubuntu22@192.168.0.223
+
+Terminal local 2, tunnel to remote client 2:
+
+    ssh -w 1:0 \
+      -J pasarela@kr.ls.fi.upm.es \
+      -o Tunnel=point-to-point \
+      ubuntu22@192.168.0.226
+
+Test the TUN connections.
+
+From the local repeater machine:
+
+    ping 10.10.10.2
+    ping 10.10.20.2
+
+From remote client 1:
+
+    ping 10.10.10.1
+
+From remote client 2:
+
+    ping 10.10.20.1
+
+Run the experiment.
+
+Local repeater:
+
+    cd /home/giicc/NETQ/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+      --listen-host-a 0.0.0.0 \
+      --listen-port-a 7401 \
+      --listen-host-b 0.0.0.0 \
+      --listen-port-b 7402 \
+      --werner-ar 1 \
+      --werner-br 1 \
+      --quiet \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --accept-timeout 120 \
+      --cpu 3
+
+Remote client 1, 192.168.0.223:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 10.10.10.1 \
+      --repeater-port 7401 \
+      --client-id 1 \
+      --quiet \
+      --plot \
+      --plot-dir csv_udp_tun \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --connect-timeout 120 \
+      --detect-timeout 120 \
+      --cpu 1
+
+
+Remote client 2, 192.168.0.226:
+
+    cd /home/ubuntu22/AESO
+
+    sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+      --repeater-host 10.10.20.1 \
+      --repeater-port 7402 \
+      --client-id 2 \
+      --quiet \
+      --plot \
+      --plot-dir csv_udp_tun \
+      --clock-sync \
+      --clock-sync-samples 256 \
+      --data-protocol udp \
+      --connect-timeout 120 \
+      --detect-timeout 120 \
+      --cpu 1
+
+After the run, fetch or copy the remote CSV/JSON files and plot them:
+
+    python3 plot_delay_hist.py csv_udp_tun --last
+
+The UDP missing-count plots are written under:
+
+    plots_udp_tun/udp_missing/

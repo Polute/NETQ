@@ -14,6 +14,10 @@ TS_FORMAT = "!Q"
 TS_SIZE = struct.calcsize(TS_FORMAT)
 MSG_FORMAT = "!QIBd"
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
+UDP_MSG_FORMAT = "!IQIBd"
+UDP_MSG_SIZE = struct.calcsize(UDP_MSG_FORMAT)
+UDP_HELLO_MAGIC = b"AESOUDP1"
+UDP_READY_BYTE = b"U"
 CLOCK_SYNC_SYNC_FORMAT = "!Q"
 CLOCK_SYNC_SYNC_SIZE = struct.calcsize(CLOCK_SYNC_SYNC_FORMAT)
 CLOCK_SYNC_DELAY_REQ_FORMAT = "!QQQ"
@@ -51,9 +55,12 @@ def parse_args():
     repeater.add_argument("--quiet", action="store_true")
     repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
     repeater.add_argument("--plot-prefix", default="repeater_send_hist", help="Prefix for repeater send timing CSV outputs.")
+    repeater.add_argument("--plot-dir", default="csv", help="Directory where --plot CSV files are written.")
     repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
     repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run PTP-style clock offset calibration. Enable it on both clients too.")
     repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    repeater.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
+    repeater.add_argument("--udp-ready-timeout", type=float, default=30.0, help="Seconds to wait for each client's UDP hello.")
 
     client = subparsers.add_parser("client", help="Run in client mode.")
     client.add_argument("--repeater-host", default="127.0.0.1")
@@ -63,7 +70,7 @@ def parse_args():
     client.add_argument("--connect-timeout", type=float, default=10.0)
     client.add_argument("--detect-timeout", type=float, default=30.0)
     client.add_argument("--detect-interval", type=float, default=0.05)
-    client.add_argument("--cpu", type=int, default=5, help="Pin this process to one CPU core.")
+    client.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
     client.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
     client.add_argument("--sock-buf", type=int, default=4096, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
     client.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
@@ -72,6 +79,7 @@ def parse_args():
     client.add_argument("--werner-in", type=float, default=1)
     client.add_argument("--plot", action="store_true", help="Write delay histogram data and plot if matplotlib is available.")
     client.add_argument("--plot-prefix", default="delay_hist_client", help="Prefix for plot outputs.")
+    client.add_argument("--plot-dir", default="csv", help="Directory where --plot CSV files are written.")
     client.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
     client.add_argument("--quiet", action="store_true")
     client.add_argument("--t1-ns", type=float, default=1_000_000.0)
@@ -80,6 +88,8 @@ def parse_args():
     client.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
     client.add_argument("--clock-offset-ns", type=int, default=None, help="Manual repeater-clock minus client-clock offset. Skips auto calibration and does not require --clock-sync.")
     client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
+    client.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
+    client.add_argument("--udp-idle-timeout", type=float, default=5.0, help="Stop waiting for UDP data after this many idle seconds.")
 
     return parser.parse_args()
 
@@ -198,6 +208,62 @@ def connect_repeater_until_ready(host, port, connect_timeout, detect_timeout, de
     raise TimeoutError("Repeater was not detected before detect-timeout expired") from last_error
 
 
+def udp_bind_socket(host, port, sock_buf, busy_poll_us, timeout=None):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    enable_low_latency_socket(sock, sock_buf, busy_poll_us)
+    if timeout is not None:
+        sock.settimeout(float(timeout))
+    sock.bind((host, port))
+    return sock
+
+
+def accept_udp_peer(control_sock, udp_sock):
+    try:
+        while True:
+            data, addr = udp_sock.recvfrom(64)
+            if data == UDP_HELLO_MAGIC:
+                udp_sock.connect(addr)
+                control_sock.sendall(UDP_READY_BYTE)
+                return udp_sock
+    except Exception:
+        udp_sock.close()
+        raise
+
+
+def connect_udp_data(control_sock, host, port, sock_buf, busy_poll_us, detect_timeout, detect_interval):
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    enable_low_latency_socket(udp_sock, sock_buf, busy_poll_us)
+    udp_sock.bind(("", 0))
+    udp_sock.connect((host, port))
+    deadline = time.monotonic() + max(0.0, detect_timeout)
+    old_timeout = control_sock.gettimeout()
+    try:
+        control_sock.settimeout(max(0.001, min(0.05, max(0.001, detect_interval))))
+        while time.monotonic() < deadline:
+            try:
+                udp_sock.send(UDP_HELLO_MAGIC)
+            except ConnectionRefusedError:
+                time.sleep(min(max(0.0, detect_interval), 0.01))
+                continue
+            try:
+                ready = control_sock.recv(1)
+                if ready == UDP_READY_BYTE:
+                    return udp_sock
+                if ready == b"":
+                    raise ConnectionError("TCP control socket closed before UDP setup")
+            except socket.timeout:
+                pass
+            time.sleep(min(max(0.0, detect_interval), 0.01))
+    except Exception:
+        udp_sock.close()
+        raise
+    finally:
+        control_sock.settimeout(old_timeout)
+    udp_sock.close()
+    raise TimeoutError("Repeater did not confirm UDP setup before detect-timeout expired")
+
+
 def percentile(sorted_vals, p):
     if not sorted_vals:
         return 0
@@ -307,8 +373,9 @@ def run_repeater(args):
     state_br = (args.repeater_id, w_br_init, args.client_b_id)
     last_ar_ns = time.monotonic_ns()
     last_br_ns = time.monotonic_ns()
-    outbuf_a = bytearray(MSG_SIZE)
-    outbuf_b = bytearray(MSG_SIZE)
+    data_msg_size = UDP_MSG_SIZE if args.data_protocol == "udp" else MSG_SIZE
+    outbuf_a = bytearray(data_msg_size)
+    outbuf_b = bytearray(data_msg_size)
     last_state_in_ar = state_ar
     last_state_in_br = state_br
     last_msg_a = (0, 0, 0, 0.0)
@@ -332,9 +399,25 @@ def run_repeater(args):
 
     conn_a = accept_one(args.listen_host_a, args.listen_port_a)
     conn_b = accept_one(args.listen_host_b, args.listen_port_b)
+    if args.data_protocol == "udp":
+        udp_a = udp_bind_socket(
+            args.listen_host_a, args.listen_port_a, args.sock_buf, args.busy_poll_us, args.udp_ready_timeout
+        )
+        udp_b = udp_bind_socket(
+            args.listen_host_b, args.listen_port_b, args.sock_buf, args.busy_poll_us, args.udp_ready_timeout
+        )
+    else:
+        udp_a = None
+        udp_b = None
     if args.clock_sync:
         serve_clock_sync(conn_a, args.clock_sync_samples)
         serve_clock_sync(conn_b, args.clock_sync_samples)
+    if args.data_protocol == "udp":
+        data_a = accept_udp_peer(conn_a, udp_a)
+        data_b = accept_udp_peer(conn_b, udp_b)
+    else:
+        data_a = conn_a
+        data_b = conn_b
 
     def update_round_state(now_ns, correction_bits):
         state_ar_local = (args.repeater_id, w_ar_init, args.client_a_id)
@@ -346,50 +429,64 @@ def run_repeater(args):
     if args.parallel:
         barrier_ready = threading.Barrier(3)
         barrier_done = threading.Barrier(3)
+        last_msg_a_ref = [last_msg_a]
+        last_msg_b_ref = [last_msg_b]
 
-        def sender_thread(conn, buffer_ref, cpu_pin, send_block_samples):
+        def sender_thread(conn, buffer_ref, cpu_pin, send_block_samples, peer_id, last_msg_ref):
             set_thread_affinity(cpu_pin)
             for idx in range(count):
                 barrier_ready.wait()
+                ts_emit_ns = time.time_ns()
+                correction_bits = correction_bits_samples[idx]
+                w_swap = 1.0
+                if args.data_protocol == "udp":
+                    struct.pack_into(UDP_MSG_FORMAT, buffer_ref, 0, idx + 1, ts_emit_ns, peer_id, correction_bits, w_swap)
+                else:
+                    struct.pack_into(MSG_FORMAT, buffer_ref, 0, ts_emit_ns, peer_id, correction_bits, w_swap)
                 if args.diag:
                     pre_send_ns = time.monotonic_ns()
-                    conn.sendall(buffer_ref)
+                    if args.data_protocol == "udp":
+                        conn.send(buffer_ref)
+                    else:
+                        conn.sendall(buffer_ref)
                     send_block_samples[idx] = time.monotonic_ns() - pre_send_ns
                 else:
-                    conn.sendall(buffer_ref)
+                    if args.data_protocol == "udp":
+                        conn.send(buffer_ref)
+                    else:
+                        conn.sendall(buffer_ref)
+                last_msg_ref[0] = (ts_emit_ns, peer_id, correction_bits, w_swap)
                 barrier_done.wait()
 
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
-            with conn_a, conn_b:
+            with conn_a, conn_b, data_a, data_b:
                 t_a = threading.Thread(
                     target=sender_thread,
-                    args=(conn_a, outbuf_a, args.cpu_a, send_a_block_samples),
+                    args=(data_a, outbuf_a, args.cpu_a, send_a_block_samples, args.client_b_id, last_msg_a_ref),
                     daemon=True,
                 )
                 t_b = threading.Thread(
                     target=sender_thread,
-                    args=(conn_b, outbuf_b, args.cpu_b, send_b_block_samples),
+                    args=(data_b, outbuf_b, args.cpu_b, send_b_block_samples, args.client_a_id, last_msg_b_ref),
                     daemon=True,
                 )
                 t_a.start()
                 t_b.start()
                 for idx in range(count):
                     now_ns = time.monotonic_ns()
-                    state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(
+                    state_ar, state_br, _ts_emit_ns, correction_bits, w_swap = update_round_state(
                         now_ns, correction_bits_samples[idx]
                     )
                     last_state_in_ar = state_ar
                     last_state_in_br = state_br
                     last_ar_ns = now_ns
                     last_br_ns = now_ns
-                    struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                    struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
-                    last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                    last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
                     barrier_ready.wait()
                     barrier_done.wait()
+                    last_msg_a = last_msg_a_ref[0]
+                    last_msg_b = last_msg_b_ref[0]
                     if args.diag:
                         send_gap_ab_samples[idx] = 0
                     if args.count_interval > 0:
@@ -403,34 +500,58 @@ def run_repeater(args):
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
-            with conn_a, conn_b:
+            with conn_a, conn_b, data_a, data_b:
                 for idx in range(count):
                     now_ns = time.monotonic_ns()
-                    state_ar, state_br, ts_emit_ns, correction_bits, w_swap = update_round_state(
+                    state_ar, state_br, _ts_emit_ns, correction_bits, w_swap = update_round_state(
                         now_ns, correction_bits_samples[idx]
                     )
                     last_state_in_ar = state_ar
                     last_state_in_br = state_br
                     last_ar_ns = now_ns
                     last_br_ns = now_ns
-                    struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_ns, args.client_b_id, correction_bits, w_swap)
+                    ts_emit_a_ns = time.time_ns()
+                    if args.data_protocol == "udp":
+                        struct.pack_into(
+                            UDP_MSG_FORMAT, outbuf_a, 0, idx + 1, ts_emit_a_ns, args.client_b_id, correction_bits, w_swap
+                        )
+                    else:
+                        struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_a_ns, args.client_b_id, correction_bits, w_swap)
                     if args.diag:
                         pre_send_a_ns = time.monotonic_ns()
-                        conn_a.sendall(outbuf_a)
+                        if args.data_protocol == "udp":
+                            data_a.send(outbuf_a)
+                        else:
+                            data_a.sendall(outbuf_a)
                         post_send_a_ns = time.monotonic_ns()
                         send_a_block_samples[idx] = post_send_a_ns - pre_send_a_ns
                     else:
-                        conn_a.sendall(outbuf_a)
-                    last_msg_a = (ts_emit_ns, args.client_b_id, correction_bits, w_swap)
-                    struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                        if args.data_protocol == "udp":
+                            data_a.send(outbuf_a)
+                        else:
+                            data_a.sendall(outbuf_a)
+                    last_msg_a = (ts_emit_a_ns, args.client_b_id, correction_bits, w_swap)
+                    ts_emit_b_ns = time.time_ns()
+                    if args.data_protocol == "udp":
+                        struct.pack_into(
+                            UDP_MSG_FORMAT, outbuf_b, 0, idx + 1, ts_emit_b_ns, args.client_a_id, correction_bits, w_swap
+                        )
+                    else:
+                        struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_b_ns, args.client_a_id, correction_bits, w_swap)
                     if args.diag:
                         pre_send_b_ns = time.monotonic_ns()
                         send_gap_ab_samples[idx] = pre_send_b_ns - pre_send_a_ns
-                        conn_b.sendall(outbuf_b)
+                        if args.data_protocol == "udp":
+                            data_b.send(outbuf_b)
+                        else:
+                            data_b.sendall(outbuf_b)
                         send_b_block_samples[idx] = time.monotonic_ns() - pre_send_b_ns
                     else:
-                        conn_b.sendall(outbuf_b)
-                    last_msg_b = (ts_emit_ns, args.client_a_id, correction_bits, w_swap)
+                        if args.data_protocol == "udp":
+                            data_b.send(outbuf_b)
+                        else:
+                            data_b.sendall(outbuf_b)
+                    last_msg_b = (ts_emit_b_ns, args.client_a_id, correction_bits, w_swap)
                     if args.count_interval > 0:
                         time.sleep(args.count_interval)
         finally:
@@ -438,14 +559,14 @@ def run_repeater(args):
                 gc.enable()
 
     if args.plot:
-        os.makedirs("csv", exist_ok=True)
+        os.makedirs(args.plot_dir, exist_ok=True)
         base = args.plot_prefix
         suffix = ""
         idx = 1
-        while os.path.exists(os.path.join("csv", f"{base}{suffix}.csv")):
+        while os.path.exists(os.path.join(args.plot_dir, f"{base}{suffix}.csv")):
             idx += 1
             suffix = f"_{idx}"
-        csv_path = os.path.join("csv", f"{base}{suffix}.csv")
+        csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
                 handle.write("count_idx,send_a_block_ns,send_b_block_ns,send_gap_ab_ns\n")
@@ -463,6 +584,7 @@ def run_repeater(args):
         print("repeater_mode=fast3")
         print(f"exchanges={count}")
         print(f"repeater_id={args.repeater_id}")
+        print(f"data_protocol={args.data_protocol}")
     print("")
     print(f"state_ar_start={fmt_state((args.repeater_id, w_ar_init, args.client_a_id))}")
     print(f"state_br_start={fmt_state((args.repeater_id, w_br_init, args.client_b_id))}")
@@ -500,8 +622,11 @@ def run_client(args):
     last_msg = (0, 0, 0, 0.0)
     last_raw_msg = (0, 0, 0, 0.0)
     last_state_out = (args.client_id, 0.0, None)
-    inbuf = bytearray(MSG_SIZE)
+    data_msg_size = UDP_MSG_SIZE if args.data_protocol == "udp" else MSG_SIZE
+    inbuf = bytearray(data_msg_size)
     sample_idx = 0
+    udp_received = 0
+    udp_lost_est = 0
 
     with connect_repeater_until_ready(
         args.repeater_host,
@@ -521,41 +646,101 @@ def run_client(args):
             clock_offset_ns = 0
             clock_sync_path_delay_ns = 0
 
+        if args.data_protocol == "udp":
+            data_sock = connect_udp_data(
+                sock,
+                args.repeater_host,
+                args.repeater_port,
+                args.sock_buf,
+                args.busy_poll_us,
+                args.detect_timeout,
+                args.detect_interval,
+            )
+            data_sock.settimeout(float(args.udp_idle_timeout))
+        else:
+            data_sock = sock
+
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
             prev_loop_ns = time.monotonic_ns() if args.diag else 0
-            for i in range(count):
-                if args.diag:
-                    loop_now_ns = time.monotonic_ns()
-                    loop_gap_ns = loop_now_ns - prev_loop_ns
-                    prev_loop_ns = loop_now_ns
-                    pre_recv_ns = time.monotonic_ns()
-                    recv_exact_into(sock, inbuf)
-                    recv_block_ns = time.monotonic_ns() - pre_recv_ns
-                else:
-                    recv_exact_into(sock, inbuf)
-                ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
-                ts_recv_ns = time.time_ns()
-                w_swap_raw = float(w_swap)
-                peer_id = int(peer_id)
-                correction_bits = int(correction_bits)
-                last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
-                last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
-                if i >= warmup:
-                    delta_samples[sample_idx] = last_delta
-                    werner_raw_samples[sample_idx] = w_swap_raw
-                    sample_msgs[sample_idx] = (last_delta, i + 1, last_raw_msg, None)
-                    delta_record_counts[sample_idx] = i + 1
+            if args.data_protocol == "udp":
+                last_seq = 0
+                while True:
                     if args.diag:
-                        loop_gap_samples[sample_idx] = loop_gap_ns
-                        recv_block_samples[sample_idx] = recv_block_ns
-                    sample_idx += 1
-                if args.count_interval > 0:
-                    time.sleep(args.count_interval)
+                        loop_now_ns = time.monotonic_ns()
+                        loop_gap_ns = loop_now_ns - prev_loop_ns
+                        prev_loop_ns = loop_now_ns
+                        pre_recv_ns = time.monotonic_ns()
+                    try:
+                        got = data_sock.recv_into(inbuf)
+                    except socket.timeout:
+                        break
+                    if args.diag:
+                        recv_block_ns = time.monotonic_ns() - pre_recv_ns
+                    if got != UDP_MSG_SIZE:
+                        continue
+                    count_idx, ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(UDP_MSG_FORMAT, inbuf)
+                    ts_recv_ns = time.time_ns()
+                    count_idx = int(count_idx)
+                    if count_idx <= 0 or count_idx > count:
+                        continue
+                    udp_received += 1
+                    if count_idx > last_seq:
+                        udp_lost_est += max(0, count_idx - last_seq - 1)
+                        last_seq = count_idx
+                    w_swap_raw = float(w_swap)
+                    peer_id = int(peer_id)
+                    correction_bits = int(correction_bits)
+                    last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+                    last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+                    if count_idx > warmup and sample_idx < sample_count:
+                        delta_samples[sample_idx] = last_delta
+                        werner_raw_samples[sample_idx] = w_swap_raw
+                        sample_msgs[sample_idx] = (last_delta, count_idx, last_raw_msg, None)
+                        delta_record_counts[sample_idx] = count_idx
+                        if args.diag:
+                            loop_gap_samples[sample_idx] = loop_gap_ns
+                            recv_block_samples[sample_idx] = recv_block_ns
+                        sample_idx += 1
+                    if count_idx >= count:
+                        break
+                    if args.count_interval > 0:
+                        time.sleep(args.count_interval)
+            else:
+                for i in range(count):
+                    if args.diag:
+                        loop_now_ns = time.monotonic_ns()
+                        loop_gap_ns = loop_now_ns - prev_loop_ns
+                        prev_loop_ns = loop_now_ns
+                        pre_recv_ns = time.monotonic_ns()
+                        recv_exact_into(data_sock, inbuf)
+                        recv_block_ns = time.monotonic_ns() - pre_recv_ns
+                    else:
+                        recv_exact_into(data_sock, inbuf)
+                    ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
+                    ts_recv_ns = time.time_ns()
+                    w_swap_raw = float(w_swap)
+                    peer_id = int(peer_id)
+                    correction_bits = int(correction_bits)
+                    last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+                    last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+                    if i >= warmup:
+                        delta_samples[sample_idx] = last_delta
+                        werner_raw_samples[sample_idx] = w_swap_raw
+                        sample_msgs[sample_idx] = (last_delta, i + 1, last_raw_msg, None)
+                        delta_record_counts[sample_idx] = i + 1
+                        if args.diag:
+                            loop_gap_samples[sample_idx] = loop_gap_ns
+                            recv_block_samples[sample_idx] = recv_block_ns
+                        sample_idx += 1
+                    if args.count_interval > 0:
+                        time.sleep(args.count_interval)
         finally:
             if gc_was_enabled:
                 gc.enable()
+            if args.data_protocol == "udp":
+                data_sock.close()
 
     delta_samples = delta_samples[:sample_idx]
     werner_raw_samples = werner_raw_samples[:sample_idx]
@@ -607,14 +792,14 @@ def run_client(args):
     signed_delay_label = "signed_centered_repeater_to_client" if args.center_delay else "signed_repeater_to_client"
 
     if args.plot:
-        os.makedirs("csv", exist_ok=True)
+        os.makedirs(args.plot_dir, exist_ok=True)
         base = f"{args.plot_prefix}_{args.client_id}"
         suffix = ""
         idx = 1
-        while os.path.exists(os.path.join("csv", f"{base}{suffix}.csv")):
+        while os.path.exists(os.path.join(args.plot_dir, f"{base}{suffix}.csv")):
             idx += 1
             suffix = f"_{idx}"
-        csv_path = os.path.join("csv", f"{base}{suffix}.csv")
+        csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
                 handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n")
@@ -631,6 +816,10 @@ def run_client(args):
     if args.quiet:
         print(f"exchanges={count}")
         print(f"warmup={warmup}")
+        print(f"data_protocol={args.data_protocol}")
+        if args.data_protocol == "udp":
+            print(f"udp_received={udp_received}")
+            print(f"udp_lost_est={udp_lost_est}")
         print(f"clock_offset_ns={clock_offset_ns}")
         print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
         print(f"delay_center_ns={delay_center_ns}")
@@ -649,6 +838,10 @@ def run_client(args):
     print("client_mode=fast3")
     print(f"exchanges={count} warmup={warmup}")
     print(f"client_id={args.client_id} repeater_id={args.repeater_id}")
+    print(f"data_protocol={args.data_protocol}")
+    if args.data_protocol == "udp":
+        print(f"udp_received={udp_received}")
+        print(f"udp_lost_est={udp_lost_est}")
     print(f"clock_offset_ns={clock_offset_ns}")
     print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
     print(f"delay_center_ns={delay_center_ns}")
