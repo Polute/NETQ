@@ -6,19 +6,123 @@ import os
 
 
 def load_delays(csv_path):
-    delays_us = []
+    values_us = []
     counts = []
     with open(csv_path, "r", encoding="utf-8") as handle:
         reader = csv.reader(handle)
         header = next(reader, None)
         if header is None:
-            return counts, delays_us
+            return counts, values_us
         for row in reader:
             if len(row) < 2:
                 continue
             counts.append(int(row[0]))
-            delays_us.append(float(row[1]) / 1000.0)
-    return counts, delays_us
+            values_us.append(float(row[1]) / 1000.0)
+    return counts, values_us
+
+
+def load_plot_series(csv_path):
+    with open(csv_path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return []
+        fieldnames = set(reader.fieldnames)
+        rows = list(reader)
+
+    if {"sample_idx", "offset_ns", "path_delay_ns"}.issubset(fieldnames):
+        samples = [int(row["sample_idx"]) for row in rows]
+        return [
+            {
+                "kind": "clock_sync",
+                "suffix": "offset",
+                "title": "PTP offset",
+                "ylabel": "offset (us)",
+                "hist_xlabel": "offset (us)",
+                "x_label": "sample",
+                "x": samples,
+                "y": [float(row["offset_ns"]) / 1000.0 for row in rows],
+            },
+            {
+                "kind": "clock_sync",
+                "suffix": "path_delay",
+                "title": "PTP path delay",
+                "ylabel": "path delay (us)",
+                "hist_xlabel": "path delay (us)",
+                "x_label": "sample",
+                "x": samples,
+                "y": [float(row["path_delay_ns"]) / 1000.0 for row in rows],
+            },
+        ]
+
+    if {"count_idx", "delay_ns"}.issubset(fieldnames):
+        return [
+            {
+                "kind": "delay",
+                "suffix": "",
+                "title": "delay",
+                "ylabel": "delay (us)",
+                "hist_xlabel": "delay (us)",
+                "x_label": "count",
+                "x": [int(row["count_idx"]) for row in rows],
+                "y": [float(row["delay_ns"]) / 1000.0 for row in rows],
+            }
+        ]
+
+    counts, delays_us = load_delays(csv_path)
+    if not counts:
+        return []
+    return [
+        {
+            "kind": "delay",
+            "suffix": "",
+            "title": "delay",
+            "ylabel": "delay (us)",
+            "hist_xlabel": "delay (us)",
+            "x_label": "count",
+            "x": counts,
+            "y": delays_us,
+        }
+    ]
+
+
+def read_clock_offset_info(csv_path):
+    if not csv_path or not os.path.exists(csv_path):
+        return None
+    with open(csv_path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return None
+        rows = list(reader)
+    if not rows:
+        return None
+
+    mean_ns = None
+    if "clock_offset_mean_ns" in reader.fieldnames:
+        try:
+            mean_ns = float(rows[0]["clock_offset_mean_ns"])
+        except (TypeError, ValueError):
+            mean_ns = None
+    if mean_ns is None and "offset_ns" in reader.fieldnames:
+        offsets = []
+        for row in rows:
+            try:
+                offsets.append(float(row["offset_ns"]))
+            except (TypeError, ValueError):
+                pass
+        if offsets:
+            mean_ns = sum(offsets) / len(offsets)
+    if mean_ns is None:
+        return None
+    return f"clock offset mean = {mean_ns / 1000.0:.3f} us"
+
+
+def equivalent_clock_sync_csv(csv_path):
+    name = os.path.basename(csv_path)
+    if not name.startswith("delay_hist_client_") or not name.endswith(".csv"):
+        return None
+    suffix = name[len("delay_hist_client_") : -len(".csv")]
+    candidate = os.path.join(os.path.dirname(csv_path), f"clock_sync_client_{suffix}.csv")
+    return candidate if os.path.exists(candidate) else None
 
 
 def confirm_overwrite(path):
@@ -111,13 +215,18 @@ def collect_jobs(inputs):
     if inputs:
         for input_path in inputs:
             if os.path.isdir(input_path):
-                csv_root = input_path if is_csv_dir(input_path) else find_csv_root(input_path)
-                plots_root = csv_dir_to_plots_dir(csv_root)
+                if is_csv_dir(input_path):
+                    csv_root = input_path
+                    plots_root = csv_dir_to_plots_dir(csv_root)
+                else:
+                    csv_root = input_path
+                    plots_root = input_path
                 for csv_path in iter_csv_files(input_path):
                     jobs.append((csv_path, csv_root, plots_root))
             else:
                 csv_root = find_csv_root(input_path)
-                jobs.append((input_path, csv_root, csv_dir_to_plots_dir(csv_root)))
+                plots_root = csv_dir_to_plots_dir(csv_root) if is_csv_dir(csv_root) else csv_root
+                jobs.append((input_path, csv_root, plots_root))
         return jobs
 
     csv_dirs = discover_csv_dirs()
@@ -130,17 +239,26 @@ def collect_jobs(inputs):
     return jobs
 
 
-def output_paths(csv_path, csv_root, plots_root, base):
+def output_paths(csv_path, csv_root, plots_root, base, clock=False):
     rel_dir = os.path.relpath(os.path.dirname(csv_path), csv_root)
     if rel_dir == ".":
         rel_dir = ""
     plot_base_dir = os.path.join(plots_root, rel_dir)
+    if clock:
+        plot_base_dir = os.path.join(plot_base_dir, "_clock")
     hist_path = os.path.join(plot_base_dir, "sec", f"{base}.png")
     seq_path = os.path.join(plot_base_dir, "counter", f"{base}_seq.png")
     filtered_path = os.path.join(plot_base_dir, "counter_filtered", f"{base}_seq_filtered.png")
     outliers_path = os.path.join(plot_base_dir, "counter_outliers", f"{base}_seq_outliers.png")
     udp_missing_path = os.path.join(plot_base_dir, "udp_missing", f"{base}_udp_missing.png")
     return hist_path, seq_path, filtered_path, outliers_path, udp_missing_path
+
+
+def series_output_paths(csv_path, csv_root, plots_root, base, series):
+    series_base = base
+    if series["suffix"]:
+        series_base = f"{base}_{series['suffix']}"
+    return output_paths(csv_path, csv_root, plots_root, series_base, clock=series["kind"] == "clock_sync")
 
 
 def should_report_udp_counts(csv_path, csv_root, plots_root):
@@ -248,6 +366,43 @@ def write_udp_missing_plot(plt, path, csv_path, counts, status):
     return True
 
 
+def add_info_box(plt, text):
+    if not text:
+        return
+    plt.gca().text(
+        0.02,
+        0.98,
+        text,
+        transform=plt.gca().transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+    )
+
+
+def write_basic_plots(plt, x_values, y_values, hist_path, seq_path, base, series, bins, info_text=None):
+    plt.figure(figsize=(8, 4))
+    plt.hist(y_values, bins=bins)
+    plt.xlabel(series["hist_xlabel"])
+    plt.ylabel("count")
+    plt.title(f"{series['title']} histogram ({base})")
+    add_info_box(plt, info_text)
+    plt.tight_layout()
+    plt.savefig(hist_path, dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x_values, y_values, linewidth=0.6)
+    plt.xlabel(series["x_label"])
+    plt.ylabel(series["ylabel"])
+    plt.title(f"{series['title']} per {series['x_label']} ({base})")
+    add_info_box(plt, info_text)
+    plt.tight_layout()
+    plt.savefig(seq_path, dpi=150)
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot delay histograms from CSV exports. csv* folders are written to matching plots* folders."
@@ -280,6 +435,7 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=50, help="Warmup counts ignored by the CSV/client.")
     parser.add_argument("--expected-count", type=int, default=2000, help="Expected final count_idx for UDP loss reports.")
+    parser.add_argument("--udp-missing", action="store_true", help="Also write UDP missing-count plots.")
     args = parser.parse_args()
     if args.filtered_only:
         args.filtered = True
@@ -296,76 +452,100 @@ def main():
         return 1
 
     for csv_path, csv_root, plots_root in jobs:
-        counts, delays_us = load_delays(csv_path)
-        if not counts:
+        series_list = load_plot_series(csv_path)
+        if not series_list:
             print(f"skip {csv_path} (no data)")
             continue
 
         base = os.path.splitext(os.path.basename(csv_path))[0]
         if args.prefix:
             base = args.prefix
-        hist_path, seq_path, filtered_path, outliers_path, udp_missing_path = output_paths(
-            csv_path, csv_root, plots_root, base
-        )
+
+        is_clock_sync_csv = any(series["kind"] == "clock_sync" for series in series_list)
+        clock_offset_info = None
+        if not is_clock_sync_csv:
+            clock_offset_info = read_clock_offset_info(equivalent_clock_sync_csv(csv_path))
 
         udp_status = None
-        if should_report_udp_counts(csv_path, csv_root, plots_root):
+        if not is_clock_sync_csv and should_report_udp_counts(csv_path, csv_root, plots_root):
+            counts = series_list[0]["x"]
             udp_status = udp_count_status(counts, args.warmup, args.expected_count)
             print_udp_count_report(csv_path, udp_status)
-            if not args.last or not os.path.exists(udp_missing_path):
+            _, _, _, _, udp_missing_path = output_paths(csv_path, csv_root, plots_root, base)
+            if not args.udp_missing:
+                pass
+            elif not args.last or not os.path.exists(udp_missing_path):
                 if write_udp_missing_plot(plt, udp_missing_path, csv_path, counts, udp_status):
                     print(f"wrote {udp_missing_path}")
             else:
                 print(f"skip {udp_missing_path} (already plotted)")
 
-        os.makedirs(os.path.dirname(hist_path), exist_ok=True)
-        os.makedirs(os.path.dirname(seq_path), exist_ok=True)
-        if args.filtered:
-            os.makedirs(os.path.dirname(filtered_path), exist_ok=True)
-            os.makedirs(os.path.dirname(outliers_path), exist_ok=True)
-
-        if args.last:
-            if args.filtered_only:
-                existing = [filtered_path, outliers_path]
-            else:
-                existing = [hist_path, seq_path]
-                if args.filtered:
-                    existing.extend([filtered_path, outliers_path])
-            if all(os.path.exists(path) for path in existing):
-                print(f"skip {csv_path} (already plotted)")
-                continue
-        elif not args.filtered_only:
-            if not confirm_overwrite(hist_path) or not confirm_overwrite(seq_path):
-                print(f"skip {csv_path} (no overwrite)")
-                continue
-
         written = []
-        if not args.filtered_only:
-            plt.figure(figsize=(8, 4))
-            plt.hist(delays_us, bins=args.bins)
-            plt.xlabel("delay (us)")
-            plt.ylabel("count")
-            plt.title(f"delay histogram ({base})")
-            plt.tight_layout()
-            plt.savefig(hist_path, dpi=150)
-            plt.close()
+        for series in series_list:
+            series_base = base if not series["suffix"] else f"{base}_{series['suffix']}"
+            hist_path, seq_path, filtered_path, outliers_path, _ = series_output_paths(
+                csv_path, csv_root, plots_root, base, series
+            )
+            x_values = series["x"]
+            y_values = series["y"]
+            os.makedirs(os.path.dirname(hist_path), exist_ok=True)
+            os.makedirs(os.path.dirname(seq_path), exist_ok=True)
 
-            plt.figure(figsize=(8, 4))
-            plt.plot(counts, delays_us, linewidth=0.6)
-            plt.xlabel("count")
-            plt.ylabel("delay (us)")
-            plt.title(f"delay per count ({base})")
-            plt.tight_layout()
-            plt.savefig(seq_path, dpi=150)
-            plt.close()
-            written.extend([hist_path, seq_path])
+            if series["kind"] == "clock_sync":
+                if args.last and os.path.exists(hist_path) and os.path.exists(seq_path):
+                    print(f"skip {csv_path} {series['suffix']} (already plotted)")
+                    continue
+                if not args.last and not confirm_overwrite(hist_path):
+                    print(f"skip {csv_path} {series['suffix']} (no overwrite)")
+                    continue
+                if not args.last and not confirm_overwrite(seq_path):
+                    print(f"skip {csv_path} {series['suffix']} (no overwrite)")
+                    continue
+                write_basic_plots(plt, x_values, y_values, hist_path, seq_path, series_base, series, args.bins)
+                written.extend([hist_path, seq_path])
+                continue
 
-        if args.filtered:
+            if args.filtered:
+                os.makedirs(os.path.dirname(filtered_path), exist_ok=True)
+                os.makedirs(os.path.dirname(outliers_path), exist_ok=True)
+
+            if args.last:
+                if args.filtered_only:
+                    existing = [filtered_path, outliers_path]
+                else:
+                    existing = [hist_path, seq_path]
+                    if args.filtered:
+                        existing.extend([filtered_path, outliers_path])
+                if all(os.path.exists(path) for path in existing):
+                    print(f"skip {csv_path} (already plotted)")
+                    continue
+            elif not args.filtered_only:
+                if not confirm_overwrite(hist_path) or not confirm_overwrite(seq_path):
+                    print(f"skip {csv_path} (no overwrite)")
+                    continue
+
+            if not args.filtered_only:
+                write_basic_plots(
+                    plt,
+                    x_values,
+                    y_values,
+                    hist_path,
+                    seq_path,
+                    series_base,
+                    series,
+                    args.bins,
+                    clock_offset_info,
+                )
+                written.extend([hist_path, seq_path])
+
+            if not args.filtered:
+                continue
+
             threshold_us = args.filter_threshold_us
             if threshold_us is None:
-                threshold_us = robust_outlier_threshold(delays_us, args.mad_scale)
-            kept = [(count, delay) for count, delay in zip(counts, delays_us) if delay <= threshold_us]
-            outliers = [(count, delay) for count, delay in zip(counts, delays_us) if delay > threshold_us]
+                threshold_us = robust_outlier_threshold(y_values, args.mad_scale)
+            kept = [(count, delay) for count, delay in zip(x_values, y_values) if delay <= threshold_us]
+            outliers = [(count, delay) for count, delay in zip(x_values, y_values) if delay > threshold_us]
             kept_counts = [count for count, _ in kept]
             kept_delays = [delay for _, delay in kept]
             outlier_counts = [count for count, _ in outliers]
@@ -373,30 +553,31 @@ def main():
 
             plt.figure(figsize=(8, 4))
             plt.plot(kept_counts, kept_delays, linewidth=0.6)
-            plt.xlabel("count")
-            plt.ylabel("delay (us)")
-            plt.title(f"delay per count filtered ({base}, <= {threshold_us:.1f} us)")
+            plt.xlabel(series["x_label"])
+            plt.ylabel(series["ylabel"])
+            plt.title(f"{series['title']} per {series['x_label']} filtered ({series_base}, <= {threshold_us:.1f} us)")
             plt.tight_layout()
             plt.savefig(filtered_path, dpi=150)
             plt.close()
 
             plt.figure(figsize=(8, 4))
-            plt.plot(counts, delays_us, linewidth=0.6, label="all samples")
+            plt.plot(x_values, y_values, linewidth=0.6, label="all samples")
             if outliers:
                 plt.scatter(outlier_counts, outlier_delays, s=12, color="red", label="filtered out")
                 plt.axhline(threshold_us, color="red", linewidth=0.8, linestyle="--")
-            plt.xlabel("count")
-            plt.ylabel("delay (us)")
-            plt.title(f"delay per count with outliers ({base}, > {threshold_us:.1f} us)")
+            plt.xlabel(series["x_label"])
+            plt.ylabel(series["ylabel"])
+            plt.title(f"{series['title']} per {series['x_label']} with outliers ({series_base}, > {threshold_us:.1f} us)")
             if outliers:
                 plt.legend()
             plt.tight_layout()
             plt.savefig(outliers_path, dpi=150)
             plt.close()
             written.extend([filtered_path, outliers_path])
-            print(f"{base}: filtered {len(outliers)} of {len(delays_us)} samples above {threshold_us:.1f} us")
+            print(f"{series_base}: filtered {len(outliers)} of {len(y_values)} samples above {threshold_us:.1f} us")
 
-        print("wrote " + " and ".join(written))
+        if written:
+            print("wrote " + " and ".join(written))
 
     return 0
 

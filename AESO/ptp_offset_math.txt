@@ -67,18 +67,18 @@ ASCII sequence:
 
         t1
         |  Sync(t1)
-        |---------------------------------------------->|
+        |--------------------------------------------->|
                                                        |
                                                        | t2
                                                        |
                                                        | t3
-        |<----------------------------------------------|
+        |<---------------------------------------------|
                           Delay_Req(t1,t2,t3)          |
         |
         | t4
         |
         |  Delay_Resp(t1,t2,t3,t4)
-        |---------------------------------------------->|
+        |--------------------------------------------->|
 
 
 Definitions
@@ -703,3 +703,419 @@ This means --center-delay is best interpreted as a jitter-analysis mode. It is
 useful for comparing spikes around the run baseline, but it should not be used if
 the goal is to compute physically absolute Werner decay from the raw one-way
 delay.
+
+
+Code Lines Used In minimal_epr_fast.py
+======================================
+
+This section links the formulas above to the current implementation in
+`minimal_epr_fast.py`.
+
+
+Repeater Side: t1 And t4
+------------------------
+
+The repeater is the master clock. During clock sync it sends `t1_ns` to the
+client and later records `t4_ns` when the client's Delay_Req reaches the
+repeater.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:150-157
+sock.sendall(struct.pack(CLOCK_SYNC_SYNC_FORMAT, t1_ns))
+t1_echo_ns, t2_ns, t3_ns = struct.unpack(
+    CLOCK_SYNC_DELAY_REQ_FORMAT, recv_exact(sock, CLOCK_SYNC_DELAY_REQ_SIZE)
+)
+t4_ns = time.time_ns()
+if t1_echo_ns != t1_ns:
+    raise ValueError("PTP clock-sync request did not match the Sync timestamp")
+sock.sendall(struct.pack(CLOCK_SYNC_DELAY_RESP_FORMAT, t1_ns, t2_ns, t3_ns, t4_ns))
+```
+
+Meaning:
+
+    t1_ns = master/repeater timestamp for Sync transmit
+    t4_ns = master/repeater timestamp for Delay_Req receive
+
+
+Client Side: t2 And t3
+----------------------
+
+The client is the slave clock. It receives `t1_ns`, records `t2_ns`, records
+`t3_ns`, and sends all three timestamps back to the repeater.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:171-177
+for _ in range(max(0, int(samples))):
+    (t1_ns,) = struct.unpack(CLOCK_SYNC_SYNC_FORMAT, recv_exact(sock, CLOCK_SYNC_SYNC_SIZE))
+    t2_ns = time.time_ns()
+    t3_ns = time.time_ns()
+    sock.sendall(struct.pack(CLOCK_SYNC_DELAY_REQ_FORMAT, t1_ns, t2_ns, t3_ns))
+    echoed_t1_ns, echoed_t2_ns, echoed_t3_ns, t4_ns = struct.unpack(
+        CLOCK_SYNC_DELAY_RESP_FORMAT, recv_exact(sock, CLOCK_SYNC_DELAY_RESP_SIZE)
+    )
+```
+
+Meaning:
+
+    t2_ns = slave/client timestamp for Sync receive
+    t3_ns = slave/client timestamp for Delay_Req transmit
+
+
+Offset And Path Delay Calculation
+---------------------------------
+
+The code computes the two PTP observed differences:
+
+    master_to_slave_ns = t2_ns - t1_ns
+    slave_to_master_ns = t4_ns - t3_ns
+
+Then it computes:
+
+    mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) / 2
+    offset_ns = (slave_to_master_ns - master_to_slave_ns) / 2
+
+Current code:
+
+```python
+# minimal_epr_fast.py:181-186
+master_to_slave_ns = t2_ns - t1_ns
+slave_to_master_ns = t4_ns - t3_ns
+mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) // 2
+offset_ns = (slave_to_master_ns - master_to_slave_ns) // 2
+offset_total_ns += offset_ns
+path_delay_total_ns += mean_path_delay_ns
+```
+
+This matches the formula:
+
+    clock_offset_ns = master_minus_slave
+                    = ((t4 - t3) - (t2 - t1)) / 2
+
+The integer `// 2` is used because all timestamps are integer nanoseconds.
+
+
+Averaging Multiple Samples
+--------------------------
+
+The script does not use only one PTP exchange. It sums the offsets and path
+delays from all clock-sync samples and returns their arithmetic mean.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:167-169
+offset_total_ns = 0
+path_delay_total_ns = 0
+sample_count = 0
+
+# minimal_epr_fast.py:185-187
+offset_total_ns += offset_ns
+path_delay_total_ns += mean_path_delay_ns
+sample_count += 1
+
+# minimal_epr_fast.py:201-203
+if sample_count == 0:
+    return 0, 0, clock_sync_samples
+return offset_total_ns // sample_count, path_delay_total_ns // sample_count, clock_sync_samples
+```
+
+So:
+
+    clock_offset_ns = mean(all offset_ns samples)
+    clock_sync_path_delay_ns = mean(all mean_path_delay_ns samples)
+
+
+Selecting The Offset Source
+---------------------------
+
+The client can get `clock_offset_ns` in three ways:
+
+1. Manual offset with `--clock-offset-ns`.
+2. Automatic PTP-style estimate with `--clock-sync`.
+3. Zero offset if neither option is used.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:655-664
+if args.clock_offset_ns is not None:
+    clock_offset_ns = int(args.clock_offset_ns)
+    clock_sync_path_delay_ns = 0
+elif args.clock_sync:
+    clock_offset_ns, clock_sync_path_delay_ns, clock_sync_sample_rows = estimate_clock_offset(
+        sock, args.clock_sync_samples
+    )
+else:
+    clock_offset_ns = 0
+    clock_sync_path_delay_ns = 0
+```
+
+This is why runs without `--clock-sync` show large apparent offsets between
+machines: the script intentionally uses:
+
+    clock_offset_ns = 0
+
+in that mode.
+
+
+Delay Calculation For UDP
+-------------------------
+
+For UDP data, each received packet contains `ts_emit_ns`, which was generated by
+the repeater/master when it sent the swapping result. The client records
+`ts_recv_ns` on its own clock, converts that timestamp into the master clock
+domain, and subtracts `ts_emit_ns`.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:700-713
+count_idx, ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(UDP_MSG_FORMAT, inbuf)
+ts_recv_ns = time.time_ns()
+count_idx = int(count_idx)
+if count_idx <= 0 or count_idx > count:
+    continue
+udp_received += 1
+if count_idx > last_seq:
+    udp_lost_est += max(0, count_idx - last_seq - 1)
+    last_seq = count_idx
+w_swap_raw = float(w_swap)
+peer_id = int(peer_id)
+correction_bits = int(correction_bits)
+last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+```
+
+The important line is:
+
+    last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+which implements:
+
+    delay_ns = (client_receive_time + master_minus_slave_offset)
+             - repeater_emit_time
+
+
+Delay Calculation For TCP
+-------------------------
+
+For TCP data the calculation is the same. Only the receive/parsing path changes.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:737-744
+recv_exact_into(data_sock, inbuf)
+ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
+ts_recv_ns = time.time_ns()
+w_swap_raw = float(w_swap)
+peer_id = int(peer_id)
+correction_bits = int(correction_bits)
+last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+```
+
+Again, the important line is:
+
+    last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+So UDP and TCP use the same clock-correction formula.
+
+
+Warmup And Stored Samples
+-------------------------
+
+The script computes `last_delta` for every received message, but it stores only
+samples after warmup.
+
+UDP current code:
+
+```python
+# minimal_epr_fast.py:714-722
+if count_idx > warmup and sample_idx < sample_count:
+    delta_samples[sample_idx] = last_delta
+    werner_raw_samples[sample_idx] = w_swap_raw
+    sample_msgs[sample_idx] = (last_delta, count_idx, last_raw_msg, None)
+    delta_record_counts[sample_idx] = count_idx
+    if args.diag:
+        loop_gap_samples[sample_idx] = loop_gap_ns
+        recv_block_samples[sample_idx] = recv_block_ns
+    sample_idx += 1
+```
+
+TCP current code:
+
+```python
+# minimal_epr_fast.py:745-753
+if i >= warmup:
+    delta_samples[sample_idx] = last_delta
+    werner_raw_samples[sample_idx] = w_swap_raw
+    sample_msgs[sample_idx] = (last_delta, i + 1, last_raw_msg, None)
+    delta_record_counts[sample_idx] = i + 1
+    if args.diag:
+        loop_gap_samples[sample_idx] = loop_gap_ns
+        recv_block_samples[sample_idx] = recv_block_ns
+    sample_idx += 1
+```
+
+
+Center Delay Code
+-----------------
+
+If `--center-delay` is disabled, `delay_center_ns` is zero and
+`delay_stat_samples` is the same as the raw corrected delay.
+
+If `--center-delay` is enabled, the median delay is subtracted from each sample.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:770-771
+delay_center_ns = percentile(sorted(delta_samples), 0.50) if args.center_delay and delta_samples else 0
+delay_stat_samples = [delay_ns - delay_center_ns for delay_ns in delta_samples]
+```
+
+Therefore:
+
+    delay_ns
+        raw corrected one-way delay in the repeater/master clock domain
+
+    delay_centered_ns
+        delay_ns - median(delay_ns)
+
+
+Werner Delay Input
+------------------
+
+Werner decay uses the same delay series used for the printed statistics:
+
+```python
+# minimal_epr_fast.py:773-775
+werner_samples = [
+    decay_werner(w_swap_raw, max(0, delay_ns), args.t1_ns) ** 2
+    for w_swap_raw, delay_ns in zip(werner_raw_samples, delay_stat_samples)
+]
+```
+
+The `max(0, delay_ns)` prevents negative delay from becoming negative physical
+age in the Werner decay model.
+
+
+CSV Columns
+-----------
+
+The raw corrected delay and the centered delay are both saved.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:828-830
+handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
+for idx, delay_ns, delay_centered_ns in zip(delta_record_counts, delta_samples, delay_stat_samples):
+    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
+```
+
+So:
+
+    delay_ns
+        raw corrected delay:
+        (ts_recv_ns + clock_offset_ns) - ts_emit_ns
+
+    delay_centered_ns
+        delay_ns - delay_center_ns
+
+    clock_offset_ns
+        estimated or manual master-minus-slave offset
+
+    clock_sync_path_delay_ns
+        estimated mean one-way path delay from the PTP-style exchange
+
+
+Clock Sync Sample CSV
+---------------------
+
+The individual PTP samples are also kept in memory during synchronization and
+written only after the data loop has finished. This avoids disk I/O during the
+timing-sensitive communication path.
+
+Current code:
+
+```python
+# minimal_epr_fast.py:188-200
+clock_sync_samples.append(
+    (
+        sample_count,
+        t1_ns,
+        t2_ns,
+        t3_ns,
+        t4_ns,
+        master_to_slave_ns,
+        slave_to_master_ns,
+        offset_ns,
+        mean_path_delay_ns,
+    )
+)
+```
+
+The CSV is written after the normal delay CSV, using the same suffix:
+
+```python
+# minimal_epr_fast.py:832-857
+if clock_sync_sample_rows:
+    clock_sync_base = f"clock_sync_client_{args.client_id}"
+    clock_sync_path = os.path.join(args.plot_dir, f"{clock_sync_base}{suffix}.csv")
+    with open(clock_sync_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "sample_idx,t1_ns,t2_ns,t3_ns,t4_ns,"
+            "master_to_slave_ns,slave_to_master_ns,offset_ns,path_delay_ns,"
+            "clock_offset_mean_ns,clock_sync_path_delay_mean_ns\n"
+        )
+        ...
+    print(f"clock_sync=data_saved ({clock_sync_path})")
+```
+
+Example naming:
+
+    delay_hist_client_1_12.csv
+    clock_sync_client_1_12.csv
+
+The clock-sync CSV columns are:
+
+    sample_idx
+        PTP sample number inside this calibration run.
+
+    t1_ns
+        repeater/master Sync transmit timestamp.
+
+    t2_ns
+        client/slave Sync receive timestamp.
+
+    t3_ns
+        client/slave Delay_Req transmit timestamp.
+
+    t4_ns
+        repeater/master Delay_Req receive timestamp.
+
+    master_to_slave_ns
+        t2_ns - t1_ns.
+
+    slave_to_master_ns
+        t4_ns - t3_ns.
+
+    offset_ns
+        per-sample master-minus-slave estimate:
+        ((t4_ns - t3_ns) - (t2_ns - t1_ns)) / 2.
+
+    path_delay_ns
+        per-sample mean path delay estimate:
+        ((t2_ns - t1_ns) + (t4_ns - t3_ns)) / 2.
+
+    clock_offset_mean_ns
+        mean offset actually used by the data loop.
+
+    clock_sync_path_delay_mean_ns
+        mean path delay reported by the client.

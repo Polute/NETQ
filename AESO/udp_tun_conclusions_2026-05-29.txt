@@ -1,0 +1,117 @@
+AESO UDP/TUN conclusions - 2026-05-29
+=====================================
+
+Test context
+------------
+
+- The repeater ran locally in WSL.
+- Client 1 ran on the remote machine reached through SSH TUN `tun0`:
+  local `10.10.10.1/30` <-> remote `10.10.10.2/30`.
+- Client 2 ran on the second remote machine reached through SSH TUN `tun1`:
+  local `10.10.20.1/30` <-> remote `10.10.20.2/30`.
+- The Python data protocol was UDP, but the UDP packets crossed an SSH `-w`
+  TUN tunnel. Therefore the application uses UDP, but the tunnel is still
+  carried by SSH over TCP underneath.
+- PTP-style clock synchronization was still done over TCP before the UDP data
+  loop.
+
+TUN link observations
+---------------------
+
+- `tun0` ping to client 1 was better:
+  `4.48 ms`, `7.06 ms` in the quick test.
+- `tun1` ping to client 2 was worse and more variable:
+  `9.31 ms`, `23.3 ms` in the quick test.
+- This explains why client 2 tends to show the strongest final spike.
+- `ip -s link` did not show TUN-level drops, so missing UDP samples are more
+  likely caused by UDP socket queues, SSH/TCP queueing, scheduling, or the
+  application not reading fast enough.
+
+UDP/TUN vs non-UDP/TCP results
+------------------------------
+
+- The best current UDP/TUN runs are better in the main distribution than most
+  previous non-UDP remote runs.
+- With clock sync and pacing, UDP/TUN usually stays around:
+  - client 1: about `6 ms` absolute p50, about `7 ms` absolute p99.
+  - client 2: about `5-6 ms` absolute p50, about `6-7 ms` absolute p99.
+- Older non-UDP remote runs with clock sync often had p99 around `13-14 ms`,
+  `30 ms`, `50 ms`, `90 ms`, or worse depending on the run.
+- Some non-UDP runs had a good median, but their tail was generally less
+  stable.
+
+Clock synchronization
+---------------------
+
+- Runs without `--clock-sync` are not valid as physical delay measurements
+  across machines.
+- Without clock sync, client 1 appeared around `55-82 ms`, while client 2
+  appeared around `-247 ms` or `-273 ms`. Those values mostly reflect clock
+  offset, not network delay.
+- Those runs can still show shape, drift, missing samples, and final queue
+  behavior, but not absolute one-way delay.
+- Runs with `--clock-sync --clock-sync-samples 256` are the useful ones for
+  comparing one-way delay.
+
+UDP socket buffer
+-----------------
+
+- The Linux default socket limits observed were:
+  - `net.core.rmem_default = 212992`
+  - `net.core.rmem_max = 212992`
+  - `net.core.wmem_default = 212992`
+  - `net.core.wmem_max = 212992`
+- The script default was lower:
+  - repeater `--sock-buf`: `65536`
+  - client `--sock-buf`: `4096`
+- The client default `4096` is too small for these UDP/TUN bursts.
+- Testing `--sock-buf 131072` improved reliability:
+  - client 1 `_11`: `udp_received=2000`, `udp_lost_est=0`.
+  - client 2 `_11`: `udp_received=2000`, `udp_lost_est=0`.
+- `--sock-buf 131072` is a good current default for this experiment because it
+  is below the current Linux max and avoids obvious UDP socket starvation.
+
+Final spike
+-----------
+
+- The final-count spike is not fully solved by increasing `--sock-buf`.
+- With `--sock-buf 131072` and `--count-interval 0.0002`, both clients received
+  all packets, but the last sample still jumped:
+  - client 1 `_11`: last about `12.52 ms`.
+  - client 2 `_11`: last about `13.67 ms`.
+- With `--sock-buf 131072` and `--count-interval 0.0005`, client 1 improved:
+  - client 1 `_12`: last about `-7.20 ms`, max about `9.27 ms`.
+- This suggests the final spike is mainly queue/flush behavior at the end of a
+  burst, not only a too-small UDP buffer.
+- Likely contributors:
+  - SSH/TUN queue draining at the end of the run.
+  - SSH over TCP head-of-line behavior.
+  - OS scheduler timing.
+  - Different path quality for `tun0` and `tun1`.
+
+Current best configuration
+--------------------------
+
+For balanced UDP/TUN results:
+
+```
+--data-protocol udp
+--clock-sync
+--clock-sync-samples 256
+--sock-buf 131072
+--count-interval 0.0005
+```
+
+If the priority is fastest possible run time, `--count-interval 0.0002` is also
+usable, but the last sample is more likely to show a visible spike.
+
+Practical interpretation
+------------------------
+
+- UDP/TUN is now useful for this setup.
+- It is not true direct UDP because it is encapsulated in SSH/TCP.
+- Increasing `--sock-buf` helps prevent UDP losses.
+- Pacing with `--count-interval` helps reduce end-of-burst queue artifacts.
+- The best metric for comparisons is `abs(delay)` p50/p95/p99 plus missing
+  count, not only signed min/max.
+- Runs without clock sync must not be used as absolute delay values.

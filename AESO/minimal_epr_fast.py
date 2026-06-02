@@ -167,6 +167,7 @@ def estimate_clock_offset(sock, samples):
     offset_total_ns = 0
     path_delay_total_ns = 0
     sample_count = 0
+    clock_sync_samples = []
     for _ in range(max(0, int(samples))):
         (t1_ns,) = struct.unpack(CLOCK_SYNC_SYNC_FORMAT, recv_exact(sock, CLOCK_SYNC_SYNC_SIZE))
         t2_ns = time.time_ns()
@@ -184,9 +185,22 @@ def estimate_clock_offset(sock, samples):
         offset_total_ns += offset_ns
         path_delay_total_ns += mean_path_delay_ns
         sample_count += 1
+        clock_sync_samples.append(
+            (
+                sample_count,
+                t1_ns,
+                t2_ns,
+                t3_ns,
+                t4_ns,
+                master_to_slave_ns,
+                slave_to_master_ns,
+                offset_ns,
+                mean_path_delay_ns,
+            )
+        )
     if sample_count == 0:
-        return 0, 0
-    return offset_total_ns // sample_count, path_delay_total_ns // sample_count
+        return 0, 0, clock_sync_samples
+    return offset_total_ns // sample_count, path_delay_total_ns // sample_count, clock_sync_samples
 
 
 def connect_repeater_until_ready(host, port, connect_timeout, detect_timeout, detect_interval, sock_buf, busy_poll_us):
@@ -627,6 +641,7 @@ def run_client(args):
     sample_idx = 0
     udp_received = 0
     udp_lost_est = 0
+    clock_sync_sample_rows = []
 
     with connect_repeater_until_ready(
         args.repeater_host,
@@ -641,7 +656,9 @@ def run_client(args):
             clock_offset_ns = int(args.clock_offset_ns)
             clock_sync_path_delay_ns = 0
         elif args.clock_sync:
-            clock_offset_ns, clock_sync_path_delay_ns = estimate_clock_offset(sock, args.clock_sync_samples)
+            clock_offset_ns, clock_sync_path_delay_ns, clock_sync_sample_rows = estimate_clock_offset(
+                sock, args.clock_sync_samples
+            )
         else:
             clock_offset_ns = 0
             clock_sync_path_delay_ns = 0
@@ -812,6 +829,32 @@ def run_client(args):
                 for idx, delay_ns, delay_centered_ns in zip(delta_record_counts, delta_samples, delay_stat_samples):
                     handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
         print(f"plot=data_saved ({csv_path})")
+        if clock_sync_sample_rows:
+            clock_sync_base = f"clock_sync_client_{args.client_id}"
+            clock_sync_path = os.path.join(args.plot_dir, f"{clock_sync_base}{suffix}.csv")
+            with open(clock_sync_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "sample_idx,t1_ns,t2_ns,t3_ns,t4_ns,"
+                    "master_to_slave_ns,slave_to_master_ns,offset_ns,path_delay_ns,"
+                    "clock_offset_mean_ns,clock_sync_path_delay_mean_ns\n"
+                )
+                for (
+                    sample_number,
+                    t1_ns,
+                    t2_ns,
+                    t3_ns,
+                    t4_ns,
+                    master_to_slave_ns,
+                    slave_to_master_ns,
+                    offset_ns,
+                    mean_path_delay_ns,
+                ) in clock_sync_sample_rows:
+                    handle.write(
+                        f"{sample_number},{t1_ns},{t2_ns},{t3_ns},{t4_ns},"
+                        f"{master_to_slave_ns},{slave_to_master_ns},{offset_ns},{mean_path_delay_ns},"
+                        f"{clock_offset_ns},{clock_sync_path_delay_ns}\n"
+                    )
+            print(f"clock_sync=data_saved ({clock_sync_path})")
 
     if args.quiet:
         print(f"exchanges={count}")

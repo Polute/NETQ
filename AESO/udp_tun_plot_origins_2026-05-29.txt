@@ -1,0 +1,266 @@
+AESO UDP/TUN plot origins - 2026-05-29
+======================================
+
+This file records the origin of the `csv_udp_tun` CSV files and their matching
+`plots_udp_tun` plots.
+
+Topology
+--------
+
+- Repeater: local WSL machine.
+- Client 1: remote machine through SSH TUN path:
+  local `tun0` `10.10.10.1` -> remote `tun0` `10.10.10.2`.
+- Client 2: remote machine through SSH TUN path:
+  local `tun1` `10.10.20.1` -> remote `tun0` `10.10.20.2`.
+- Data protocol: UDP at the Python application level.
+- Transport underneath: SSH `-w` TUN, therefore encapsulated over SSH/TCP.
+- Warmup: 50 samples.
+- Count: 2000 exchanges unless stated otherwise.
+- Useful plotted samples after warmup: normally 1950.
+
+Common command shape
+--------------------
+
+Repeater base:
+
+```
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+  --listen-host-a 0.0.0.0 \
+  --listen-port-a 7401 \
+  --listen-host-b 0.0.0.0 \
+  --listen-port-b 7402 \
+  --werner-ar 1 \
+  --werner-br 1 \
+  --quiet \
+  --data-protocol udp \
+  --accept-timeout 120
+```
+
+Client 1 base:
+
+```
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 10.10.10.1 \
+  --repeater-port 7401 \
+  --client-id 1 \
+  --quiet \
+  --plot \
+  --plot-dir csv_udp_tun \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1
+```
+
+Client 2 base:
+
+```
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 10.10.20.1 \
+  --repeater-port 7402 \
+  --client-id 2 \
+  --quiet \
+  --plot \
+  --plot-dir csv_udp_tun \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1
+```
+
+File-by-file origin
+-------------------
+
+`delay_hist_client_1.csv` and `delay_hist_client_2.csv`
+
+- UDP/TUN early run.
+- No `--clock-sync`.
+- Default socket buffer.
+- No reliable absolute one-way delay because clock offset was not corrected.
+- Result shape:
+  - client 1: around `55 ms`.
+  - client 2: around `-273 ms`.
+
+`delay_hist_client_1_2.csv` and `delay_hist_client_2_2.csv`
+
+- UDP/TUN early run.
+- No `--clock-sync`.
+- Inferred repeater pacing: `--count-interval 0.0001`.
+- Default socket buffer.
+- Not valid as absolute one-way delay because clock offset was not corrected.
+- Terminal reference for client 1 showed final sample around `75.67 ms`.
+
+`delay_hist_client_1_3.csv` and `delay_hist_client_2_3.csv`
+
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Default socket buffer.
+- No count interval on the repeater.
+- Repeater included `--cpu 3`.
+- Client 1:
+  - `udp_received=1999`, `udp_lost_est=1` in terminal output.
+  - local CSV currently contains 1950 post-warmup rows.
+  - abs p50 about `15.79 ms`, abs p99 about `19.00 ms`.
+- Client 2:
+  - local CSV shows many missing samples: `397` post-warmup missing.
+  - abs p50 about `11.30 ms`, abs p99 about `55.69 ms`.
+- Interpretation: clock correction was enabled, but the burst was too harsh for
+  the UDP/TUN path, especially client 2.
+
+`delay_hist_client_1_4.csv` and `delay_hist_client_2_4.csv`
+
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater pacing:
+  `--count-interval 0.0001`.
+- Default socket buffer.
+- Repeater included `--cpu 3`.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 about `6.79 ms`, abs p99 about `7.31 ms`.
+  - last about `-6.98 ms`.
+- Client 2:
+  - no missing samples in the local CSV.
+  - abs p50 about `6.54 ms`, abs p99 about `7.07 ms`.
+  - final spike about `12.17 ms`.
+- Interpretation: first clearly good UDP/TUN result. Pacing fixed most losses.
+
+`delay_hist_client_1_5.csv` and `delay_hist_client_2_5.csv`
+
+- UDP/TUN run without clock sync.
+- Repeater used `--count-interval 0.0001` according to terminal history.
+- Default socket buffer.
+- Not valid for absolute one-way delay.
+- Client 1 appeared around `76 ms`.
+- Client 2 appeared around `-253 ms`.
+- Useful only for shape and missing-sample behavior.
+
+`delay_hist_client_1_6.csv` and `delay_hist_client_2_6.csv`
+
+- UDP/TUN run without clock sync.
+- Repeater used `--count-interval 0.0005`.
+- Default socket buffer.
+- Not valid for absolute one-way delay.
+- Client 1:
+  - `2` missing post-warmup samples in local CSV.
+  - apparent p50 around `82.45 ms`.
+- Client 2:
+  - `27` missing post-warmup samples in local CSV.
+  - apparent p50 around `246.92 ms` absolute.
+
+`delay_hist_client_1_7.csv` and `delay_hist_client_2_7.csv`
+
+- UDP/TUN run without clock sync.
+- Repeater used `--count-interval 0.0002`.
+- Default socket buffer.
+- Not valid for absolute one-way delay.
+- Client 1:
+  - no missing samples.
+  - apparent p50 around `82.66 ms`.
+- Client 2:
+  - `3` missing post-warmup samples.
+  - apparent p50 around `246.76 ms` absolute.
+
+`delay_hist_client_1_8.csv` and `delay_hist_client_2_8.csv`
+
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater used `--count-interval 0.0005`.
+- Default socket buffer.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0` in terminal output.
+  - abs p50 about `6.07 ms`, abs p99 about `7.19 ms`.
+  - last about `-6.75 ms`.
+- Client 2:
+  - local CSV has `4` missing post-warmup samples.
+  - abs p50 about `5.48 ms`, abs p99 about `6.17 ms`.
+  - final spike about `13.14 ms`.
+- Interpretation: very good central distribution; client 2 still has a final
+  spike and a few misses.
+
+`delay_hist_client_1_9.csv` and `delay_hist_client_2_9.csv`
+
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater used `--count-interval 0.0005`.
+- Default socket buffer.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 about `6.04 ms`, abs p99 about `7.06 ms`.
+  - last about `3.59 ms`.
+- Client 2:
+  - no missing samples.
+  - abs p50 about `5.72 ms`, abs p99 about `6.39 ms`.
+  - final spike about `15.14 ms`.
+- Interpretation: best zero-loss default-buffer run, but client 2 still shows
+  the end-of-run queue spike.
+
+`delay_hist_client_1_10.csv` and `delay_hist_client_2_10.csv`
+
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater used `--count-interval 0.0002`.
+- Default socket buffer.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 about `6.86 ms`, abs p99 about `7.54 ms`.
+  - last about `-2.68 ms`.
+- Client 2:
+  - `2` missing post-warmup samples.
+  - abs p50 about `6.04 ms`, abs p99 about `6.69 ms`.
+  - final spike about `11.92 ms`.
+- Interpretation: `0.0002` is usable, but did not fully remove client 2's final
+  spike and had a small amount of loss.
+
+`delay_hist_client_1_11.csv` and `delay_hist_client_2_11.csv`
+
+- These were reported from terminal output and may not yet be present in this
+  local copy of `csv_udp_tun`.
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater used:
+  `--count-interval 0.0002 --sock-buf 131072`.
+- Clients used:
+  `--sock-buf 131072`.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 `6.325 ms`, abs p99 `7.189 ms`.
+  - max/last `12.522 ms` at count `2000`.
+- Client 2:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 `5.280 ms`, abs p99 `6.082 ms`.
+  - max/last `13.665 ms` at count `2000`.
+- Interpretation: larger socket buffer removed losses, but the final spike
+  remained. That points to end-of-burst queue/flush behavior, not only lack of
+  socket buffer.
+
+`delay_hist_client_1_12.csv`
+
+- Reported from terminal output and may not yet be present in this local copy
+  of `csv_udp_tun`.
+- UDP/TUN run with clock sync:
+  `--clock-sync --clock-sync-samples 256`.
+- Repeater used:
+  `--count-interval 0.0005 --sock-buf 131072`.
+- Client used:
+  `--sock-buf 131072`.
+- Client 1:
+  - `udp_received=2000`, `udp_lost_est=0`.
+  - abs p50 `6.583 ms`, abs p99 `7.685 ms`.
+  - max `9.271 ms` at count `1301`.
+  - last `-7.200 ms`.
+- Interpretation: `0.0005` pacing reduced the final spike compared with `_11`.
+
+Notes on plots
+--------------
+
+- `plots_udp_tun/sec/*.png` plots delay over time.
+- `plots_udp_tun/counter/*.png` plots delay by count index.
+- `plots_udp_tun/counter_filtered/*.png` and
+  `plots_udp_tun/counter_outliers/*.png` split normal points and outliers.
+- `plots_udp_tun/udp_missing/*_udp_missing.png` shows missing UDP count
+  positions for UDP runs.
+- For cross-machine one-way delay, use only plots whose CSV had clock sync
+  enabled.
+- For comparing closeness to zero, prefer absolute delay statistics:
+  abs p50, abs p95, abs p99, and abs max.
