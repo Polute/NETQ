@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import gc
+import json
 import math
 import os
+import sys
 import ctypes
 import random
 import threading
@@ -24,6 +26,12 @@ CLOCK_SYNC_DELAY_REQ_FORMAT = "!QQQ"
 CLOCK_SYNC_DELAY_REQ_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_REQ_FORMAT)
 CLOCK_SYNC_DELAY_RESP_FORMAT = "!QQQQ"
 CLOCK_SYNC_DELAY_RESP_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_RESP_FORMAT)
+SO_TIMESTAMPNS_CANDIDATES = tuple(
+    value for value in (getattr(socket, "SO_TIMESTAMPNS", None), 64, 35) if value is not None
+)
+SCM_TIMESTAMPNS_CANDIDATES = tuple(
+    value for value in (getattr(socket, "SCM_TIMESTAMPNS", None), 64, 35) if value is not None
+)
 
 
 def parse_args():
@@ -51,11 +59,16 @@ def parse_args():
     repeater.add_argument("--parallel", action="store_true", help="Send to A/B in parallel threads.")
     repeater.add_argument("--cpu-a", type=int, default=2, help="Pin sender thread A to this CPU core.")
     repeater.add_argument("--cpu-b", type=int, default=3, help="Pin sender thread B to this CPU core.")
+    repeater.add_argument("--shared-send-timestamp", action="store_true", help="Use one timestamp for both A/B messages in non-parallel mode.")
     repeater.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
+    repeater.add_argument("--pace-mode", choices=("sleep", "spin", "hybrid"), default="sleep", help="How --count-interval pacing waits between counts.")
+    repeater.add_argument("--spin-margin-us", type=float, default=100.0, help="Final busy-wait window used by --pace-mode hybrid.")
     repeater.add_argument("--quiet", action="store_true")
     repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
     repeater.add_argument("--plot-prefix", default="repeater_send_hist", help="Prefix for repeater send timing CSV outputs.")
     repeater.add_argument("--plot-dir", default="csv", help="Directory where --plot CSV files are written.")
+    repeater.add_argument("--json", dest="json_output", action=argparse.BooleanOptionalAction, default=True, help="Write JSON metadata when --plot is used.")
+    repeater.add_argument("--json-dir", default=None, help="Directory where JSON files are written. Defaults from --plot-dir: csv_x -> json_x.")
     repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
     repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run PTP-style clock offset calibration. Enable it on both clients too.")
     repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
@@ -72,7 +85,7 @@ def parse_args():
     client.add_argument("--detect-interval", type=float, default=0.05)
     client.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
     client.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
-    client.add_argument("--sock-buf", type=int, default=4096, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
+    client.add_argument("--sock-buf", type=int, default=65536, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
     client.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
     client.add_argument("--client-id", type=int, default=1)
     client.add_argument("--repeater-id", type=int, default=0)
@@ -80,6 +93,8 @@ def parse_args():
     client.add_argument("--plot", action="store_true", help="Write delay histogram data and plot if matplotlib is available.")
     client.add_argument("--plot-prefix", default="delay_hist_client", help="Prefix for plot outputs.")
     client.add_argument("--plot-dir", default="csv", help="Directory where --plot CSV files are written.")
+    client.add_argument("--json", dest="json_output", action=argparse.BooleanOptionalAction, default=True, help="Write JSON output when --plot is used.")
+    client.add_argument("--json-dir", default=None, help="Directory where JSON files are written. Defaults from --plot-dir: csv_x -> json_x.")
     client.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
     client.add_argument("--quiet", action="store_true")
     client.add_argument("--t1-ns", type=float, default=1_000_000.0)
@@ -90,8 +105,23 @@ def parse_args():
     client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
     client.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
     client.add_argument("--udp-idle-timeout", type=float, default=5.0, help="Stop waiting for UDP data after this many idle seconds.")
+    client.add_argument("--kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS receive timestamps for UDP data.")
 
     return parser.parse_args()
+
+
+def default_json_dir(plot_dir):
+    clean_dir = plot_dir.rstrip(os.sep)
+    parent, base = os.path.split(clean_dir)
+    if not base:
+        return "json"
+    if base.startswith("csv"):
+        json_base = "json" + base[3:]
+    elif base.startswith("plots"):
+        json_base = "json" + base[5:]
+    else:
+        json_base = base + "_json"
+    return os.path.join(parent, json_base) if parent else json_base
 
 
 def enable_low_latency_socket(sock, sock_buf=0, busy_poll_us=0):
@@ -115,6 +145,50 @@ def enable_low_latency_socket(sock, sock_buf=0, busy_poll_us=0):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BUSY_POLL, int(busy_poll_us))
         except OSError:
             pass
+
+
+def enable_kernel_timestamp_ns(sock):
+    last_error = None
+    for opt in SO_TIMESTAMPNS_CANDIDATES:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, int(opt), 1)
+            return int(opt)
+        except OSError as exc:
+            last_error = exc
+    raise OSError("SO_TIMESTAMPNS is not available") from last_error
+
+
+def parse_kernel_timestamp_ns(ancdata):
+    for level, cmsg_type, data in ancdata:
+        if level != socket.SOL_SOCKET or cmsg_type not in SCM_TIMESTAMPNS_CANDIDATES:
+            continue
+        if len(data) >= 16:
+            sec, nsec = struct.unpack_from("@qq", data)
+            return int(sec) * 1_000_000_000 + int(nsec)
+        if len(data) >= 8:
+            sec, nsec = struct.unpack_from("@ll", data)
+            return int(sec) * 1_000_000_000 + int(nsec)
+    return None
+
+
+def pace_wait(interval_ns, mode="sleep", spin_margin_ns=100_000):
+    if interval_ns <= 0:
+        return
+    if mode == "sleep":
+        time.sleep(interval_ns / 1_000_000_000)
+        return
+    deadline_ns = time.monotonic_ns() + interval_ns
+    if mode == "hybrid":
+        while True:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                return
+            if remaining_ns > spin_margin_ns:
+                time.sleep((remaining_ns - spin_margin_ns) / 1_000_000_000)
+            else:
+                break
+    while time.monotonic_ns() < deadline_ns:
+        pass
 
 
 def apply_cpu_rt(cpu=None, rt_priority=None):
@@ -298,6 +372,23 @@ def stddev(vals, mean_value):
     return math.sqrt(sum((v - mean_value) ** 2 for v in vals) / len(vals))
 
 
+def ns_summary(vals):
+    if not vals:
+        return {"p50": 0, "p90": 0, "p95": 0, "p99": 0, "mean": 0, "std": 0.0, "min": 0, "max": 0}
+    ordered = sorted(vals)
+    mean_value = sum(vals) / len(vals)
+    return {
+        "p50": int(percentile(ordered, 0.50)),
+        "p90": int(percentile(ordered, 0.90)),
+        "p95": int(percentile(ordered, 0.95)),
+        "p99": int(percentile(ordered, 0.99)),
+        "mean": int(mean_value),
+        "std": float(stddev(vals, mean_value)),
+        "min": int(min(vals)),
+        "max": int(max(vals)),
+    }
+
+
 def decay_werner(base, age_ns, t1_ns):
     if t1_ns <= 0:
         raise ValueError("t1_ns must be positive")
@@ -433,12 +524,9 @@ def run_repeater(args):
         data_a = conn_a
         data_b = conn_b
 
-    def update_round_state(now_ns, correction_bits):
-        state_ar_local = (args.repeater_id, w_ar_init, args.client_a_id)
-        state_br_local = (args.repeater_id, w_br_init, args.client_b_id)
-        ts_emit_ns_local = time.time_ns()
-        w_swap_local = 1
-        return state_ar_local, state_br_local, ts_emit_ns_local, correction_bits, w_swap_local
+    is_udp_data = args.data_protocol == "udp"
+    udp_pack_into = struct.Struct(UDP_MSG_FORMAT).pack_into
+    tcp_pack_into = struct.Struct(MSG_FORMAT).pack_into
 
     if args.parallel:
         barrier_ready = threading.Barrier(3)
@@ -448,24 +536,25 @@ def run_repeater(args):
 
         def sender_thread(conn, buffer_ref, cpu_pin, send_block_samples, peer_id, last_msg_ref):
             set_thread_affinity(cpu_pin)
+            time_ns = time.time_ns
             for idx in range(count):
                 barrier_ready.wait()
-                ts_emit_ns = time.time_ns()
+                ts_emit_ns = time_ns()
                 correction_bits = correction_bits_samples[idx]
                 w_swap = 1.0
-                if args.data_protocol == "udp":
-                    struct.pack_into(UDP_MSG_FORMAT, buffer_ref, 0, idx + 1, ts_emit_ns, peer_id, correction_bits, w_swap)
+                if is_udp_data:
+                    udp_pack_into(buffer_ref, 0, idx + 1, ts_emit_ns, peer_id, correction_bits, w_swap)
                 else:
-                    struct.pack_into(MSG_FORMAT, buffer_ref, 0, ts_emit_ns, peer_id, correction_bits, w_swap)
+                    tcp_pack_into(buffer_ref, 0, ts_emit_ns, peer_id, correction_bits, w_swap)
                 if args.diag:
                     pre_send_ns = time.monotonic_ns()
-                    if args.data_protocol == "udp":
+                    if is_udp_data:
                         conn.send(buffer_ref)
                     else:
                         conn.sendall(buffer_ref)
                     send_block_samples[idx] = time.monotonic_ns() - pre_send_ns
                 else:
-                    if args.data_protocol == "udp":
+                    if is_udp_data:
                         conn.send(buffer_ref)
                     else:
                         conn.sendall(buffer_ref)
@@ -489,14 +578,8 @@ def run_repeater(args):
                 t_a.start()
                 t_b.start()
                 for idx in range(count):
-                    now_ns = time.monotonic_ns()
-                    state_ar, state_br, _ts_emit_ns, correction_bits, w_swap = update_round_state(
-                        now_ns, correction_bits_samples[idx]
-                    )
                     last_state_in_ar = state_ar
                     last_state_in_br = state_br
-                    last_ar_ns = now_ns
-                    last_br_ns = now_ns
                     barrier_ready.wait()
                     barrier_done.wait()
                     last_msg_a = last_msg_a_ref[0]
@@ -504,7 +587,11 @@ def run_repeater(args):
                     if args.diag:
                         send_gap_ab_samples[idx] = 0
                     if args.count_interval > 0:
-                        time.sleep(args.count_interval)
+                        pace_wait(
+                            int(args.count_interval * 1_000_000_000),
+                            args.pace_mode,
+                            int(args.spin_margin_us * 1000),
+                        )
                 t_a.join()
                 t_b.join()
         finally:
@@ -515,59 +602,55 @@ def run_repeater(args):
         gc.disable()
         try:
             with conn_a, conn_b, data_a, data_b:
+                send_a = data_a.send if is_udp_data else data_a.sendall
+                send_b = data_b.send if is_udp_data else data_b.sendall
+                pack_into = udp_pack_into if is_udp_data else tcp_pack_into
+                time_ns = time.time_ns
+                mono_ns = time.monotonic_ns
+                sleep = time.sleep
+                diag = args.diag
+                count_interval = args.count_interval
+                pace_interval_ns = int(count_interval * 1_000_000_000)
+                pace_mode = args.pace_mode
+                spin_margin_ns = int(args.spin_margin_us * 1000)
+                peer_a_id = args.client_b_id
+                peer_b_id = args.client_a_id
+                shared_send_timestamp = args.shared_send_timestamp
+                w_swap = 1.0
                 for idx in range(count):
-                    now_ns = time.monotonic_ns()
-                    state_ar, state_br, _ts_emit_ns, correction_bits, w_swap = update_round_state(
-                        now_ns, correction_bits_samples[idx]
-                    )
-                    last_state_in_ar = state_ar
-                    last_state_in_br = state_br
-                    last_ar_ns = now_ns
-                    last_br_ns = now_ns
-                    ts_emit_a_ns = time.time_ns()
-                    if args.data_protocol == "udp":
-                        struct.pack_into(
-                            UDP_MSG_FORMAT, outbuf_a, 0, idx + 1, ts_emit_a_ns, args.client_b_id, correction_bits, w_swap
-                        )
+                    correction_bits = correction_bits_samples[idx]
+                    count_idx = idx + 1
+                    ts_emit_a_ns = time_ns()
+                    if is_udp_data:
+                        pack_into(outbuf_a, 0, count_idx, ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
                     else:
-                        struct.pack_into(MSG_FORMAT, outbuf_a, 0, ts_emit_a_ns, args.client_b_id, correction_bits, w_swap)
-                    if args.diag:
-                        pre_send_a_ns = time.monotonic_ns()
-                        if args.data_protocol == "udp":
-                            data_a.send(outbuf_a)
-                        else:
-                            data_a.sendall(outbuf_a)
-                        post_send_a_ns = time.monotonic_ns()
+                        pack_into(outbuf_a, 0, ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
+                    if diag:
+                        pre_send_a_ns = mono_ns()
+                        send_a(outbuf_a)
+                        post_send_a_ns = mono_ns()
                         send_a_block_samples[idx] = post_send_a_ns - pre_send_a_ns
                     else:
-                        if args.data_protocol == "udp":
-                            data_a.send(outbuf_a)
-                        else:
-                            data_a.sendall(outbuf_a)
-                    last_msg_a = (ts_emit_a_ns, args.client_b_id, correction_bits, w_swap)
-                    ts_emit_b_ns = time.time_ns()
-                    if args.data_protocol == "udp":
-                        struct.pack_into(
-                            UDP_MSG_FORMAT, outbuf_b, 0, idx + 1, ts_emit_b_ns, args.client_a_id, correction_bits, w_swap
-                        )
+                        send_a(outbuf_a)
+                    last_msg_a = (ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
+                    ts_emit_b_ns = ts_emit_a_ns if shared_send_timestamp else time_ns()
+                    if is_udp_data:
+                        pack_into(outbuf_b, 0, count_idx, ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
                     else:
-                        struct.pack_into(MSG_FORMAT, outbuf_b, 0, ts_emit_b_ns, args.client_a_id, correction_bits, w_swap)
-                    if args.diag:
-                        pre_send_b_ns = time.monotonic_ns()
+                        pack_into(outbuf_b, 0, ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
+                    if diag:
+                        pre_send_b_ns = mono_ns()
                         send_gap_ab_samples[idx] = pre_send_b_ns - pre_send_a_ns
-                        if args.data_protocol == "udp":
-                            data_b.send(outbuf_b)
-                        else:
-                            data_b.sendall(outbuf_b)
-                        send_b_block_samples[idx] = time.monotonic_ns() - pre_send_b_ns
+                        send_b(outbuf_b)
+                        send_b_block_samples[idx] = mono_ns() - pre_send_b_ns
                     else:
-                        if args.data_protocol == "udp":
-                            data_b.send(outbuf_b)
+                        send_b(outbuf_b)
+                    last_msg_b = (ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
+                    if pace_interval_ns > 0:
+                        if pace_mode == "sleep":
+                            sleep(count_interval)
                         else:
-                            data_b.sendall(outbuf_b)
-                    last_msg_b = (ts_emit_b_ns, args.client_a_id, correction_bits, w_swap)
-                    if args.count_interval > 0:
-                        time.sleep(args.count_interval)
+                            pace_wait(pace_interval_ns, pace_mode, spin_margin_ns)
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -593,6 +676,64 @@ def run_repeater(args):
                 for count_idx in range(1, count + 1):
                     handle.write(f"{count_idx}\n")
         print(f"repeater_plot=data_saved ({csv_path})")
+        if args.json_output:
+            json_dir = args.json_dir or default_json_dir(args.plot_dir)
+            os.makedirs(json_dir, exist_ok=True)
+            json_path = os.path.join(json_dir, f"{base}{suffix}.json")
+            payload = {
+                "role": "repeater",
+                "argv": sys.argv,
+                "args": vars(args),
+                "csv_path": csv_path,
+                "created_at_unix_ns": time.time_ns(),
+                "exchanges": int(count),
+                "data_protocol": args.data_protocol,
+                "state_ar_start": {
+                    "local_id": int(args.repeater_id),
+                    "werner": float(w_ar_init),
+                    "peer_id": int(args.client_a_id),
+                },
+                "state_br_start": {
+                    "local_id": int(args.repeater_id),
+                    "werner": float(w_br_init),
+                    "peer_id": int(args.client_b_id),
+                },
+                "last_msg_a": {
+                    "ts_emit_ns": int(last_msg_a[0]),
+                    "peer_id": int(last_msg_a[1]),
+                    "correction_bits": int(last_msg_a[2]),
+                    "w_swap": float(last_msg_a[3]),
+                },
+                "last_msg_b": {
+                    "ts_emit_ns": int(last_msg_b[0]),
+                    "peer_id": int(last_msg_b[1]),
+                    "correction_bits": int(last_msg_b[2]),
+                    "w_swap": float(last_msg_b[3]),
+                },
+                "send_summary_ns": None,
+                "samples": [],
+            }
+            if args.diag:
+                payload["send_summary_ns"] = {
+                    "send_a_block_ns": ns_summary(send_a_block_samples),
+                    "send_b_block_ns": ns_summary(send_b_block_samples),
+                    "send_gap_ab_ns": ns_summary(send_gap_ab_samples),
+                }
+                payload["samples"] = [
+                    {
+                        "count_idx": int(count_idx),
+                        "send_a_block_ns": int(send_a_ns),
+                        "send_b_block_ns": int(send_b_ns),
+                        "send_gap_ab_ns": int(send_gap_ab_ns),
+                    }
+                    for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns) in enumerate(
+                        zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples), start=1
+                    )
+                ]
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+            print(f"repeater_json=data_saved ({json_path})")
 
     if not args.quiet:
         print("repeater_mode=fast3")
@@ -635,12 +776,23 @@ def run_client(args):
     last_werner = 0.0
     last_msg = (0, 0, 0, 0.0)
     last_raw_msg = (0, 0, 0, 0.0)
+    last_ts_emit_ns = 0
+    last_peer_id = 0
+    last_correction_bits = 0
+    last_w_swap_raw = 0.0
     last_state_out = (args.client_id, 0.0, None)
     data_msg_size = UDP_MSG_SIZE if args.data_protocol == "udp" else MSG_SIZE
     inbuf = bytearray(data_msg_size)
+    is_udp_data = args.data_protocol == "udp"
+    udp_unpack_from = struct.Struct(UDP_MSG_FORMAT).unpack_from
+    tcp_unpack_from = struct.Struct(MSG_FORMAT).unpack_from
     sample_idx = 0
     udp_received = 0
     udp_lost_est = 0
+    udp_seen_counts = bytearray(count + 1)
+    udp_seen_total = 0
+    kernel_timestamp_received = 0
+    kernel_timestamp_fallback = 0
     clock_sync_sample_rows = []
 
     with connect_repeater_until_ready(
@@ -663,7 +815,8 @@ def run_client(args):
             clock_offset_ns = 0
             clock_sync_path_delay_ns = 0
 
-        if args.data_protocol == "udp":
+        kernel_timestamp_enabled = False
+        if is_udp_data:
             data_sock = connect_udp_data(
                 sock,
                 args.repeater_host,
@@ -674,90 +827,118 @@ def run_client(args):
                 args.detect_interval,
             )
             data_sock.settimeout(float(args.udp_idle_timeout))
+            if args.kernel_timestamp:
+                enable_kernel_timestamp_ns(data_sock)
+                kernel_timestamp_enabled = True
         else:
+            if args.kernel_timestamp:
+                raise ValueError("--kernel-timestamp is only supported with --data-protocol udp")
             data_sock = sock
 
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
-            prev_loop_ns = time.monotonic_ns() if args.diag else 0
-            if args.data_protocol == "udp":
-                last_seq = 0
+            diag = args.diag
+            recv_into = data_sock.recv_into
+            recv_exact = recv_exact_into
+            time_ns = time.time_ns
+            mono_ns = time.monotonic_ns
+            sleep = time.sleep
+            count_interval = args.count_interval
+            recvmsg_into = data_sock.recvmsg_into if kernel_timestamp_enabled else None
+            cmsg_buf_size = socket.CMSG_SPACE(16) if hasattr(socket, "CMSG_SPACE") else 128
+            prev_loop_ns = mono_ns() if diag else 0
+            if is_udp_data:
                 while True:
-                    if args.diag:
-                        loop_now_ns = time.monotonic_ns()
+                    if diag:
+                        loop_now_ns = mono_ns()
                         loop_gap_ns = loop_now_ns - prev_loop_ns
                         prev_loop_ns = loop_now_ns
-                        pre_recv_ns = time.monotonic_ns()
+                        pre_recv_ns = mono_ns()
                     try:
-                        got = data_sock.recv_into(inbuf)
+                        if kernel_timestamp_enabled:
+                            got, ancdata, _flags, _addr = recvmsg_into([inbuf], cmsg_buf_size)
+                            ts_recv_ns = parse_kernel_timestamp_ns(ancdata)
+                            if ts_recv_ns is None:
+                                ts_recv_ns = time_ns()
+                                kernel_timestamp_fallback += 1
+                            else:
+                                kernel_timestamp_received += 1
+                        else:
+                            got = recv_into(inbuf)
+                            ts_recv_ns = time_ns()
                     except socket.timeout:
                         break
-                    if args.diag:
-                        recv_block_ns = time.monotonic_ns() - pre_recv_ns
+                    if diag:
+                        recv_block_ns = mono_ns() - pre_recv_ns
                     if got != UDP_MSG_SIZE:
                         continue
-                    count_idx, ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(UDP_MSG_FORMAT, inbuf)
-                    ts_recv_ns = time.time_ns()
-                    count_idx = int(count_idx)
+                    count_idx, ts_emit_ns, peer_id, correction_bits, w_swap = udp_unpack_from(inbuf)
                     if count_idx <= 0 or count_idx > count:
                         continue
                     udp_received += 1
-                    if count_idx > last_seq:
-                        udp_lost_est += max(0, count_idx - last_seq - 1)
-                        last_seq = count_idx
-                    w_swap_raw = float(w_swap)
-                    peer_id = int(peer_id)
-                    correction_bits = int(correction_bits)
-                    last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+                    if not udp_seen_counts[count_idx]:
+                        udp_seen_counts[count_idx] = 1
+                        udp_seen_total += 1
+                    w_swap_raw = w_swap
+                    last_ts_emit_ns = ts_emit_ns
+                    last_peer_id = peer_id
+                    last_correction_bits = correction_bits
+                    last_w_swap_raw = w_swap_raw
                     last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
                     if count_idx > warmup and sample_idx < sample_count:
+                        raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
                         delta_samples[sample_idx] = last_delta
                         werner_raw_samples[sample_idx] = w_swap_raw
-                        sample_msgs[sample_idx] = (last_delta, count_idx, last_raw_msg, None)
+                        sample_msgs[sample_idx] = (last_delta, count_idx, raw_msg, None)
                         delta_record_counts[sample_idx] = count_idx
-                        if args.diag:
+                        if diag:
                             loop_gap_samples[sample_idx] = loop_gap_ns
                             recv_block_samples[sample_idx] = recv_block_ns
                         sample_idx += 1
                     if count_idx >= count:
                         break
-                    if args.count_interval > 0:
-                        time.sleep(args.count_interval)
+                    if count_interval > 0:
+                        sleep(count_interval)
             else:
                 for i in range(count):
-                    if args.diag:
-                        loop_now_ns = time.monotonic_ns()
+                    if diag:
+                        loop_now_ns = mono_ns()
                         loop_gap_ns = loop_now_ns - prev_loop_ns
                         prev_loop_ns = loop_now_ns
-                        pre_recv_ns = time.monotonic_ns()
-                        recv_exact_into(data_sock, inbuf)
-                        recv_block_ns = time.monotonic_ns() - pre_recv_ns
+                        pre_recv_ns = mono_ns()
+                        recv_exact(data_sock, inbuf)
+                        recv_block_ns = mono_ns() - pre_recv_ns
                     else:
-                        recv_exact_into(data_sock, inbuf)
-                    ts_emit_ns, peer_id, correction_bits, w_swap = struct.unpack(MSG_FORMAT, inbuf)
-                    ts_recv_ns = time.time_ns()
-                    w_swap_raw = float(w_swap)
-                    peer_id = int(peer_id)
-                    correction_bits = int(correction_bits)
-                    last_raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
+                        recv_exact(data_sock, inbuf)
+                    ts_emit_ns, peer_id, correction_bits, w_swap = tcp_unpack_from(inbuf)
+                    ts_recv_ns = time_ns()
+                    w_swap_raw = w_swap
+                    last_ts_emit_ns = ts_emit_ns
+                    last_peer_id = peer_id
+                    last_correction_bits = correction_bits
+                    last_w_swap_raw = w_swap_raw
                     last_delta = (ts_recv_ns + clock_offset_ns) - ts_emit_ns
                     if i >= warmup:
+                        raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
                         delta_samples[sample_idx] = last_delta
                         werner_raw_samples[sample_idx] = w_swap_raw
-                        sample_msgs[sample_idx] = (last_delta, i + 1, last_raw_msg, None)
+                        sample_msgs[sample_idx] = (last_delta, i + 1, raw_msg, None)
                         delta_record_counts[sample_idx] = i + 1
-                        if args.diag:
+                        if diag:
                             loop_gap_samples[sample_idx] = loop_gap_ns
                             recv_block_samples[sample_idx] = recv_block_ns
                         sample_idx += 1
-                    if args.count_interval > 0:
-                        time.sleep(args.count_interval)
+                    if count_interval > 0:
+                        sleep(count_interval)
         finally:
             if gc_was_enabled:
                 gc.enable()
             if args.data_protocol == "udp":
                 data_sock.close()
+
+    if is_udp_data:
+        udp_lost_est = max(0, count - udp_seen_total)
 
     delta_samples = delta_samples[:sample_idx]
     werner_raw_samples = werner_raw_samples[:sample_idx]
@@ -769,6 +950,7 @@ def run_client(args):
 
     delay_center_ns = percentile(sorted(delta_samples), 0.50) if args.center_delay and delta_samples else 0
     delay_stat_samples = [delay_ns - delay_center_ns for delay_ns in delta_samples]
+    last_raw_msg = (last_ts_emit_ns, last_peer_id, last_correction_bits, last_w_swap_raw)
 
     werner_samples = [
         decay_werner(w_swap_raw, max(0, delay_ns), args.t1_ns) ** 2
@@ -855,11 +1037,80 @@ def run_client(args):
                         f"{clock_offset_ns},{clock_sync_path_delay_ns}\n"
                     )
             print(f"clock_sync=data_saved ({clock_sync_path})")
+        if args.json_output:
+            json_dir = args.json_dir or default_json_dir(args.plot_dir)
+            os.makedirs(json_dir, exist_ok=True)
+            json_path = os.path.join(json_dir, f"{base}{suffix}.json")
+            json_samples = []
+            for count_idx, delay_ns, delay_centered_ns, w_swap_raw, werner, sample in zip(
+                delta_record_counts, delta_samples, delay_stat_samples, werner_raw_samples, werner_samples, sample_msgs
+            ):
+                msg = sample[2] if sample else (0, 0, 0, 0.0)
+                json_samples.append(
+                    {
+                        "count_idx": int(count_idx),
+                        "delay_ns": int(delay_ns),
+                        "delay_center_ns": int(delay_center_ns),
+                        "delay_centered_ns": int(delay_centered_ns),
+                        "clock_offset_ns": int(clock_offset_ns),
+                        "clock_sync_path_delay_ns": int(clock_sync_path_delay_ns),
+                        "ts_emit_ns": int(msg[0]),
+                        "peer_id": int(msg[1]),
+                        "correction_bits": int(msg[2]),
+                        "w_swap_raw": float(w_swap_raw),
+                        "werner": float(werner),
+                    }
+                )
+            payload = {
+                "role": "client",
+                "argv": sys.argv,
+                "args": vars(args),
+                "client_id": int(args.client_id),
+                "repeater_id": int(args.repeater_id),
+                "exchanges": int(count),
+                "warmup": int(warmup),
+                "data_protocol": args.data_protocol,
+                "udp_received": int(udp_received),
+                "udp_lost_est": int(udp_lost_est),
+                "clock_offset_ns": int(clock_offset_ns),
+                "clock_sync_path_delay_ns": int(clock_sync_path_delay_ns),
+                "kernel_timestamp": bool(kernel_timestamp_enabled),
+                "kernel_timestamp_received": int(kernel_timestamp_received),
+                "kernel_timestamp_fallback": int(kernel_timestamp_fallback),
+                "delay_center_ns": int(delay_center_ns),
+                "summary": {
+                    "abs_delay_ns": {
+                        "p50": int(percentile(delta_sorted, 0.50)),
+                        "p90": int(percentile(delta_sorted, 0.90)),
+                        "p95": int(percentile(delta_sorted, 0.95)),
+                        "p99": int(percentile(delta_sorted, 0.99)),
+                        "mean": int(mean_delay),
+                        "std": float(std_delay),
+                    },
+                    "werner": {
+                        "p50": float(percentile_inverse(w_sorted, 0.50)),
+                        "p90": float(percentile_inverse(w_sorted, 0.90)),
+                        "p95": float(percentile_inverse(w_sorted, 0.95)),
+                        "p99": float(percentile_inverse(w_sorted, 0.99)),
+                        "mean": float(mean_werner),
+                        "std": float(std_werner),
+                    },
+                },
+                "samples": json_samples,
+            }
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+            print(f"json=data_saved ({json_path})")
 
     if args.quiet:
         print(f"exchanges={count}")
         print(f"warmup={warmup}")
         print(f"data_protocol={args.data_protocol}")
+        print(f"kernel_timestamp={kernel_timestamp_enabled}")
+        if kernel_timestamp_enabled:
+            print(f"kernel_timestamp_received={kernel_timestamp_received}")
+            print(f"kernel_timestamp_fallback={kernel_timestamp_fallback}")
         if args.data_protocol == "udp":
             print(f"udp_received={udp_received}")
             print(f"udp_lost_est={udp_lost_est}")
@@ -882,6 +1133,10 @@ def run_client(args):
     print(f"exchanges={count} warmup={warmup}")
     print(f"client_id={args.client_id} repeater_id={args.repeater_id}")
     print(f"data_protocol={args.data_protocol}")
+    print(f"kernel_timestamp={kernel_timestamp_enabled}")
+    if kernel_timestamp_enabled:
+        print(f"kernel_timestamp_received={kernel_timestamp_received}")
+        print(f"kernel_timestamp_fallback={kernel_timestamp_fallback}")
     if args.data_protocol == "udp":
         print(f"udp_received={udp_received}")
         print(f"udp_lost_est={udp_lost_est}")

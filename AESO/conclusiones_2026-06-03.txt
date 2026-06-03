@@ -1,0 +1,117 @@
+Conclusiones AESO entre 2026-06-02 y 2026-06-03
+================================================
+
+Contexto del experimento
+------------------------
+
+El objetivo de estas pruebas es medir cuanto tarda la comunicacion clasica
+desde un nodo repeater hasta dos nodos extremos cuando el repeater anuncia que
+ha realizado entanglement swapping. La metrica principal es el delay
+repeater_to_client, porque representa el coste clasico que condiciona la
+propagacion de informacion en una futura red cuantica.
+
+Conclusiones principales
+------------------------
+
+1. El problema grande de jitter de estos dias no era solo Python.
+
+   Al principio parecia que el bucle Python habia empeorado mucho porque los
+   minimos locales dejaron de estar en 2-6 us y aparecieron medias y maximos
+   mucho peores. Se optimizo el bucle de envio y recepcion, pero la pista clave
+   fue que C tambien mostraba picos parecidos en el mismo entorno. Eso apunta a
+   scheduler/WSL/entorno, no solo al lenguaje.
+
+2. WSL fue la fuente mas sospechosa de inestabilidad.
+
+   Las corridas en WSL daban resultados muy variables: a veces buenos, a veces
+   muy malos, con picos de 1-3 ms y perdida UDP elevada. La carga de CPU parecia
+   baja, pero eso no descarta jitter: si el proceso no despierta a tiempo o si
+   loopback/softirq se retrasa, el delay medido crece aunque la CPU media este
+   libre.
+
+3. Docker con host networking mejoro mucho la lectura local.
+
+   En la carpeta csv_docker_udp_kernel_ts_paced/json_docker_udp_kernel_ts_paced
+   la corrida 2 fue una buena referencia:
+
+   - Cliente 1: p50 3.485 us, p95 9.732 us, p99 18.347 us, media 4.503 us.
+   - Cliente 2: p50 19.747 us, p95 36.811 us, p99 54.860 us, media 22.259 us.
+   - Perdida UDP: 0.
+   - Kernel timestamps: 2000/2000 recibidos, 0 fallback.
+
+   Esto encaja mucho mas con los resultados buenos anteriores.
+
+4. Para medir red, conviene separar dos cosas.
+
+   - Timestamp de usuario: mide envio/recepcion mas scheduler del proceso.
+   - Timestamp de kernel: mide llegada al kernel y evita cargar a la metrica el
+     retraso de despertar el proceso cliente.
+
+   Por eso --kernel-timestamp en UDP es importante para distinguir latencia de
+   red de latencia de planificacion.
+
+5. El modo UDP no significa "cero coste".
+
+   UDP elimina ACK de aplicacion y evita stream TCP, pero aun atraviesa socket,
+   colas de kernel, scheduler, timestamp, copias y softirq. Si el repeater
+   manda demasiado rapido, el cliente puede acumular mensajes y el delay aparente
+   sube aunque la red local sea rapida.
+
+6. El pacing fue util.
+
+   --count-interval 0.00005 con --pace-mode sleep y --shared-send-timestamp dio
+   resultados mucho mas razonables en Docker. Spin/hybrid no fue siempre mejor:
+   puede reducir oversleep, pero tambien puede competir por CPU si el entorno no
+   esta bien aislado.
+
+7. ACK no es la metrica principal, pero puede servir como control.
+
+   Si se hace ACK por mensaje, se evita acumulacion y se mide un comportamiento
+   mas controlado. Pero ya no es el mismo experimento de "el repeater emite
+   notificaciones lo antes posible"; mide round-trip/control de flujo. Puede ser
+   util para diagnostico, no como sustituto directo de la metrica principal.
+
+8. Los buffers no deben "ponerse a tope" sin criterio.
+
+   Buffers grandes pueden reducir perdida, pero tambien permiten acumular cola y
+   esconder que el cliente no drena a tiempo. Para estas pruebas se ha dejado
+   65536 por defecto en Python y C como compromiso mejor que 4096/212992.
+
+9. Los JSON son importantes para reproducibilidad.
+
+   Ahora el Python escribe JSON por defecto cuando se usa --plot. Guardan argv,
+   args, resumen y muestras. El C se ha actualizado para escribir JSON equivalente
+   de resumen y muestras al final de la corrida, sin tocar el bucle critico.
+
+Problemas encontrados
+---------------------
+
+- TUN/SSH crea interfaces que desaparecen al cerrar la sesion SSH si no se
+  crean de forma persistente. Para las pruebas de red directa, no conviene
+  mezclar TUN con UDP directo si no se esta midiendo explicitamente el tunel.
+
+- La sincronizacion PTP por TCP funciona antes del bucle de datos. No debe
+  ejecutarse durante la ruta critica de envio UDP/TCP.
+
+- Los delays negativos no son un fallo automatico de red: indican error residual
+  de offset entre relojes. Para Werner se truncan a cero para no aplicar decaimiento
+  negativo, pero en CSV se conserva el delay firmado.
+
+- En WSL, la reserva de CPU/cpuset no garantiza aislamiento real como en Linux
+  nativo. Docker con --network host y cpuset ayudo, pero la validacion final
+  debe repetirse en la maquina/entorno real.
+
+Estado actual recomendado
+-------------------------
+
+Para comparar de forma limpia:
+
+- Probar primero local en Docker.
+- Usar UDP con --kernel-timestamp en clientes.
+- Usar --shared-send-timestamp en repeater para que A/B partan del mismo tiempo
+  logico en modo no paralelo.
+- Usar --count-interval 0.00005 como baseline inicial.
+- Mantener --sock-buf 65536.
+- Evitar --diag en corridas finales, porque anade llamadas de reloj.
+- Guardar siempre CSV y JSON.
+

@@ -33,6 +33,14 @@
 #define UDP_READY_BYTE 'U'
 #define DATA_ACK_BYTE 'A'
 
+#ifndef SO_TIMESTAMPNS
+#define SO_TIMESTAMPNS 64
+#endif
+
+#ifndef SCM_TIMESTAMPNS
+#define SCM_TIMESTAMPNS SO_TIMESTAMPNS
+#endif
+
 typedef enum {
     ROLE_NONE = 0,
     ROLE_REPEATER,
@@ -49,6 +57,12 @@ typedef enum {
     SEND_MODE_PACED,
     SEND_MODE_ACK
 } SendMode;
+
+typedef enum {
+    PACE_SLEEP = 0,
+    PACE_SPIN,
+    PACE_HYBRID
+} PaceMode;
 
 typedef struct {
     uint64_t ts_emit_ns;
@@ -126,11 +140,19 @@ typedef struct {
     bool clock_offset_set;
     int64_t clock_offset_ns;
     bool center_delay;
+    bool shared_send_timestamp;
+    PaceMode pace_mode;
+    double spin_margin_us;
+    bool json_output;
+    const char *json_dir;
+    bool kernel_timestamp;
     DataProtocol data_protocol;
     SendMode send_mode;
     double udp_ready_timeout;
     double udp_idle_timeout;
     double t1_ns;
+    int argc;
+    char **argv;
 } Options;
 
 typedef struct {
@@ -215,6 +237,45 @@ static void sleep_seconds(double seconds) {
         req.tv_nsec = 0;
     }
     while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+    }
+}
+
+static const char *pace_mode_name(PaceMode mode) {
+    switch (mode) {
+        case PACE_SLEEP:
+            return "sleep";
+        case PACE_SPIN:
+            return "spin";
+        case PACE_HYBRID:
+            return "hybrid";
+    }
+    return "unknown";
+}
+
+static void pace_wait(uint64_t interval_ns, PaceMode mode, uint64_t spin_margin_ns) {
+    if (interval_ns == 0) {
+        return;
+    }
+    if (mode == PACE_SLEEP) {
+        sleep_seconds((double)interval_ns / 1e9);
+        return;
+    }
+    uint64_t deadline_ns = monotonic_ns() + interval_ns;
+    if (mode == PACE_HYBRID) {
+        while (true) {
+            uint64_t now = monotonic_ns();
+            if (now >= deadline_ns) {
+                return;
+            }
+            uint64_t remaining = deadline_ns - now;
+            if (remaining <= spin_margin_ns) {
+                break;
+            }
+            uint64_t sleep_ns = remaining - spin_margin_ns;
+            sleep_seconds((double)sleep_ns / 1e9);
+        }
+    }
+    while (monotonic_ns() < deadline_ns) {
     }
 }
 
@@ -352,6 +413,43 @@ static void enable_low_latency_socket(int fd, int sock_buf, int busy_poll_us) {
         (void)setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
     }
 #endif
+}
+
+static bool try_setsockopt_int(int fd, int level, int optname, int value) {
+    return setsockopt(fd, level, optname, &value, sizeof(value)) == 0;
+}
+
+static void enable_kernel_timestamp_ns(int fd) {
+    if (try_setsockopt_int(fd, SOL_SOCKET, SO_TIMESTAMPNS, 1)) {
+        return;
+    }
+    if (SO_TIMESTAMPNS != 64 && try_setsockopt_int(fd, SOL_SOCKET, 64, 1)) {
+        return;
+    }
+    if (SO_TIMESTAMPNS != 35 && try_setsockopt_int(fd, SOL_SOCKET, 35, 1)) {
+        return;
+    }
+    die("setsockopt SO_TIMESTAMPNS");
+}
+
+static uint64_t parse_kernel_timestamp_ns(struct msghdr *msg, bool *found) {
+    *found = false;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET) {
+            continue;
+        }
+        if (cmsg->cmsg_type != SCM_TIMESTAMPNS && cmsg->cmsg_type != SO_TIMESTAMPNS &&
+            cmsg->cmsg_type != 64 && cmsg->cmsg_type != 35) {
+            continue;
+        }
+        if (cmsg->cmsg_len >= CMSG_LEN(sizeof(struct timespec))) {
+            struct timespec ts;
+            memcpy(&ts, CMSG_DATA(cmsg), sizeof(ts));
+            *found = true;
+            return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        }
+    }
+    return 0;
 }
 
 static void apply_cpu_rt(const Options *o) {
@@ -589,6 +687,83 @@ static const char *path_suffix(const char *path, const char *base) {
     return suffix;
 }
 
+static void default_json_dir(char *out, size_t out_size, const char *plot_dir) {
+    char clean[4096];
+    snprintf(clean, sizeof(clean), "%s", plot_dir ? plot_dir : "csv");
+    size_t len = strlen(clean);
+    while (len > 0 && clean[len - 1] == '/') {
+        clean[--len] = '\0';
+    }
+    char *slash = strrchr(clean, '/');
+    const char *base = slash ? slash + 1 : clean;
+    char parent[4096] = "";
+    if (slash) {
+        size_t parent_len = (size_t)(slash - clean);
+        if (parent_len >= sizeof(parent)) {
+            parent_len = sizeof(parent) - 1;
+        }
+        memcpy(parent, clean, parent_len);
+        parent[parent_len] = '\0';
+    }
+    char json_base[4096];
+    if (strncmp(base, "csv", 3) == 0) {
+        snprintf(json_base, sizeof(json_base), "json%s", base + 3);
+    } else if (strncmp(base, "plots", 5) == 0) {
+        snprintf(json_base, sizeof(json_base), "json%s", base + 5);
+    } else if (*base) {
+        snprintf(json_base, sizeof(json_base), "%s_json", base);
+    } else {
+        snprintf(json_base, sizeof(json_base), "json");
+    }
+    if (parent[0]) {
+        snprintf(out, out_size, "%s/%s", parent, json_base);
+    } else {
+        snprintf(out, out_size, "%s", json_base);
+    }
+}
+
+static void json_print_string(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; ++p) {
+        switch (*p) {
+            case '\\':
+                fputs("\\\\", f);
+                break;
+            case '"':
+                fputs("\\\"", f);
+                break;
+            case '\n':
+                fputs("\\n", f);
+                break;
+            case '\r':
+                fputs("\\r", f);
+                break;
+            case '\t':
+                fputs("\\t", f);
+                break;
+            default:
+                if (*p < 0x20) {
+                    fprintf(f, "\\u%04x", *p);
+                } else {
+                    fputc(*p, f);
+                }
+                break;
+        }
+    }
+    fputc('"', f);
+}
+
+static void json_print_argv(FILE *f, const Options *o) {
+    fputc('[', f);
+    for (int i = 0; i < o->argc; ++i) {
+        if (i > 0) {
+            fputs(", ", f);
+        }
+        json_print_string(f, o->argv[i]);
+    }
+    fputc(']', f);
+}
+
 static void parse_defaults(Options *o, Role role) {
     memset(o, 0, sizeof(*o));
     o->role = role;
@@ -607,7 +782,7 @@ static void parse_defaults(Options *o, Role role) {
     o->cpu = -1;
     o->rt_priority = 50;
     o->rt_priority_set = true;
-    o->sock_buf = role == ROLE_REPEATER ? 65536 : 4096;
+    o->sock_buf = 65536;
     o->busy_poll_us = 25;
     o->repeater_id = 0;
     o->client_a_id = 1;
@@ -619,7 +794,10 @@ static void parse_defaults(Options *o, Role role) {
     o->count_interval = 0.0;
     o->plot_prefix = role == ROLE_REPEATER ? "repeater_send_hist" : "delay_hist_client";
     o->plot_dir = "csv";
+    o->json_output = true;
     o->clock_sync_samples = 8;
+    o->pace_mode = PACE_SLEEP;
+    o->spin_margin_us = 100.0;
     o->data_protocol = PROTO_UDP;
     o->send_mode = SEND_MODE_BURST;
     o->udp_ready_timeout = 30.0;
@@ -685,6 +863,19 @@ static void recv_data_ack(int fd, DataProtocol protocol) {
 static void usage(const char *prog) {
     printf("usage: %s {repeater,client} [options]\n", prog);
     printf("Fast3 unified C port: repeater/client with persistent sockets and low-jitter options.\n");
+    printf("\nCommon options:\n");
+    printf("  --count N --quiet --plot --plot-dir DIR --json/--no-json --json-dir DIR\n");
+    printf("  --cpu N --rt-priority N --sock-buf N --busy-poll-us N\n");
+    printf("  --data-protocol udp|tcp --clock-sync --clock-sync-samples N\n");
+    printf("\nRepeater options:\n");
+    printf("  --listen-host-a HOST --listen-port-a PORT --listen-host-b HOST --listen-port-b PORT\n");
+    printf("  --werner-ar X --werner-br X --parallel --cpu-a N --cpu-b N\n");
+    printf("  --shared-send-timestamp --count-interval SEC --pace-mode sleep|spin|hybrid\n");
+    printf("  --spin-margin-us US --send-mode burst|paced|ack --udp-ready-timeout SEC\n");
+    printf("\nClient options:\n");
+    printf("  --repeater-host HOST --repeater-port PORT --client-id N --warmup N\n");
+    printf("  --connect-timeout SEC --detect-timeout SEC --detect-interval SEC\n");
+    printf("  --clock-offset-ns NS --center-delay --udp-idle-timeout SEC --kernel-timestamp\n");
 }
 
 static void parse_args(int argc, char **argv, Options *o) {
@@ -702,6 +893,8 @@ static void parse_args(int argc, char **argv, Options *o) {
         exit(2);
     }
     parse_defaults(o, role);
+    o->argc = argc;
+    o->argv = argv;
     for (int i = 2; i < argc; ++i) {
         const char *arg = argv[i];
         if (streq(arg, "--help") || streq(arg, "-h")) {
@@ -765,6 +958,21 @@ static void parse_args(int argc, char **argv, Options *o) {
             o->cpu_b = atoi(need_arg(argc, argv, &i));
         } else if (streq(arg, "--count-interval")) {
             o->count_interval = atof(need_arg(argc, argv, &i));
+        } else if (streq(arg, "--pace-mode")) {
+            const char *v = need_arg(argc, argv, &i);
+            if (streq(v, "sleep")) {
+                o->pace_mode = PACE_SLEEP;
+            } else if (streq(v, "spin")) {
+                o->pace_mode = PACE_SPIN;
+            } else if (streq(v, "hybrid")) {
+                o->pace_mode = PACE_HYBRID;
+            } else {
+                die_msg("--pace-mode must be sleep, spin, or hybrid");
+            }
+        } else if (streq(arg, "--spin-margin-us")) {
+            o->spin_margin_us = atof(need_arg(argc, argv, &i));
+        } else if (streq(arg, "--shared-send-timestamp")) {
+            o->shared_send_timestamp = true;
         } else if (streq(arg, "--quiet")) {
             o->quiet = true;
         } else if (streq(arg, "--plot")) {
@@ -773,6 +981,12 @@ static void parse_args(int argc, char **argv, Options *o) {
             o->plot_prefix = need_arg(argc, argv, &i);
         } else if (streq(arg, "--plot-dir")) {
             o->plot_dir = need_arg(argc, argv, &i);
+        } else if (streq(arg, "--json")) {
+            o->json_output = true;
+        } else if (streq(arg, "--no-json")) {
+            o->json_output = false;
+        } else if (streq(arg, "--json-dir")) {
+            o->json_dir = need_arg(argc, argv, &i);
         } else if (streq(arg, "--diag")) {
             o->diag = true;
         } else if (streq(arg, "--clock-sync")) {
@@ -808,6 +1022,8 @@ static void parse_args(int argc, char **argv, Options *o) {
             o->udp_ready_timeout = atof(need_arg(argc, argv, &i));
         } else if (streq(arg, "--udp-idle-timeout")) {
             o->udp_idle_timeout = atof(need_arg(argc, argv, &i));
+        } else if (streq(arg, "--kernel-timestamp")) {
+            o->kernel_timestamp = true;
         } else if (streq(arg, "--t1-ns")) {
             o->t1_ns = atof(need_arg(argc, argv, &i));
         } else {
@@ -1300,6 +1516,8 @@ static int run_repeater(const Options *o) {
     for (int i = 0; i < count; ++i) {
         correction_bits_samples[i] = (uint8_t)(rand() % 4);
     }
+    uint64_t pace_interval_ns = o->count_interval > 0.0 ? (uint64_t)(o->count_interval * 1e9) : 0;
+    uint64_t spin_margin_ns = o->spin_margin_us > 0.0 ? (uint64_t)(o->spin_margin_us * 1000.0) : 0;
 
     int conn_a = accept_one(o->listen_host_a, o->listen_port_a, o->accept_timeout, o->sock_buf, o->busy_poll_us);
     int conn_b = accept_one(o->listen_host_b, o->listen_port_b, o->accept_timeout, o->sock_buf, o->busy_poll_us);
@@ -1353,9 +1571,7 @@ static int run_repeater(const Options *o) {
             if (o->diag) {
                 send_gap_ab_samples[idx] = 0;
             }
-            if (o->count_interval > 0.0) {
-                sleep_seconds(o->count_interval);
-            }
+            pace_wait(pace_interval_ns, o->pace_mode, spin_margin_ns);
         }
         pthread_join(ta, NULL);
         pthread_join(tb, NULL);
@@ -1384,7 +1600,7 @@ static int run_repeater(const Options *o) {
                 uint64_t post_a = monotonic_ns();
                 send_a_block_samples[idx] = (int64_t)(post_a - pre_a);
                 last_msg_a = (Msg){ts_emit_a_ns, (uint32_t)o->client_b_id, correction_bits, w_swap};
-                uint64_t ts_emit_b_ns = time_ns();
+                uint64_t ts_emit_b_ns = o->shared_send_timestamp ? ts_emit_a_ns : time_ns();
                 if (o->data_protocol == PROTO_UDP) {
                     pack_udp_msg(outbuf_b, (uint32_t)(idx + 1), ts_emit_b_ns, (uint32_t)o->client_a_id, correction_bits, w_swap);
                 } else {
@@ -1412,7 +1628,7 @@ static int run_repeater(const Options *o) {
                     die("send A");
                 }
                 last_msg_a = (Msg){ts_emit_a_ns, (uint32_t)o->client_b_id, correction_bits, w_swap};
-                uint64_t ts_emit_b_ns = time_ns();
+                uint64_t ts_emit_b_ns = o->shared_send_timestamp ? ts_emit_a_ns : time_ns();
                 if (o->data_protocol == PROTO_UDP) {
                     pack_udp_msg(outbuf_b, (uint32_t)(idx + 1), ts_emit_b_ns, (uint32_t)o->client_a_id, correction_bits, w_swap);
                 } else {
@@ -1430,9 +1646,7 @@ static int run_repeater(const Options *o) {
                     recv_data_ack(data_b, o->data_protocol);
                 }
             }
-            if (o->count_interval > 0.0) {
-                sleep_seconds(o->count_interval);
-            }
+            pace_wait(pace_interval_ns, o->pace_mode, spin_margin_ns);
         }
     }
 
@@ -1465,6 +1679,80 @@ static int run_repeater(const Options *o) {
         fclose(f);
         chown_to_sudo_user(csv_path);
         printf("repeater_plot=data_saved (%s)\n", csv_path);
+        if (o->json_output) {
+            char json_dir_buf[8192];
+            const char *json_dir = o->json_dir;
+            if (!json_dir) {
+                default_json_dir(json_dir_buf, sizeof(json_dir_buf), o->plot_dir);
+                json_dir = json_dir_buf;
+            }
+            ensure_dir(json_dir);
+            const char *suffix = path_suffix(csv_path, o->plot_prefix);
+            size_t json_path_len = strlen(json_dir) + strlen(o->plot_prefix) + strlen(suffix) + 8;
+            char *json_path = malloc(json_path_len);
+            if (!json_path) {
+                die("malloc repeater json path");
+            }
+            snprintf(json_path, json_path_len, "%s/%s%s.json", json_dir, o->plot_prefix, suffix);
+            FILE *jf = fopen(json_path, "w");
+            if (!jf) {
+                die("fopen repeater json");
+            }
+            fprintf(jf, "{\n");
+            fprintf(jf, "  \"role\": \"repeater\",\n");
+            fprintf(jf, "  \"argv\": ");
+            json_print_argv(jf, o);
+            fprintf(jf, ",\n");
+            fprintf(jf, "  \"args\": {\n");
+            fprintf(jf, "    \"count\": %d,\n", count);
+            fprintf(jf, "    \"listen_host_a\": ");
+            json_print_string(jf, o->listen_host_a);
+            fprintf(jf, ",\n    \"listen_port_a\": %d,\n", o->listen_port_a);
+            fprintf(jf, "    \"listen_host_b\": ");
+            json_print_string(jf, o->listen_host_b);
+            fprintf(jf, ",\n    \"listen_port_b\": %d,\n", o->listen_port_b);
+            fprintf(jf, "    \"data_protocol\": \"%s\",\n", protocol_name(o->data_protocol));
+            fprintf(jf, "    \"send_mode\": \"%s\",\n", send_mode_name(o->send_mode));
+            fprintf(jf, "    \"pace_mode\": \"%s\",\n", pace_mode_name(o->pace_mode));
+            fprintf(jf, "    \"shared_send_timestamp\": %s,\n", o->shared_send_timestamp ? "true" : "false");
+            fprintf(jf, "    \"count_interval\": %.12g,\n", o->count_interval);
+            fprintf(jf, "    \"sock_buf\": %d,\n", o->sock_buf);
+            fprintf(jf, "    \"busy_poll_us\": %d,\n", o->busy_poll_us);
+            fprintf(jf, "    \"cpu\": %d,\n", o->cpu);
+            fprintf(jf, "    \"rt_priority\": %d\n", o->rt_priority);
+            fprintf(jf, "  },\n");
+            fprintf(jf, "  \"exchanges\": %d,\n", count);
+            fprintf(jf, "  \"csv_path\": ");
+            json_print_string(jf, csv_path);
+            fprintf(jf, ",\n");
+            fprintf(jf, "  \"last_msg_a\": {\"ts_emit_ns\": %llu, \"peer_id\": %u, \"correction_bits\": %u, \"w_swap\": %.17g},\n",
+                    (unsigned long long)last_msg_a.ts_emit_ns, last_msg_a.peer_id, last_msg_a.bits, last_msg_a.w_swap);
+            fprintf(jf, "  \"last_msg_b\": {\"ts_emit_ns\": %llu, \"peer_id\": %u, \"correction_bits\": %u, \"w_swap\": %.17g},\n",
+                    (unsigned long long)last_msg_b.ts_emit_ns, last_msg_b.peer_id, last_msg_b.bits, last_msg_b.w_swap);
+            fprintf(jf, "  \"send_samples\": [");
+            if (o->diag) {
+                for (int i = 0; i < count; ++i) {
+                    fprintf(
+                        jf,
+                        "%s\n    {\"count_idx\": %d, \"send_a_block_ns\": %lld, \"send_b_block_ns\": %lld, \"send_gap_ab_ns\": %lld}",
+                        i == 0 ? "" : ",",
+                        i + 1,
+                        (long long)send_a_block_samples[i],
+                        (long long)send_b_block_samples[i],
+                        (long long)send_gap_ab_samples[i]
+                    );
+                }
+                if (count > 0) {
+                    fputc('\n', jf);
+                }
+            }
+            fprintf(jf, "  ]\n");
+            fprintf(jf, "}\n");
+            fclose(jf);
+            chown_to_sudo_user(json_path);
+            printf("repeater_json=data_saved (%s)\n", json_path);
+            free(json_path);
+        }
     }
 
     if (!o->quiet) {
@@ -1473,6 +1761,8 @@ static int run_repeater(const Options *o) {
         printf("repeater_id=%d\n", o->repeater_id);
         printf("data_protocol=%s\n", protocol_name(o->data_protocol));
         printf("send_mode=%s\n", send_mode_name(o->send_mode));
+        printf("pace_mode=%s\n", pace_mode_name(o->pace_mode));
+        printf("shared_send_timestamp=%s\n", o->shared_send_timestamp ? "true" : "false");
     }
     char statebuf_a[96];
     char statebuf_b[96];
@@ -1573,9 +1863,11 @@ static int run_client(const Options *o) {
     int *delta_record_counts = calloc((size_t)sample_count, sizeof(int));
     int64_t *loop_gap_samples = o->diag ? calloc((size_t)sample_count, sizeof(int64_t)) : NULL;
     int64_t *recv_block_samples = o->diag ? calloc((size_t)sample_count, sizeof(int64_t)) : NULL;
+    unsigned char *udp_seen_counts = o->data_protocol == PROTO_UDP ? calloc((size_t)count + 1, 1) : NULL;
     if (!delta_samples || !delay_stat_samples || !delay_abs_samples || !werner_samples ||
         !werner_raw_samples || !sample_msgs || !delta_record_counts ||
-        (o->diag && (!loop_gap_samples || !recv_block_samples))) {
+        (o->diag && (!loop_gap_samples || !recv_block_samples)) ||
+        (o->data_protocol == PROTO_UDP && !udp_seen_counts)) {
         die("calloc client");
     }
     int data_msg_size = o->data_protocol == PROTO_UDP ? UDP_MSG_SIZE : MSG_SIZE;
@@ -1586,6 +1878,10 @@ static int run_client(const Options *o) {
     int sample_idx = 0;
     int udp_received = 0;
     int udp_lost_est = 0;
+    int udp_seen_total = 0;
+    int kernel_timestamp_received = 0;
+    int kernel_timestamp_fallback = 0;
+    bool kernel_timestamp_enabled = false;
     int64_t last_delta = 0;
     Msg last_raw_msg = {0, 0, 0, 0.0};
     ClockSyncRow *clock_rows = NULL;
@@ -1633,21 +1929,57 @@ static int run_client(const Options *o) {
             tv.tv_usec = 0;
         }
         (void)setsockopt(data_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (o->kernel_timestamp) {
+            enable_kernel_timestamp_ns(data_fd);
+            kernel_timestamp_enabled = true;
+        }
+    } else if (o->kernel_timestamp) {
+        die_msg("--kernel-timestamp is only supported with --data-protocol udp");
     }
 
     uint64_t prev_loop_ns = o->diag ? monotonic_ns() : 0;
     if (o->data_protocol == PROTO_UDP) {
-        int last_seq = 0;
         while (true) {
             int64_t loop_gap_ns = 0;
             int64_t recv_block_ns = 0;
+            uint64_t ts_recv_ns = 0;
             if (o->diag) {
                 uint64_t loop_now = monotonic_ns();
                 loop_gap_ns = (int64_t)(loop_now - prev_loop_ns);
                 prev_loop_ns = loop_now;
             }
             uint64_t pre_recv = o->diag ? monotonic_ns() : 0;
-            ssize_t got = recv(data_fd, inbuf, (size_t)data_msg_size, 0);
+            ssize_t got;
+            if (kernel_timestamp_enabled) {
+                struct iovec iov;
+                char control[128];
+                struct msghdr hdr;
+                memset(&iov, 0, sizeof(iov));
+                memset(&hdr, 0, sizeof(hdr));
+                memset(control, 0, sizeof(control));
+                iov.iov_base = inbuf;
+                iov.iov_len = (size_t)data_msg_size;
+                hdr.msg_iov = &iov;
+                hdr.msg_iovlen = 1;
+                hdr.msg_control = control;
+                hdr.msg_controllen = sizeof(control);
+                got = recvmsg(data_fd, &hdr, 0);
+                if (got >= 0) {
+                    bool found_ts = false;
+                    ts_recv_ns = parse_kernel_timestamp_ns(&hdr, &found_ts);
+                    if (found_ts) {
+                        ++kernel_timestamp_received;
+                    } else {
+                        ts_recv_ns = time_ns();
+                        ++kernel_timestamp_fallback;
+                    }
+                }
+            } else {
+                got = recv(data_fd, inbuf, (size_t)data_msg_size, 0);
+                if (got >= 0) {
+                    ts_recv_ns = time_ns();
+                }
+            }
             if (got < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     break;
@@ -1665,17 +1997,13 @@ static int run_client(const Options *o) {
             }
             int count_idx = 0;
             Msg msg = unpack_udp_msg(inbuf, &count_idx);
-            uint64_t ts_recv_ns = time_ns();
             if (count_idx <= 0 || count_idx > count) {
                 continue;
             }
             ++udp_received;
-            if (count_idx > last_seq) {
-                int lost = count_idx - last_seq - 1;
-                if (lost > 0) {
-                    udp_lost_est += lost;
-                }
-                last_seq = count_idx;
+            if (!udp_seen_counts[count_idx]) {
+                udp_seen_counts[count_idx] = 1;
+                ++udp_seen_total;
             }
             last_raw_msg = msg;
             last_delta = (int64_t)((int64_t)ts_recv_ns + clock_offset_ns - (int64_t)msg.ts_emit_ns);
@@ -1741,6 +2069,13 @@ static int run_client(const Options *o) {
             if (o->count_interval > 0.0) {
                 sleep_seconds(o->count_interval);
             }
+        }
+    }
+
+    if (o->data_protocol == PROTO_UDP) {
+        udp_lost_est = count - udp_seen_total;
+        if (udp_lost_est < 0) {
+            udp_lost_est = 0;
         }
     }
 
@@ -1882,6 +2217,106 @@ static int run_client(const Options *o) {
             chown_to_sudo_user(clock_path);
             printf("clock_sync=data_saved (%s)\n", clock_path);
         }
+        if (o->json_output) {
+            const char *suffix = path_suffix(csv_path, base);
+            char json_dir_buf[8192];
+            const char *json_dir = o->json_dir;
+            if (!json_dir) {
+                default_json_dir(json_dir_buf, sizeof(json_dir_buf), o->plot_dir);
+                json_dir = json_dir_buf;
+            }
+            ensure_dir(json_dir);
+            size_t json_path_len = strlen(json_dir) + strlen(base) + strlen(suffix) + 8;
+            char *json_path = malloc(json_path_len);
+            if (!json_path) {
+                die("malloc client json path");
+            }
+            snprintf(json_path, json_path_len, "%s/%s%s.json", json_dir, base, suffix);
+            FILE *jf = fopen(json_path, "w");
+            if (!jf) {
+                die("fopen client json");
+            }
+            fprintf(jf, "{\n");
+            fprintf(jf, "  \"role\": \"client\",\n");
+            fprintf(jf, "  \"argv\": ");
+            json_print_argv(jf, o);
+            fprintf(jf, ",\n");
+            fprintf(jf, "  \"args\": {\n");
+            fprintf(jf, "    \"client_id\": %d,\n", o->client_id);
+            fprintf(jf, "    \"repeater_host\": ");
+            json_print_string(jf, o->repeater_host);
+            fprintf(jf, ",\n    \"repeater_port\": %d,\n", o->repeater_port);
+            fprintf(jf, "    \"count\": %d,\n", count);
+            fprintf(jf, "    \"warmup\": %d,\n", warmup);
+            fprintf(jf, "    \"data_protocol\": \"%s\",\n", protocol_name(o->data_protocol));
+            fprintf(jf, "    \"send_mode\": \"%s\",\n", send_mode_name(o->send_mode));
+            fprintf(jf, "    \"kernel_timestamp\": %s,\n", kernel_timestamp_enabled ? "true" : "false");
+            fprintf(jf, "    \"sock_buf\": %d,\n", o->sock_buf);
+            fprintf(jf, "    \"busy_poll_us\": %d,\n", o->busy_poll_us);
+            fprintf(jf, "    \"cpu\": %d,\n", o->cpu);
+            fprintf(jf, "    \"rt_priority\": %d\n", o->rt_priority);
+            fprintf(jf, "  },\n");
+            fprintf(jf, "  \"client_id\": %d,\n", o->client_id);
+            fprintf(jf, "  \"repeater_id\": %d,\n", o->repeater_id);
+            fprintf(jf, "  \"exchanges\": %d,\n", count);
+            fprintf(jf, "  \"warmup\": %d,\n", warmup);
+            fprintf(jf, "  \"data_protocol\": \"%s\",\n", protocol_name(o->data_protocol));
+            fprintf(jf, "  \"udp_received\": %d,\n", udp_received);
+            fprintf(jf, "  \"udp_lost_est\": %d,\n", udp_lost_est);
+            fprintf(jf, "  \"clock_offset_ns\": %lld,\n", (long long)clock_offset_ns);
+            fprintf(jf, "  \"clock_sync_path_delay_ns\": %lld,\n", (long long)clock_sync_path_delay_ns);
+            fprintf(jf, "  \"kernel_timestamp\": %s,\n", kernel_timestamp_enabled ? "true" : "false");
+            fprintf(jf, "  \"kernel_timestamp_received\": %d,\n", kernel_timestamp_received);
+            fprintf(jf, "  \"kernel_timestamp_fallback\": %d,\n", kernel_timestamp_fallback);
+            fprintf(jf, "  \"delay_center_ns\": %lld,\n", (long long)delay_center_ns);
+            fprintf(jf, "  \"csv_path\": ");
+            json_print_string(jf, csv_path);
+            fprintf(jf, ",\n");
+            fprintf(jf, "  \"summary\": {\n");
+            fprintf(jf, "    \"abs_delay_ns\": {\"p50\": %lld, \"p90\": %lld, \"p95\": %lld, \"p99\": %lld, \"mean\": %lld, \"std\": %.17g},\n",
+                    (long long)percentile_i64(delta_sorted, sample_idx, 0.50),
+                    (long long)percentile_i64(delta_sorted, sample_idx, 0.90),
+                    (long long)percentile_i64(delta_sorted, sample_idx, 0.95),
+                    (long long)percentile_i64(delta_sorted, sample_idx, 0.99),
+                    (long long)mean_delay,
+                    std_delay);
+            fprintf(jf, "    \"werner\": {\"p50\": %.17g, \"p90\": %.17g, \"p95\": %.17g, \"p99\": %.17g, \"mean\": %.17g, \"std\": %.17g}\n",
+                    percentile_inverse_double(w_sorted, sample_idx, 0.50),
+                    percentile_inverse_double(w_sorted, sample_idx, 0.90),
+                    percentile_inverse_double(w_sorted, sample_idx, 0.95),
+                    percentile_inverse_double(w_sorted, sample_idx, 0.99),
+                    mean_werner,
+                    std_werner);
+            fprintf(jf, "  },\n");
+            fprintf(jf, "  \"samples\": [");
+            for (int i = 0; i < sample_idx; ++i) {
+                fprintf(
+                    jf,
+                    "%s\n    {\"count_idx\": %d, \"delay_ns\": %lld, \"delay_center_ns\": %lld, \"delay_centered_ns\": %lld, \"clock_offset_ns\": %lld, \"clock_sync_path_delay_ns\": %lld, \"ts_emit_ns\": %llu, \"peer_id\": %u, \"correction_bits\": %u, \"w_swap_raw\": %.17g, \"werner\": %.17g}",
+                    i == 0 ? "" : ",",
+                    delta_record_counts[i],
+                    (long long)delta_samples[i],
+                    (long long)delay_center_ns,
+                    (long long)delay_stat_samples[i],
+                    (long long)clock_offset_ns,
+                    (long long)clock_sync_path_delay_ns,
+                    (unsigned long long)sample_msgs[i].msg.ts_emit_ns,
+                    sample_msgs[i].msg.peer_id,
+                    sample_msgs[i].msg.bits,
+                    werner_raw_samples[i],
+                    werner_samples[i]
+                );
+            }
+            if (sample_idx > 0) {
+                fputc('\n', jf);
+            }
+            fprintf(jf, "  ]\n");
+            fprintf(jf, "}\n");
+            fclose(jf);
+            chown_to_sudo_user(json_path);
+            printf("json=data_saved (%s)\n", json_path);
+            free(json_path);
+        }
     }
 
     if (o->quiet) {
@@ -1889,6 +2324,11 @@ static int run_client(const Options *o) {
         printf("warmup=%d\n", warmup);
         printf("data_protocol=%s\n", protocol_name(o->data_protocol));
         printf("send_mode=%s\n", send_mode_name(o->send_mode));
+        printf("kernel_timestamp=%s\n", kernel_timestamp_enabled ? "True" : "False");
+        if (kernel_timestamp_enabled) {
+            printf("kernel_timestamp_received=%d\n", kernel_timestamp_received);
+            printf("kernel_timestamp_fallback=%d\n", kernel_timestamp_fallback);
+        }
         if (o->data_protocol == PROTO_UDP) {
             printf("udp_received=%d\n", udp_received);
             printf("udp_lost_est=%d\n", udp_lost_est);
@@ -1915,6 +2355,11 @@ static int run_client(const Options *o) {
         printf("client_id=%d repeater_id=%d\n", o->client_id, o->repeater_id);
         printf("data_protocol=%s\n", protocol_name(o->data_protocol));
         printf("send_mode=%s\n", send_mode_name(o->send_mode));
+        printf("kernel_timestamp=%s\n", kernel_timestamp_enabled ? "True" : "False");
+        if (kernel_timestamp_enabled) {
+            printf("kernel_timestamp_received=%d\n", kernel_timestamp_received);
+            printf("kernel_timestamp_fallback=%d\n", kernel_timestamp_fallback);
+        }
         if (o->data_protocol == PROTO_UDP) {
             printf("udp_received=%d\n", udp_received);
             printf("udp_lost_est=%d\n", udp_lost_est);
@@ -1946,6 +2391,7 @@ static int run_client(const Options *o) {
     free(delta_record_counts);
     free(loop_gap_samples);
     free(recv_block_samples);
+    free(udp_seen_counts);
     free(inbuf);
     free(clock_rows);
     free(delta_sorted);

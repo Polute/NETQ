@@ -3,6 +3,12 @@
 This directory contains the C port of `../minimal_epr_fast.py`.
 It is meant to run the same local experiments without depending on the Python runtime.
 
+Updated 2026-06-03: for the Docker/Python/C baseline commands, use
+`../README_DOCKER_AESO_2026-06-03.md`. The C binary now also supports
+`--shared-send-timestamp`, `--pace-mode sleep|spin|hybrid`,
+`--spin-margin-us`, `--kernel-timestamp`, `--json/--no-json`, and
+`--json-dir`.
+
 ## Layout
 
 ```text
@@ -23,6 +29,10 @@ cd /home/giicc/NETQ/AESO/c_code
 gcc -O3 -Wall -Wextra -pthread -o minimal_epr_fast_c minimal_epr_fast.c -lm
 ```
 
+If you run inside the Ubuntu 22.04 Docker container, compile inside that same
+container. A binary compiled on a newer host can fail in Ubuntu 22.04 with
+`GLIBC_2.38 not found`.
+
 The binary is:
 
 ```bash
@@ -38,6 +48,10 @@ The C binary keeps the same core structure as the Python script:
 - data over `--data-protocol udp` or `--data-protocol tcp`;
 - send mode with `--send-mode burst|paced|ack`;
 - CSV output with `--plot --plot-dir ...`;
+- JSON output with `--plot --json --json-dir ...`;
+- Linux UDP receive timestamps with client-side `--kernel-timestamp`;
+- non-parallel shared A/B timestamps with repeater-side `--shared-send-timestamp`;
+- pacing with `--pace-mode sleep|spin|hybrid`;
 - CPU pinning with `--cpu`;
 - real-time scheduling by default with `--rt-priority 50`, matching Python.
 
