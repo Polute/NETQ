@@ -1,0 +1,25 @@
+{
+  "role": "repeater",
+  "argv": ["./c_code/minimal_epr_fast_c", "repeater", "--listen-host-a", "0.0.0.0", "--listen-port-a", "7401", "--listen-host-b", "0.0.0.0", "--listen-port-b", "7402", "--werner-ar", "1", "--werner-br", "1", "--quiet", "--clock-sync", "--clock-sync-samples", "264", "--data-protocol", "udp", "--plot", "--plot-dir", "csv_3nodes_c_udp_sync264", "--accept-timeout", "120", "--cpu", "1", "--sock-buf", "65536", "--busy-poll-us", "25", "--shared-send-timestamp", "--count-interval", "0.00005", "--pace-mode", "sleep"],
+  "args": {
+    "count": 2000,
+    "listen_host_a": "0.0.0.0",
+    "listen_port_a": 7401,
+    "listen_host_b": "0.0.0.0",
+    "listen_port_b": 7402,
+    "data_protocol": "udp",
+    "send_mode": "burst",
+    "pace_mode": "sleep",
+    "shared_send_timestamp": true,
+    "count_interval": 5e-05,
+    "sock_buf": 65536,
+    "busy_poll_us": 25,
+    "cpu": 1,
+    "rt_priority": 50
+  },
+  "exchanges": 2000,
+  "csv_path": "csv_3nodes_c_udp_sync264/repeater_send_hist_4.csv",
+  "last_msg_a": {"ts_emit_ns": 1780563798337984121, "peer_id": 2, "correction_bits": 3, "w_swap": 1},
+  "last_msg_b": {"ts_emit_ns": 1780563798337984121, "peer_id": 1, "correction_bits": 3, "w_swap": 1},
+  "send_samples": [  ]
+}

@@ -19,13 +19,16 @@ debug tools.
 
 ## Open Three Terminals
 
-Open three separate terminals with the same command:
+Open three separate terminals. Give each terminal one CPU, matching the CPU
+used later by the command running inside that terminal.
+
+Terminal 1, repeater on CPU 3:
 
 ```bash
 cd /home/giicc/NETQ
 docker run --rm -it \
   --network host \
-  --cpuset-cpus="3,5,7" \
+  --cpuset-cpus="3" \
   --cap-add SYS_NICE \
   --cap-add NET_ADMIN \
   --ulimit rtprio=99 \
@@ -35,7 +38,37 @@ docker run --rm -it \
   netq-ubuntu2204-py310
 ```
 
-Use one terminal as repeater, one as client 1, and one as client 2.
+Terminal 2, client 1 on CPU 5:
+
+```bash
+cd /home/giicc/NETQ
+docker run --rm -it \
+  --network host \
+  --cpuset-cpus="5" \
+  --cap-add SYS_NICE \
+  --cap-add NET_ADMIN \
+  --ulimit rtprio=99 \
+  --ulimit memlock=-1 \
+  -v "$PWD":/work \
+  -w /work/AESO \
+  netq-ubuntu2204-py310
+```
+
+Terminal 3, client 2 on CPU 7:
+
+```bash
+cd /home/giicc/NETQ
+docker run --rm -it \
+  --network host \
+  --cpuset-cpus="7" \
+  --cap-add SYS_NICE \
+  --cap-add NET_ADMIN \
+  --ulimit rtprio=99 \
+  --ulimit memlock=-1 \
+  -v "$PWD":/work \
+  -w /work/AESO \
+  netq-ubuntu2204-py310
+```
 
 ## Python UDP Baseline
 
@@ -316,6 +349,171 @@ Common: --data-protocol udp|tcp --clock-sync --clock-sync-samples
 Repeater: --shared-send-timestamp --count-interval --pace-mode --spin-margin-us
 Repeater: --send-mode burst|paced|ack --udp-ready-timeout
 Client: --clock-offset-ns --center-delay --udp-idle-timeout --kernel-timestamp
+```
+
+## Three Real Nodes
+
+Use this when the real machines are:
+
+```text
+192.168.0.226  repeater
+192.168.0.223  client 1
+192.168.0.227  client 2
+```
+
+All three commands use CPU 1 because those VMs only expose two CPUs.
+
+### Python UDP With Clock Sync
+
+Run first on `.226`:
+
+```bash
+cd ~/AESO_opt
+
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+  --listen-host-a 0.0.0.0 \
+  --listen-port-a 7401 \
+  --listen-host-b 0.0.0.0 \
+  --listen-port-b 7402 \
+  --werner-ar 1 \
+  --werner-br 1 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --data-protocol udp \
+  --plot \
+  --plot-dir csv_3nodes_py_udp_sync264 \
+  --accept-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --shared-send-timestamp \
+  --count-interval 0.00005 \
+  --pace-mode sleep
+```
+
+Run on `.223`:
+
+```bash
+cd ~/AESO_opt
+
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 192.168.0.226 \
+  --repeater-port 7401 \
+  --client-id 1 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --plot \
+  --plot-dir csv_3nodes_py_udp_sync264 \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --kernel-timestamp
+```
+
+Run on `.227`:
+
+```bash
+cd ~/AESO_opt
+
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 192.168.0.226 \
+  --repeater-port 7402 \
+  --client-id 2 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --plot \
+  --plot-dir csv_3nodes_py_udp_sync264 \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --kernel-timestamp
+```
+
+### C UDP With Clock Sync
+
+Compile the C binary in a compatible Ubuntu 22.04 environment, or copy a binary
+compiled inside the Docker image to each machine.
+
+Run first on `.226`:
+
+```bash
+cd ~/AESO_opt
+
+sudo ./c_code/minimal_epr_fast_c repeater \
+  --listen-host-a 0.0.0.0 \
+  --listen-port-a 7401 \
+  --listen-host-b 0.0.0.0 \
+  --listen-port-b 7402 \
+  --werner-ar 1 \
+  --werner-br 1 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --data-protocol udp \
+  --plot \
+  --plot-dir csv_3nodes_c_udp_sync264 \
+  --accept-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --shared-send-timestamp \
+  --count-interval 0.00005 \
+  --pace-mode sleep
+```
+
+Run on `.223`:
+
+```bash
+cd ~/AESO_opt
+
+sudo ./c_code/minimal_epr_fast_c client \
+  --repeater-host 192.168.0.226 \
+  --repeater-port 7401 \
+  --client-id 1 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --plot \
+  --plot-dir csv_3nodes_c_udp_sync264 \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --kernel-timestamp
+```
+
+Run on `.227`:
+
+```bash
+cd ~/AESO_opt
+
+sudo ./c_code/minimal_epr_fast_c client \
+  --repeater-host 192.168.0.226 \
+  --repeater-port 7402 \
+  --client-id 2 \
+  --quiet \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --plot \
+  --plot-dir csv_3nodes_c_udp_sync264 \
+  --data-protocol udp \
+  --connect-timeout 120 \
+  --detect-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 25 \
+  --kernel-timestamp
 ```
 
 ## Plotting
