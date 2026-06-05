@@ -381,23 +381,73 @@ def add_info_box(plt, text):
     )
 
 
-def write_basic_plots(plt, x_values, y_values, hist_path, seq_path, base, series, bins, info_text=None):
+def series_stats(values):
+    if not values:
+        return None
+    return {
+        "mean": sum(values) / len(values),
+        "median": statistics.median(values),
+        "count": len(values),
+    }
+
+
+def format_clock_stats(stats):
+    if not stats:
+        return None
+    return "\n".join(
+        [
+            f"mean = {stats['mean']:.3f} us",
+            f"median = {stats['median']:.3f} us",
+            f"n = {stats['count']}",
+        ]
+    )
+
+
+def add_reference_lines(plt, stats, orientation):
+    if not stats:
+        return
+    if orientation == "vertical":
+        plt.axvline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
+        plt.axvline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
+    else:
+        plt.axhline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
+        plt.axhline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
+
+
+def write_basic_plots(
+    plt,
+    x_values,
+    y_values,
+    hist_path,
+    seq_path,
+    base,
+    series,
+    bins,
+    info_text=None,
+    reference_stats=None,
+):
     plt.figure(figsize=(8, 4))
     plt.hist(y_values, bins=bins)
+    add_reference_lines(plt, reference_stats, "vertical")
     plt.xlabel(series["hist_xlabel"])
     plt.ylabel("count")
     plt.title(f"{series['title']} histogram ({base})")
     add_info_box(plt, info_text)
+    if reference_stats:
+        plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(hist_path, dpi=150)
     plt.close()
 
     plt.figure(figsize=(8, 4))
     plt.plot(x_values, y_values, linewidth=0.6)
+    add_reference_lines(plt, reference_stats, "horizontal")
     plt.xlabel(series["x_label"])
     plt.ylabel(series["ylabel"])
     plt.title(f"{series['title']} per {series['x_label']} ({base})")
     add_info_box(plt, info_text)
+    if reference_stats:
+        plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(seq_path, dpi=150)
     plt.close()
@@ -458,10 +508,12 @@ def main():
             continue
 
         base = os.path.splitext(os.path.basename(csv_path))[0]
+        file_base = base
         if args.prefix:
             base = args.prefix
 
         is_clock_sync_csv = any(series["kind"] == "clock_sync" for series in series_list)
+        show_clock_stats = file_base.startswith("clock_sync")
         clock_offset_info = None
         if not is_clock_sync_csv:
             clock_offset_info = read_clock_offset_info(equivalent_clock_sync_csv(csv_path))
@@ -492,6 +544,8 @@ def main():
             os.makedirs(os.path.dirname(seq_path), exist_ok=True)
 
             if series["kind"] == "clock_sync":
+                clock_stats = series_stats(y_values) if show_clock_stats else None
+                clock_info = format_clock_stats(clock_stats)
                 if args.last and os.path.exists(hist_path) and os.path.exists(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (already plotted)")
                     continue
@@ -501,7 +555,18 @@ def main():
                 if not args.last and not confirm_overwrite(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (no overwrite)")
                     continue
-                write_basic_plots(plt, x_values, y_values, hist_path, seq_path, series_base, series, args.bins)
+                write_basic_plots(
+                    plt,
+                    x_values,
+                    y_values,
+                    hist_path,
+                    seq_path,
+                    series_base,
+                    series,
+                    args.bins,
+                    clock_info,
+                    clock_stats,
+                )
                 written.extend([hist_path, seq_path])
                 continue
 

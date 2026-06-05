@@ -28,6 +28,16 @@
 #define CLOCK_SYNC_SYNC_SIZE 8
 #define CLOCK_SYNC_DELAY_REQ_SIZE 24
 #define CLOCK_SYNC_DELAY_RESP_SIZE 32
+#define CLOCK_SYNC_UDP_MAGIC "AESOCS1!"
+#define CLOCK_SYNC_UDP_MAGIC_SIZE 8
+#define CLOCK_SYNC_UDP_HELLO 1
+#define CLOCK_SYNC_UDP_SYNC 2
+#define CLOCK_SYNC_UDP_DELAY_REQ 3
+#define CLOCK_SYNC_UDP_DELAY_RESP 4
+#define CLOCK_SYNC_UDP_HELLO_SIZE 9
+#define CLOCK_SYNC_UDP_SYNC_SIZE 21
+#define CLOCK_SYNC_UDP_DELAY_REQ_SIZE 37
+#define CLOCK_SYNC_UDP_DELAY_RESP_SIZE 46
 #define UDP_HELLO_MAGIC "AESOUDP1"
 #define UDP_HELLO_MAGIC_SIZE 8
 #define UDP_READY_BYTE 'U'
@@ -64,6 +74,46 @@ typedef enum {
     PACE_HYBRID
 } PaceMode;
 
+typedef enum {
+    CLOCK_SYNC_METHOD_NONE = -2,
+    CLOCK_SYNC_METHOD_MANUAL = -1,
+    CLOCK_SYNC_METHOD_MEAN = 0,
+    CLOCK_SYNC_METHOD_MEDIAN,
+    CLOCK_SYNC_METHOD_BEST_PATH_MEDIAN
+} ClockSyncMethod;
+
+typedef struct {
+    ClockSyncMethod method;
+    int warmup;
+    double best_ratio;
+    int used_samples;
+    int best_path_samples;
+    int64_t offset_mean_ns;
+    int64_t offset_median_ns;
+    int64_t offset_best_path_median_ns;
+    double offset_std_ns;
+    int64_t offset_mad_ns;
+    int64_t path_delay_mean_ns;
+    int64_t path_delay_min_ns;
+    int64_t path_delay_median_ns;
+    int64_t path_delay_p95_ns;
+    int64_t path_delay_best_median_ns;
+    bool negative_or_suspicious;
+    char quality[8];
+    char reasons[256];
+    int delay_negative_count;
+    double delay_negative_ratio;
+    int64_t delay_signed_p50_ns;
+    DataProtocol protocol;
+    bool kernel_timestamp;
+    int kernel_timestamp_received;
+    int kernel_timestamp_fallback;
+    int t2_kernel_timestamp_received;
+    int t2_kernel_timestamp_fallback;
+    int t4_kernel_timestamp_received;
+    int t4_kernel_timestamp_fallback;
+} ClockSyncStats;
+
 typedef struct {
     uint64_t ts_emit_ns;
     uint32_t peer_id;
@@ -88,6 +138,10 @@ typedef struct {
     int64_t slave_to_master_ns;
     int64_t offset_ns;
     int64_t path_delay_ns;
+    bool used_for_offset;
+    bool used_for_best_path;
+    bool t2_kernel_timestamp;
+    bool t4_kernel_timestamp;
 } ClockSyncRow;
 
 typedef struct {
@@ -136,7 +190,12 @@ typedef struct {
     const char *plot_dir;
     bool diag;
     bool clock_sync;
+    DataProtocol clock_sync_protocol;
     int clock_sync_samples;
+    int clock_sync_warmup;
+    ClockSyncMethod clock_sync_method;
+    double clock_sync_best_ratio;
+    bool clock_sync_kernel_timestamp;
     bool clock_offset_set;
     int64_t clock_offset_ns;
     bool center_delay;
@@ -452,6 +511,49 @@ static uint64_t parse_kernel_timestamp_ns(struct msghdr *msg, bool *found) {
     return 0;
 }
 
+static ssize_t recvfrom_timestamped(
+    int fd,
+    void *buf,
+    size_t len,
+    bool kernel_timestamp,
+    struct sockaddr_in *addr,
+    socklen_t *addr_len,
+    uint64_t *rx_ns,
+    bool *got_kernel
+) {
+    *got_kernel = false;
+    if (kernel_timestamp) {
+        struct iovec iov;
+        char control[128];
+        struct msghdr hdr;
+        memset(&iov, 0, sizeof(iov));
+        memset(&hdr, 0, sizeof(hdr));
+        memset(control, 0, sizeof(control));
+        iov.iov_base = buf;
+        iov.iov_len = len;
+        hdr.msg_name = addr;
+        hdr.msg_namelen = *addr_len;
+        hdr.msg_iov = &iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = control;
+        hdr.msg_controllen = sizeof(control);
+        ssize_t got = recvmsg(fd, &hdr, 0);
+        if (got >= 0) {
+            bool found_ts = false;
+            uint64_t ts = parse_kernel_timestamp_ns(&hdr, &found_ts);
+            *rx_ns = found_ts ? ts : time_ns();
+            *got_kernel = found_ts;
+            *addr_len = hdr.msg_namelen;
+        }
+        return got;
+    }
+    ssize_t got = recvfrom(fd, buf, len, 0, (struct sockaddr *)addr, addr_len);
+    if (got >= 0) {
+        *rx_ns = time_ns();
+    }
+    return got;
+}
+
 static void apply_cpu_rt(const Options *o) {
     if (o->cpu_set) {
         cpu_set_t set;
@@ -612,6 +714,10 @@ static double decay_werner(double base, int64_t age_ns, double t1_ns) {
 
 static int64_t i64_abs_value(int64_t v) {
     return v < 0 ? -v : v;
+}
+
+static int64_t ns_diff(uint64_t newer_or_local, uint64_t older_or_remote) {
+    return (int64_t)newer_or_local - (int64_t)older_or_remote;
 }
 
 static void ensure_dir(const char *path) {
@@ -791,11 +897,16 @@ static void parse_defaults(Options *o, Role role) {
     o->werner_in = 1.0;
     o->cpu_a = 2;
     o->cpu_b = 3;
+    o->shared_send_timestamp = true;
     o->count_interval = 0.0;
     o->plot_prefix = role == ROLE_REPEATER ? "repeater_send_hist" : "delay_hist_client";
     o->plot_dir = "csv";
     o->json_output = true;
+    o->clock_sync_protocol = PROTO_TCP;
     o->clock_sync_samples = 8;
+    o->clock_sync_warmup = -1;
+    o->clock_sync_method = CLOCK_SYNC_METHOD_BEST_PATH_MEDIAN;
+    o->clock_sync_best_ratio = 0.5;
     o->pace_mode = PACE_SLEEP;
     o->spin_margin_us = 100.0;
     o->data_protocol = PROTO_UDP;
@@ -818,6 +929,25 @@ static bool streq(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
+static void fill_sockaddr_in(struct sockaddr_in *addr, const char *host, int port) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr->sin_addr) != 1) {
+        struct hostent *he = gethostbyname(host);
+        if (!he || he->h_addrtype != AF_INET) {
+            die_msg("Could not resolve IPv4 host");
+        }
+        memcpy(&addr->sin_addr, he->h_addr, sizeof(addr->sin_addr));
+    }
+}
+
+static bool sockaddr_same_endpoint(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+    return a->sin_family == b->sin_family &&
+           a->sin_port == b->sin_port &&
+           a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
+
 static const char *protocol_name(DataProtocol protocol) {
     return protocol == PROTO_UDP ? "udp" : "tcp";
 }
@@ -830,6 +960,22 @@ static const char *send_mode_name(SendMode mode) {
             return "paced";
         case SEND_MODE_ACK:
             return "ack";
+    }
+    return "unknown";
+}
+
+static const char *clock_sync_method_name(ClockSyncMethod method) {
+    switch (method) {
+        case CLOCK_SYNC_METHOD_NONE:
+            return "none";
+        case CLOCK_SYNC_METHOD_MANUAL:
+            return "manual";
+        case CLOCK_SYNC_METHOD_MEAN:
+            return "mean";
+        case CLOCK_SYNC_METHOD_MEDIAN:
+            return "median";
+        case CLOCK_SYNC_METHOD_BEST_PATH_MEDIAN:
+            return "best-path-median";
     }
     return "unknown";
 }
@@ -866,11 +1012,14 @@ static void usage(const char *prog) {
     printf("\nCommon options:\n");
     printf("  --count N --quiet --plot --plot-dir DIR --json/--no-json --json-dir DIR\n");
     printf("  --cpu N --rt-priority N --sock-buf N --busy-poll-us N\n");
-    printf("  --data-protocol udp|tcp --clock-sync --clock-sync-samples N\n");
+    printf("  --data-protocol udp|tcp --clock-sync [tcp|udp] --clock-sync-samples N --clock-sync-warmup N\n");
+    printf("  --clock-sync-kernel-timestamp\n");
+    printf("  --clock-sync-method mean|median|best-path-median --clock-sync-best-ratio R\n");
     printf("\nRepeater options:\n");
     printf("  --listen-host-a HOST --listen-port-a PORT --listen-host-b HOST --listen-port-b PORT\n");
     printf("  --werner-ar X --werner-br X --parallel --cpu-a N --cpu-b N\n");
-    printf("  --shared-send-timestamp --count-interval SEC --pace-mode sleep|spin|hybrid\n");
+    printf("  --shared-send-timestamp/--no-shared-send-timestamp --count-interval SEC\n");
+    printf("  --pace-mode sleep|spin|hybrid\n");
     printf("  --spin-margin-us US --send-mode burst|paced|ack --udp-ready-timeout SEC\n");
     printf("\nClient options:\n");
     printf("  --repeater-host HOST --repeater-port PORT --client-id N --warmup N\n");
@@ -973,6 +1122,8 @@ static void parse_args(int argc, char **argv, Options *o) {
             o->spin_margin_us = atof(need_arg(argc, argv, &i));
         } else if (streq(arg, "--shared-send-timestamp")) {
             o->shared_send_timestamp = true;
+        } else if (streq(arg, "--no-shared-send-timestamp")) {
+            o->shared_send_timestamp = false;
         } else if (streq(arg, "--quiet")) {
             o->quiet = true;
         } else if (streq(arg, "--plot")) {
@@ -991,8 +1142,44 @@ static void parse_args(int argc, char **argv, Options *o) {
             o->diag = true;
         } else if (streq(arg, "--clock-sync")) {
             o->clock_sync = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                const char *v = argv[i + 1];
+                if (streq(v, "udp")) {
+                    o->clock_sync_protocol = PROTO_UDP;
+                    ++i;
+                } else if (streq(v, "tcp")) {
+                    o->clock_sync_protocol = PROTO_TCP;
+                    ++i;
+                }
+            }
+        } else if (streq(arg, "--clock-sync-protocol")) {
+            const char *v = need_arg(argc, argv, &i);
+            if (streq(v, "udp")) {
+                o->clock_sync_protocol = PROTO_UDP;
+            } else if (streq(v, "tcp")) {
+                o->clock_sync_protocol = PROTO_TCP;
+            } else {
+                die_msg("--clock-sync-protocol must be udp or tcp");
+            }
+        } else if (streq(arg, "--clock-sync-kernel-timestamp")) {
+            o->clock_sync_kernel_timestamp = true;
         } else if (streq(arg, "--clock-sync-samples")) {
             o->clock_sync_samples = atoi(need_arg(argc, argv, &i));
+        } else if (streq(arg, "--clock-sync-warmup")) {
+            o->clock_sync_warmup = atoi(need_arg(argc, argv, &i));
+        } else if (streq(arg, "--clock-sync-method")) {
+            const char *v = need_arg(argc, argv, &i);
+            if (streq(v, "mean")) {
+                o->clock_sync_method = CLOCK_SYNC_METHOD_MEAN;
+            } else if (streq(v, "median")) {
+                o->clock_sync_method = CLOCK_SYNC_METHOD_MEDIAN;
+            } else if (streq(v, "best-path-median")) {
+                o->clock_sync_method = CLOCK_SYNC_METHOD_BEST_PATH_MEDIAN;
+            } else {
+                die_msg("--clock-sync-method must be mean, median, or best-path-median");
+            }
+        } else if (streq(arg, "--clock-sync-best-ratio")) {
+            o->clock_sync_best_ratio = atof(need_arg(argc, argv, &i));
         } else if (streq(arg, "--clock-offset-ns")) {
             o->clock_offset_ns = atoll(need_arg(argc, argv, &i));
             o->clock_offset_set = true;
@@ -1033,6 +1220,9 @@ static void parse_args(int argc, char **argv, Options *o) {
     }
     if (o->send_mode == SEND_MODE_PACED && o->count_interval <= 0.0) {
         die_msg("--send-mode paced requires --count-interval > 0");
+    }
+    if (o->clock_sync_kernel_timestamp && o->clock_sync_protocol != PROTO_UDP) {
+        die_msg("--clock-sync-kernel-timestamp requires --clock-sync udp");
     }
 }
 
@@ -1363,17 +1553,368 @@ static void serve_clock_sync(int fd, int samples) {
     }
 }
 
+static void serve_clock_sync_udp(int udp_fd, int samples, bool kernel_timestamp) {
+    if (samples < 0) {
+        samples = 0;
+    }
+    if (kernel_timestamp) {
+        enable_kernel_timestamp_ns(udp_fd);
+    }
+    unsigned char buf[CLOCK_SYNC_UDP_DELAY_REQ_SIZE];
+    unsigned char sync_buf[CLOCK_SYNC_UDP_SYNC_SIZE];
+    unsigned char resp_buf[CLOCK_SYNC_UDP_DELAY_RESP_SIZE];
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    while (true) {
+        uint64_t rx_ns = 0;
+        bool got_kernel = false;
+        peer_len = sizeof(peer);
+        ssize_t got = recvfrom_timestamped(udp_fd, buf, sizeof(buf), false, &peer, &peer_len, &rx_ns, &got_kernel);
+        (void)rx_ns;
+        (void)got_kernel;
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            die("UDP clock sync hello recv");
+        }
+        if (got == CLOCK_SYNC_UDP_HELLO_SIZE &&
+            memcmp(buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE) == 0 &&
+            buf[8] == CLOCK_SYNC_UDP_HELLO) {
+            break;
+        }
+    }
+    for (int i = 0; i < samples; ++i) {
+        int sample_number = i + 1;
+        uint64_t t1 = time_ns();
+        memcpy(sync_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE);
+        sync_buf[8] = CLOCK_SYNC_UDP_SYNC;
+        pack_u32be(sync_buf + 9, (uint32_t)sample_number);
+        pack_u64be(sync_buf + 13, t1);
+        if (sendto(udp_fd, sync_buf, sizeof(sync_buf), 0, (struct sockaddr *)&peer, peer_len) != (ssize_t)sizeof(sync_buf)) {
+            die("UDP clock sync send Sync");
+        }
+        uint64_t t2 = 0;
+        uint64_t t3 = 0;
+        uint64_t t4 = 0;
+        bool t4_got_kernel = false;
+        while (true) {
+            struct sockaddr_in req_addr;
+            socklen_t req_len = sizeof(req_addr);
+            uint64_t rx_ns = 0;
+            bool got_kernel = false;
+            ssize_t got = recvfrom_timestamped(
+                udp_fd,
+                buf,
+                CLOCK_SYNC_UDP_DELAY_REQ_SIZE,
+                kernel_timestamp,
+                &req_addr,
+                &req_len,
+                &rx_ns,
+                &got_kernel
+            );
+            if (got < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                die("UDP clock sync recv Delay_Req");
+            }
+            if (!sockaddr_same_endpoint(&peer, &req_addr) || got != CLOCK_SYNC_UDP_DELAY_REQ_SIZE) {
+                continue;
+            }
+            if (memcmp(buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE) != 0 || buf[8] != CLOCK_SYNC_UDP_DELAY_REQ) {
+                continue;
+            }
+            int echoed_sample = (int)unpack_u32be(buf + 9);
+            uint64_t t1_echo = unpack_u64be(buf + 13);
+            if (echoed_sample != sample_number || t1_echo != t1) {
+                die_msg("UDP PTP clock-sync request did not match the Sync timestamp");
+            }
+            t2 = unpack_u64be(buf + 21);
+            t3 = unpack_u64be(buf + 29);
+            t4 = rx_ns;
+            t4_got_kernel = got_kernel;
+            break;
+        }
+        memcpy(resp_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE);
+        resp_buf[8] = CLOCK_SYNC_UDP_DELAY_RESP;
+        pack_u32be(resp_buf + 9, (uint32_t)sample_number);
+        pack_u64be(resp_buf + 13, t1);
+        pack_u64be(resp_buf + 21, t2);
+        pack_u64be(resp_buf + 29, t3);
+        pack_u64be(resp_buf + 37, t4);
+        resp_buf[45] = t4_got_kernel ? 1 : 0;
+        if (sendto(udp_fd, resp_buf, sizeof(resp_buf), 0, (struct sockaddr *)&peer, peer_len) != (ssize_t)sizeof(resp_buf)) {
+            die("UDP clock sync send Delay_Resp");
+        }
+    }
+}
+
+static int effective_clock_sync_warmup(int samples, int warmup) {
+    if (samples <= 0) {
+        return 0;
+    }
+    int discard = warmup < 0 ? (int)(samples * 0.05) : warmup;
+    if (discard < 0) {
+        discard = 0;
+    }
+    if (discard >= samples) {
+        discard = samples - 1;
+    }
+    return discard;
+}
+
+static int cmp_clock_row_path(const void *a, const void *b) {
+    const ClockSyncRow *ra = *(const ClockSyncRow * const *)a;
+    const ClockSyncRow *rb = *(const ClockSyncRow * const *)b;
+    if (ra->path_delay_ns < rb->path_delay_ns) {
+        return -1;
+    }
+    if (ra->path_delay_ns > rb->path_delay_ns) {
+        return 1;
+    }
+    return 0;
+}
+
+static int64_t median_i64_copy(const int64_t *vals, int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    int64_t *copy = malloc((size_t)n * sizeof(*copy));
+    if (!copy) {
+        die("malloc median copy");
+    }
+    memcpy(copy, vals, (size_t)n * sizeof(*copy));
+    qsort(copy, (size_t)n, sizeof(*copy), cmp_i64);
+    int64_t result = percentile_i64(copy, n, 0.50);
+    free(copy);
+    return result;
+}
+
+static int64_t percentile_i64_copy(const int64_t *vals, int n, double p) {
+    if (n <= 0) {
+        return 0;
+    }
+    int64_t *copy = malloc((size_t)n * sizeof(*copy));
+    if (!copy) {
+        die("malloc percentile copy");
+    }
+    memcpy(copy, vals, (size_t)n * sizeof(*copy));
+    qsort(copy, (size_t)n, sizeof(*copy), cmp_i64);
+    int64_t result = percentile_i64(copy, n, p);
+    free(copy);
+    return result;
+}
+
+static int64_t mad_i64(const int64_t *vals, int n, int64_t median_value) {
+    if (n <= 0) {
+        return 0;
+    }
+    int64_t *devs = malloc((size_t)n * sizeof(*devs));
+    if (!devs) {
+        die("malloc mad");
+    }
+    for (int i = 0; i < n; ++i) {
+        int64_t diff = vals[i] - median_value;
+        devs[i] = diff < 0 ? -diff : diff;
+    }
+    int64_t result = median_i64_copy(devs, n);
+    free(devs);
+    return result;
+}
+
+static void init_clock_sync_stats(ClockSyncStats *stats, ClockSyncMethod method, int warmup, double best_ratio) {
+    memset(stats, 0, sizeof(*stats));
+    stats->method = method;
+    stats->warmup = warmup;
+    stats->best_ratio = best_ratio;
+    stats->protocol = PROTO_TCP;
+    stats->kernel_timestamp = false;
+    strcpy(stats->quality, "ok");
+    stats->reasons[0] = '\0';
+}
+
+static void append_reason(ClockSyncStats *stats, const char *reason) {
+    if (stats->reasons[0] != '\0') {
+        strncat(stats->reasons, ";", sizeof(stats->reasons) - strlen(stats->reasons) - 1);
+    }
+    strncat(stats->reasons, reason, sizeof(stats->reasons) - strlen(stats->reasons) - 1);
+}
+
+static void compute_clock_sync_stats(
+    ClockSyncRow *rows,
+    int row_count,
+    ClockSyncMethod method,
+    int warmup,
+    double best_ratio,
+    int64_t *clock_offset_ns,
+    int64_t *clock_sync_path_delay_ns,
+    ClockSyncStats *stats
+) {
+    init_clock_sync_stats(stats, method, warmup, best_ratio);
+    int used_count = 0;
+    for (int i = 0; i < row_count; ++i) {
+        rows[i].used_for_best_path = false;
+        if (rows[i].used_for_offset) {
+            ++used_count;
+        }
+    }
+    stats->used_samples = used_count;
+    if (used_count <= 0) {
+        *clock_offset_ns = 0;
+        *clock_sync_path_delay_ns = 0;
+        return;
+    }
+    if (best_ratio <= 0.0) {
+        best_ratio = 0.0;
+    }
+    if (best_ratio > 1.0) {
+        best_ratio = 1.0;
+    }
+    int best_count = best_ratio > 0.0 ? (int)ceil((double)used_count * best_ratio) : 1;
+    if (best_count < 1) {
+        best_count = 1;
+    }
+    if (best_count > used_count) {
+        best_count = used_count;
+    }
+    stats->best_ratio = best_ratio;
+    stats->best_path_samples = best_count;
+
+    int64_t *offsets = malloc((size_t)used_count * sizeof(*offsets));
+    int64_t *paths = malloc((size_t)used_count * sizeof(*paths));
+    ClockSyncRow **used_rows = malloc((size_t)used_count * sizeof(*used_rows));
+    int64_t *best_offsets = malloc((size_t)best_count * sizeof(*best_offsets));
+    int64_t *best_paths = malloc((size_t)best_count * sizeof(*best_paths));
+    if (!offsets || !paths || !used_rows || !best_offsets || !best_paths) {
+        die("malloc clock sync stats");
+    }
+    int out = 0;
+    double offset_sum = 0.0;
+    double path_sum = 0.0;
+    for (int i = 0; i < row_count; ++i) {
+        if (!rows[i].used_for_offset) {
+            continue;
+        }
+        offsets[out] = rows[i].offset_ns;
+        paths[out] = rows[i].path_delay_ns;
+        used_rows[out] = &rows[i];
+        offset_sum += (double)rows[i].offset_ns;
+        path_sum += (double)rows[i].path_delay_ns;
+        ++out;
+    }
+    qsort(used_rows, (size_t)used_count, sizeof(*used_rows), cmp_clock_row_path);
+    for (int i = 0; i < best_count; ++i) {
+        used_rows[i]->used_for_best_path = true;
+        best_offsets[i] = used_rows[i]->offset_ns;
+        best_paths[i] = used_rows[i]->path_delay_ns;
+    }
+
+    double offset_mean_raw = offset_sum / (double)used_count;
+    double path_mean_raw = path_sum / (double)used_count;
+    stats->offset_mean_ns = (int64_t)offset_mean_raw;
+    stats->offset_median_ns = median_i64_copy(offsets, used_count);
+    stats->offset_best_path_median_ns = median_i64_copy(best_offsets, best_count);
+    stats->offset_std_ns = stddev_i64(offsets, used_count, offset_mean_raw);
+    stats->offset_mad_ns = mad_i64(offsets, used_count, stats->offset_median_ns);
+    stats->path_delay_mean_ns = (int64_t)path_mean_raw;
+    stats->path_delay_min_ns = paths[0];
+    for (int i = 1; i < used_count; ++i) {
+        if (paths[i] < stats->path_delay_min_ns) {
+            stats->path_delay_min_ns = paths[i];
+        }
+    }
+    stats->path_delay_median_ns = median_i64_copy(paths, used_count);
+    stats->path_delay_p95_ns = percentile_i64_copy(paths, used_count, 0.95);
+    stats->path_delay_best_median_ns = median_i64_copy(best_paths, best_count);
+
+    if (method == CLOCK_SYNC_METHOD_MEAN) {
+        *clock_offset_ns = stats->offset_mean_ns;
+        *clock_sync_path_delay_ns = stats->path_delay_mean_ns;
+    } else if (method == CLOCK_SYNC_METHOD_MEDIAN) {
+        *clock_offset_ns = stats->offset_median_ns;
+        *clock_sync_path_delay_ns = stats->path_delay_median_ns;
+    } else {
+        *clock_offset_ns = stats->offset_best_path_median_ns;
+        *clock_sync_path_delay_ns = stats->path_delay_best_median_ns;
+    }
+
+    free(offsets);
+    free(paths);
+    free(used_rows);
+    free(best_offsets);
+    free(best_paths);
+}
+
+static void assess_sync_quality(ClockSyncStats *stats, const int64_t *signed_delays, int n) {
+    int level = 0;
+    stats->delay_negative_count = 0;
+    stats->delay_negative_ratio = 0.0;
+    stats->delay_signed_p50_ns = 0;
+    stats->negative_or_suspicious = false;
+    strcpy(stats->quality, "ok");
+    stats->reasons[0] = '\0';
+    for (int i = 0; i < n; ++i) {
+        if (signed_delays[i] < 0) {
+            ++stats->delay_negative_count;
+        }
+    }
+    if (n > 0) {
+        stats->delay_negative_ratio = (double)stats->delay_negative_count / (double)n;
+        stats->delay_signed_p50_ns = median_i64_copy(signed_delays, n);
+    }
+    if (stats->path_delay_median_ns > 1000000LL || stats->path_delay_p95_ns > 2000000LL) {
+        level = level > 1 ? level : 1;
+        append_reason(stats, "high_path_delay");
+    }
+    if (stats->path_delay_median_ns > 5000000LL || stats->path_delay_p95_ns > 10000000LL) {
+        level = 2;
+        append_reason(stats, "very_high_path_delay");
+    }
+    if (stats->offset_mad_ns > 10000LL) {
+        level = level > 1 ? level : 1;
+        append_reason(stats, "high_offset_mad");
+    }
+    if (stats->offset_mad_ns > 100000LL) {
+        level = 2;
+        append_reason(stats, "very_high_offset_mad");
+    }
+    if (stats->delay_negative_ratio > 0.20) {
+        level = level > 1 ? level : 1;
+        append_reason(stats, "many_negative_delays");
+    }
+    if (stats->delay_negative_ratio > 0.80) {
+        level = 2;
+        append_reason(stats, "mostly_negative_delays");
+    }
+    if (stats->delay_signed_p50_ns < -1000000LL) {
+        level = 2;
+        append_reason(stats, "negative_delay_p50_ms");
+    }
+    if (level == 1) {
+        strcpy(stats->quality, "warn");
+    } else if (level >= 2) {
+        strcpy(stats->quality, "bad");
+    }
+    stats->negative_or_suspicious = level > 0;
+}
+
 static void estimate_clock_offset(
     int fd,
     int samples,
+    int warmup,
+    ClockSyncMethod method,
+    double best_ratio,
     int64_t *clock_offset_ns,
     int64_t *clock_sync_path_delay_ns,
+    ClockSyncStats *stats,
     ClockSyncRow **rows_out,
     int *row_count_out
 ) {
     if (samples < 0) {
         samples = 0;
     }
+    warmup = effective_clock_sync_warmup(samples, warmup);
     ClockSyncRow *rows = NULL;
     if (samples > 0) {
         rows = calloc((size_t)samples, sizeof(*rows));
@@ -1381,9 +1922,6 @@ static void estimate_clock_offset(
             die("calloc clock rows");
         }
     }
-    int64_t offset_total = 0;
-    int64_t path_total = 0;
-    int sample_count = 0;
     unsigned char sync_buf[CLOCK_SYNC_SYNC_SIZE];
     unsigned char req_buf[CLOCK_SYNC_DELAY_REQ_SIZE];
     unsigned char resp_buf[CLOCK_SYNC_DELAY_RESP_SIZE];
@@ -1410,14 +1948,12 @@ static void estimate_clock_offset(
         if (echoed_t1 != t1 || echoed_t2 != t2 || echoed_t3 != t3) {
             die_msg("PTP clock-sync response did not match the Delay_Req timestamps");
         }
-        int64_t master_to_slave = (int64_t)(t2 - t1);
-        int64_t slave_to_master = (int64_t)(t4 - t3);
+        int64_t master_to_slave = ns_diff(t2, t1);
+        int64_t slave_to_master = ns_diff(t4, t3);
         int64_t mean_path = (master_to_slave + slave_to_master) / 2;
         int64_t offset = (slave_to_master - master_to_slave) / 2;
-        offset_total += offset;
-        path_total += mean_path;
-        ++sample_count;
-        rows[i].sample_idx = sample_count;
+        bool used_for_offset = i + 1 > warmup;
+        rows[i].sample_idx = i + 1;
         rows[i].t1_ns = t1;
         rows[i].t2_ns = t2;
         rows[i].t3_ns = t3;
@@ -1426,16 +1962,251 @@ static void estimate_clock_offset(
         rows[i].slave_to_master_ns = slave_to_master;
         rows[i].offset_ns = offset;
         rows[i].path_delay_ns = mean_path;
+        rows[i].used_for_offset = used_for_offset;
+        rows[i].t2_kernel_timestamp = false;
+        rows[i].t4_kernel_timestamp = false;
     }
-    if (sample_count == 0) {
-        *clock_offset_ns = 0;
-        *clock_sync_path_delay_ns = 0;
-    } else {
-        *clock_offset_ns = offset_total / sample_count;
-        *clock_sync_path_delay_ns = path_total / sample_count;
-    }
+    compute_clock_sync_stats(rows, samples, method, warmup, best_ratio, clock_offset_ns, clock_sync_path_delay_ns, stats);
+    stats->protocol = PROTO_TCP;
+    stats->kernel_timestamp = false;
     *rows_out = rows;
-    *row_count_out = sample_count;
+    *row_count_out = samples;
+}
+
+static void estimate_clock_offset_udp(
+    const char *host,
+    int port,
+    int samples,
+    int warmup,
+    ClockSyncMethod method,
+    double best_ratio,
+    int sock_buf,
+    int busy_poll_us,
+    double detect_timeout,
+    double detect_interval,
+    bool kernel_timestamp,
+    int64_t *clock_offset_ns,
+    int64_t *clock_sync_path_delay_ns,
+    ClockSyncStats *stats,
+    ClockSyncRow **rows_out,
+    int *row_count_out
+) {
+    if (samples < 0) {
+        samples = 0;
+    }
+    warmup = effective_clock_sync_warmup(samples, warmup);
+    ClockSyncRow *rows = NULL;
+    if (samples > 0) {
+        rows = calloc((size_t)samples, sizeof(*rows));
+        if (!rows) {
+            die("calloc UDP clock rows");
+        }
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        die("socket UDP clock sync");
+    }
+    enable_low_latency_socket(fd, sock_buf, busy_poll_us);
+    if (kernel_timestamp) {
+        enable_kernel_timestamp_ns(fd);
+    }
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(0);
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) {
+        die("bind UDP clock sync");
+    }
+    struct sockaddr_in server;
+    fill_sockaddr_in(&server, host, port);
+    double wait_s = detect_interval;
+    if (wait_s < 0.001) {
+        wait_s = 0.001;
+    }
+    if (wait_s > 0.05) {
+        wait_s = 0.05;
+    }
+    struct timeval tv;
+    tv.tv_sec = (time_t)wait_s;
+    tv.tv_usec = (suseconds_t)((wait_s - (double)tv.tv_sec) * 1000000.0);
+    if (tv.tv_usec < 0) {
+        tv.tv_usec = 0;
+    }
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    unsigned char hello_buf[CLOCK_SYNC_UDP_HELLO_SIZE];
+    unsigned char sync_buf[CLOCK_SYNC_UDP_SYNC_SIZE];
+    unsigned char req_buf[CLOCK_SYNC_UDP_DELAY_REQ_SIZE];
+    unsigned char resp_buf[CLOCK_SYNC_UDP_DELAY_RESP_SIZE];
+    memcpy(hello_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE);
+    hello_buf[8] = CLOCK_SYNC_UDP_HELLO;
+    uint64_t deadline = monotonic_ns() + (uint64_t)(detect_timeout * 1e9);
+    int t2_kernel_received = 0;
+    int t2_kernel_fallback = 0;
+    int t4_kernel_received = 0;
+    int t4_kernel_fallback = 0;
+    int sample_number = 1;
+    bool waiting_for_first_sync = true;
+    while (sample_number <= samples) {
+        if (waiting_for_first_sync) {
+            ssize_t sent = sendto(fd, hello_buf, sizeof(hello_buf), 0, (struct sockaddr *)&server, sizeof(server));
+            if (sent != (ssize_t)sizeof(hello_buf) && errno != EINTR) {
+                die("UDP clock sync send hello");
+            }
+        }
+        uint64_t t1 = 0;
+        uint64_t t2 = 0;
+        bool t2_got_kernel = false;
+        while (true) {
+            if (monotonic_ns() >= deadline) {
+                die_msg("UDP clock sync did not complete before detect-timeout expired");
+            }
+            struct sockaddr_in addr;
+            socklen_t addr_len = sizeof(addr);
+            uint64_t rx_ns = 0;
+            bool got_kernel = false;
+            ssize_t got = recvfrom_timestamped(
+                fd,
+                sync_buf,
+                sizeof(sync_buf),
+                kernel_timestamp,
+                &addr,
+                &addr_len,
+                &rx_ns,
+                &got_kernel
+            );
+            if (got < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (waiting_for_first_sync) {
+                        break;
+                    }
+                    continue;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                die("UDP clock sync recv Sync");
+            }
+            if (!sockaddr_same_endpoint(&server, &addr) || got != CLOCK_SYNC_UDP_SYNC_SIZE) {
+                continue;
+            }
+            if (memcmp(sync_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE) != 0 || sync_buf[8] != CLOCK_SYNC_UDP_SYNC) {
+                continue;
+            }
+            int echoed_sample = (int)unpack_u32be(sync_buf + 9);
+            if (echoed_sample != sample_number) {
+                continue;
+            }
+            t1 = unpack_u64be(sync_buf + 13);
+            t2 = rx_ns;
+            t2_got_kernel = got_kernel;
+            if (kernel_timestamp) {
+                if (got_kernel) {
+                    ++t2_kernel_received;
+                } else {
+                    ++t2_kernel_fallback;
+                }
+            }
+            waiting_for_first_sync = false;
+            break;
+        }
+        if (waiting_for_first_sync) {
+            continue;
+        }
+        uint64_t t3 = time_ns();
+        memcpy(req_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE);
+        req_buf[8] = CLOCK_SYNC_UDP_DELAY_REQ;
+        pack_u32be(req_buf + 9, (uint32_t)sample_number);
+        pack_u64be(req_buf + 13, t1);
+        pack_u64be(req_buf + 21, t2);
+        pack_u64be(req_buf + 29, t3);
+        if (sendto(fd, req_buf, sizeof(req_buf), 0, (struct sockaddr *)&server, sizeof(server)) != (ssize_t)sizeof(req_buf)) {
+            die("UDP clock sync send Delay_Req");
+        }
+        uint64_t t4 = 0;
+        bool t4_got_kernel = false;
+        while (true) {
+            if (monotonic_ns() >= deadline) {
+                die_msg("UDP clock sync response was not received before detect-timeout expired");
+            }
+            struct sockaddr_in addr;
+            socklen_t addr_len = sizeof(addr);
+            uint64_t rx_ns = 0;
+            bool got_kernel = false;
+            ssize_t got = recvfrom_timestamped(
+                fd,
+                resp_buf,
+                sizeof(resp_buf),
+                false,
+                &addr,
+                &addr_len,
+                &rx_ns,
+                &got_kernel
+            );
+            (void)rx_ns;
+            (void)got_kernel;
+            if (got < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                die("UDP clock sync recv Delay_Resp");
+            }
+            if (!sockaddr_same_endpoint(&server, &addr) || got != CLOCK_SYNC_UDP_DELAY_RESP_SIZE) {
+                continue;
+            }
+            if (memcmp(resp_buf, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_MAGIC_SIZE) != 0 || resp_buf[8] != CLOCK_SYNC_UDP_DELAY_RESP) {
+                continue;
+            }
+            int echoed_sample = (int)unpack_u32be(resp_buf + 9);
+            uint64_t echoed_t1 = unpack_u64be(resp_buf + 13);
+            uint64_t echoed_t2 = unpack_u64be(resp_buf + 21);
+            uint64_t echoed_t3 = unpack_u64be(resp_buf + 29);
+            if (echoed_sample != sample_number || echoed_t1 != t1 || echoed_t2 != t2 || echoed_t3 != t3) {
+                die_msg("UDP PTP clock-sync response did not match the Delay_Req timestamps");
+            }
+            t4 = unpack_u64be(resp_buf + 37);
+            t4_got_kernel = resp_buf[45] != 0;
+            break;
+        }
+        if (kernel_timestamp) {
+            if (t4_got_kernel) {
+                ++t4_kernel_received;
+            } else {
+                ++t4_kernel_fallback;
+            }
+        }
+        int idx = sample_number - 1;
+        int64_t master_to_slave = ns_diff(t2, t1);
+        int64_t slave_to_master = ns_diff(t4, t3);
+        int64_t mean_path = (master_to_slave + slave_to_master) / 2;
+        int64_t offset = (slave_to_master - master_to_slave) / 2;
+        rows[idx].sample_idx = sample_number;
+        rows[idx].t1_ns = t1;
+        rows[idx].t2_ns = t2;
+        rows[idx].t3_ns = t3;
+        rows[idx].t4_ns = t4;
+        rows[idx].master_to_slave_ns = master_to_slave;
+        rows[idx].slave_to_master_ns = slave_to_master;
+        rows[idx].offset_ns = offset;
+        rows[idx].path_delay_ns = mean_path;
+        rows[idx].used_for_offset = sample_number > warmup;
+        rows[idx].t2_kernel_timestamp = kernel_timestamp && t2_got_kernel;
+        rows[idx].t4_kernel_timestamp = kernel_timestamp && t4_got_kernel;
+        ++sample_number;
+    }
+    close(fd);
+    compute_clock_sync_stats(rows, samples, method, warmup, best_ratio, clock_offset_ns, clock_sync_path_delay_ns, stats);
+    stats->protocol = PROTO_UDP;
+    stats->kernel_timestamp = kernel_timestamp;
+    stats->t2_kernel_timestamp_received = t2_kernel_received;
+    stats->t2_kernel_timestamp_fallback = t2_kernel_fallback;
+    stats->t4_kernel_timestamp_received = t4_kernel_received;
+    stats->t4_kernel_timestamp_fallback = t4_kernel_fallback;
+    stats->kernel_timestamp_received = t2_kernel_received + t4_kernel_received;
+    stats->kernel_timestamp_fallback = t2_kernel_fallback + t4_kernel_fallback;
+    *rows_out = rows;
+    *row_count_out = samples;
 }
 
 static void *sender_thread_main(void *arg) {
@@ -1523,19 +2294,32 @@ static int run_repeater(const Options *o) {
     int conn_b = accept_one(o->listen_host_b, o->listen_port_b, o->accept_timeout, o->sock_buf, o->busy_poll_us);
     int udp_a = -1;
     int udp_b = -1;
-    if (o->data_protocol == PROTO_UDP) {
+    bool needs_udp_socket = o->data_protocol == PROTO_UDP || (o->clock_sync && o->clock_sync_protocol == PROTO_UDP);
+    if (needs_udp_socket) {
         udp_a = udp_bind_socket(o->listen_host_a, o->listen_port_a, o->sock_buf, o->busy_poll_us, o->udp_ready_timeout);
         udp_b = udp_bind_socket(o->listen_host_b, o->listen_port_b, o->sock_buf, o->busy_poll_us, o->udp_ready_timeout);
     }
     if (o->clock_sync) {
-        serve_clock_sync(conn_a, o->clock_sync_samples);
-        serve_clock_sync(conn_b, o->clock_sync_samples);
+        if (o->clock_sync_protocol == PROTO_TCP) {
+            serve_clock_sync(conn_a, o->clock_sync_samples);
+            serve_clock_sync(conn_b, o->clock_sync_samples);
+        } else {
+            serve_clock_sync_udp(udp_a, o->clock_sync_samples, o->clock_sync_kernel_timestamp);
+            serve_clock_sync_udp(udp_b, o->clock_sync_samples, o->clock_sync_kernel_timestamp);
+        }
     }
     int data_a = conn_a;
     int data_b = conn_b;
     if (o->data_protocol == PROTO_UDP) {
         data_a = accept_udp_peer(conn_a, udp_a);
         data_b = accept_udp_peer(conn_b, udp_b);
+    } else {
+        if (udp_a >= 0) {
+            close(udp_a);
+        }
+        if (udp_b >= 0) {
+            close(udp_b);
+        }
     }
 
     if (o->parallel) {
@@ -1712,6 +2496,10 @@ static int run_repeater(const Options *o) {
             json_print_string(jf, o->listen_host_b);
             fprintf(jf, ",\n    \"listen_port_b\": %d,\n", o->listen_port_b);
             fprintf(jf, "    \"data_protocol\": \"%s\",\n", protocol_name(o->data_protocol));
+            fprintf(jf, "    \"clock_sync\": %s,\n", o->clock_sync ? "true" : "false");
+            fprintf(jf, "    \"clock_sync_protocol\": \"%s\",\n", protocol_name(o->clock_sync_protocol));
+            fprintf(jf, "    \"clock_sync_kernel_timestamp\": %s,\n", o->clock_sync_kernel_timestamp ? "true" : "false");
+            fprintf(jf, "    \"clock_sync_samples\": %d,\n", o->clock_sync_samples);
             fprintf(jf, "    \"send_mode\": \"%s\",\n", send_mode_name(o->send_mode));
             fprintf(jf, "    \"pace_mode\": \"%s\",\n", pace_mode_name(o->pace_mode));
             fprintf(jf, "    \"shared_send_timestamp\": %s,\n", o->shared_send_timestamp ? "true" : "false");
@@ -1857,6 +2645,7 @@ static int run_client(const Options *o) {
     int64_t *delta_samples = calloc((size_t)sample_count, sizeof(int64_t));
     int64_t *delay_stat_samples = calloc((size_t)sample_count, sizeof(int64_t));
     int64_t *delay_abs_samples = calloc((size_t)sample_count, sizeof(int64_t));
+    int64_t *delay_physical_samples = calloc((size_t)sample_count, sizeof(int64_t));
     double *werner_samples = calloc((size_t)sample_count, sizeof(double));
     double *werner_raw_samples = calloc((size_t)sample_count, sizeof(double));
     SampleMsg *sample_msgs = calloc((size_t)sample_count, sizeof(SampleMsg));
@@ -1864,7 +2653,7 @@ static int run_client(const Options *o) {
     int64_t *loop_gap_samples = o->diag ? calloc((size_t)sample_count, sizeof(int64_t)) : NULL;
     int64_t *recv_block_samples = o->diag ? calloc((size_t)sample_count, sizeof(int64_t)) : NULL;
     unsigned char *udp_seen_counts = o->data_protocol == PROTO_UDP ? calloc((size_t)count + 1, 1) : NULL;
-    if (!delta_samples || !delay_stat_samples || !delay_abs_samples || !werner_samples ||
+    if (!delta_samples || !delay_stat_samples || !delay_abs_samples || !delay_physical_samples || !werner_samples ||
         !werner_raw_samples || !sample_msgs || !delta_record_counts ||
         (o->diag && (!loop_gap_samples || !recv_block_samples)) ||
         (o->data_protocol == PROTO_UDP && !udp_seen_counts)) {
@@ -1888,6 +2677,20 @@ static int run_client(const Options *o) {
     int clock_row_count = 0;
     int64_t clock_offset_ns = 0;
     int64_t clock_sync_path_delay_ns = 0;
+    int clock_sync_warmup = 0;
+    ClockSyncStats clock_sync_stats;
+    ClockSyncMethod initial_sync_method = CLOCK_SYNC_METHOD_NONE;
+    if (o->clock_offset_set) {
+        initial_sync_method = CLOCK_SYNC_METHOD_MANUAL;
+    } else if (o->clock_sync) {
+        initial_sync_method = o->clock_sync_method;
+    }
+    init_clock_sync_stats(
+        &clock_sync_stats,
+        initial_sync_method,
+        clock_sync_warmup,
+        o->clock_sync ? o->clock_sync_best_ratio : 0.0
+    );
 
     int control_fd = connect_repeater_until_ready(
         o->repeater_host,
@@ -1902,14 +2705,40 @@ static int run_client(const Options *o) {
         clock_offset_ns = o->clock_offset_ns;
         clock_sync_path_delay_ns = 0;
     } else if (o->clock_sync) {
-        estimate_clock_offset(
-            control_fd,
-            o->clock_sync_samples,
-            &clock_offset_ns,
-            &clock_sync_path_delay_ns,
-            &clock_rows,
-            &clock_row_count
-        );
+        clock_sync_warmup = effective_clock_sync_warmup(o->clock_sync_samples, o->clock_sync_warmup);
+        if (o->clock_sync_protocol == PROTO_TCP) {
+            estimate_clock_offset(
+                control_fd,
+                o->clock_sync_samples,
+                clock_sync_warmup,
+                o->clock_sync_method,
+                o->clock_sync_best_ratio,
+                &clock_offset_ns,
+                &clock_sync_path_delay_ns,
+                &clock_sync_stats,
+                &clock_rows,
+                &clock_row_count
+            );
+        } else {
+            estimate_clock_offset_udp(
+                o->repeater_host,
+                o->repeater_port,
+                o->clock_sync_samples,
+                clock_sync_warmup,
+                o->clock_sync_method,
+                o->clock_sync_best_ratio,
+                o->sock_buf,
+                o->busy_poll_us,
+                o->detect_timeout,
+                o->detect_interval,
+                o->clock_sync_kernel_timestamp,
+                &clock_offset_ns,
+                &clock_sync_path_delay_ns,
+                &clock_sync_stats,
+                &clock_rows,
+                &clock_row_count
+            );
+        }
     }
     int data_fd = control_fd;
     if (o->data_protocol == PROTO_UDP) {
@@ -2103,7 +2932,9 @@ static int run_client(const Options *o) {
         sample_msgs[i].msg.w_swap = werner_samples[i];
         sample_msgs[i].state_out = (State){o->client_id, werner_samples[i], (int)sample_msgs[i].msg.peer_id, false};
         delay_abs_samples[i] = i64_abs_value(delay_stat_samples[i]);
+        delay_physical_samples[i] = delay_stat_samples[i] > 0 ? delay_stat_samples[i] : 0;
     }
+    assess_sync_quality(&clock_sync_stats, delta_samples, sample_idx);
     int64_t last_stat_delta = last_delta - delay_center_ns;
     double last_werner = decay_werner(last_raw_msg.w_swap, last_stat_delta > 0 ? last_stat_delta : 0, o->t1_ns);
     last_werner *= last_werner;
@@ -2151,15 +2982,16 @@ static int run_client(const Options *o) {
             die("fopen client csv");
         }
         if (o->diag) {
-            fprintf(f, "count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n");
+            fprintf(f, "count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n");
             for (int i = 0; i < sample_idx; ++i) {
                 fprintf(
                     f,
-                    "%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                    "%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
                     delta_record_counts[i],
                     (long long)delta_samples[i],
                     (long long)delay_center_ns,
                     (long long)delay_stat_samples[i],
+                    (long long)delay_physical_samples[i],
                     (long long)clock_offset_ns,
                     (long long)clock_sync_path_delay_ns,
                     (long long)loop_gap_samples[i],
@@ -2167,15 +2999,16 @@ static int run_client(const Options *o) {
                 );
             }
         } else {
-            fprintf(f, "count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns\n");
+            fprintf(f, "count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns\n");
             for (int i = 0; i < sample_idx; ++i) {
                 fprintf(
                     f,
-                    "%d,%lld,%lld,%lld,%lld,%lld\n",
+                    "%d,%lld,%lld,%lld,%lld,%lld,%lld\n",
                     delta_record_counts[i],
                     (long long)delta_samples[i],
                     (long long)delay_center_ns,
                     (long long)delay_stat_samples[i],
+                    (long long)delay_physical_samples[i],
                     (long long)clock_offset_ns,
                     (long long)clock_sync_path_delay_ns
                 );
@@ -2194,12 +3027,12 @@ static int run_client(const Options *o) {
             }
             fprintf(
                 cf,
-                "sample_idx,t1_ns,t2_ns,t3_ns,t4_ns,master_to_slave_ns,slave_to_master_ns,offset_ns,path_delay_ns,clock_offset_mean_ns,clock_sync_path_delay_mean_ns\n"
+                "sample_idx,t1_ns,t2_ns,t3_ns,t4_ns,master_to_slave_ns,slave_to_master_ns,offset_ns,path_delay_ns,t2_kernel_timestamp,t4_kernel_timestamp,used_for_offset,used_for_best_path,clock_sync_method,clock_sync_protocol,clock_sync_kernel_timestamp,clock_sync_kernel_timestamp_received,clock_sync_kernel_timestamp_fallback,clock_sync_t2_kernel_timestamp_received,clock_sync_t2_kernel_timestamp_fallback,clock_sync_t4_kernel_timestamp_received,clock_sync_t4_kernel_timestamp_fallback,clock_offset_final_ns,clock_offset_mean_ns,clock_offset_median_ns,clock_offset_best_path_median_ns,clock_offset_std_ns,clock_offset_mad_ns,clock_sync_path_delay_final_ns,clock_sync_path_delay_mean_ns,clock_sync_path_delay_min_ns,clock_sync_path_delay_median_ns,clock_sync_path_delay_p95_ns,clock_sync_path_delay_best_median_ns,clock_sync_negative_or_suspicious,sync_quality\n"
             );
             for (int i = 0; i < clock_row_count; ++i) {
                 fprintf(
                     cf,
-                    "%d,%llu,%llu,%llu,%llu,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                    "%d,%llu,%llu,%llu,%llu,%lld,%lld,%lld,%lld,%d,%d,%d,%d,%s,%s,%d,%d,%d,%d,%d,%d,%d,%lld,%lld,%lld,%lld,%.6f,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d,%s\n",
                     clock_rows[i].sample_idx,
                     (unsigned long long)clock_rows[i].t1_ns,
                     (unsigned long long)clock_rows[i].t2_ns,
@@ -2209,8 +3042,33 @@ static int run_client(const Options *o) {
                     (long long)clock_rows[i].slave_to_master_ns,
                     (long long)clock_rows[i].offset_ns,
                     (long long)clock_rows[i].path_delay_ns,
+                    clock_rows[i].t2_kernel_timestamp ? 1 : 0,
+                    clock_rows[i].t4_kernel_timestamp ? 1 : 0,
+                    clock_rows[i].used_for_offset ? 1 : 0,
+                    clock_rows[i].used_for_best_path ? 1 : 0,
+                    clock_sync_method_name(clock_sync_stats.method),
+                    protocol_name(clock_sync_stats.protocol),
+                    clock_sync_stats.kernel_timestamp ? 1 : 0,
+                    clock_sync_stats.kernel_timestamp_received,
+                    clock_sync_stats.kernel_timestamp_fallback,
+                    clock_sync_stats.t2_kernel_timestamp_received,
+                    clock_sync_stats.t2_kernel_timestamp_fallback,
+                    clock_sync_stats.t4_kernel_timestamp_received,
+                    clock_sync_stats.t4_kernel_timestamp_fallback,
                     (long long)clock_offset_ns,
-                    (long long)clock_sync_path_delay_ns
+                    (long long)clock_sync_stats.offset_mean_ns,
+                    (long long)clock_sync_stats.offset_median_ns,
+                    (long long)clock_sync_stats.offset_best_path_median_ns,
+                    clock_sync_stats.offset_std_ns,
+                    (long long)clock_sync_stats.offset_mad_ns,
+                    (long long)clock_sync_path_delay_ns,
+                    (long long)clock_sync_stats.path_delay_mean_ns,
+                    (long long)clock_sync_stats.path_delay_min_ns,
+                    (long long)clock_sync_stats.path_delay_median_ns,
+                    (long long)clock_sync_stats.path_delay_p95_ns,
+                    (long long)clock_sync_stats.path_delay_best_median_ns,
+                    clock_sync_stats.negative_or_suspicious ? 1 : 0,
+                    clock_sync_stats.quality
                 );
             }
             fclose(cf);
@@ -2251,6 +3109,10 @@ static int run_client(const Options *o) {
             fprintf(jf, "    \"data_protocol\": \"%s\",\n", protocol_name(o->data_protocol));
             fprintf(jf, "    \"send_mode\": \"%s\",\n", send_mode_name(o->send_mode));
             fprintf(jf, "    \"kernel_timestamp\": %s,\n", kernel_timestamp_enabled ? "true" : "false");
+            fprintf(jf, "    \"clock_sync_protocol\": \"%s\",\n", protocol_name(o->clock_sync_protocol));
+            fprintf(jf, "    \"clock_sync_kernel_timestamp\": %s,\n", o->clock_sync_kernel_timestamp ? "true" : "false");
+            fprintf(jf, "    \"clock_sync_method\": \"%s\",\n", clock_sync_method_name(o->clock_sync_method));
+            fprintf(jf, "    \"clock_sync_best_ratio\": %.17g,\n", o->clock_sync_best_ratio);
             fprintf(jf, "    \"sock_buf\": %d,\n", o->sock_buf);
             fprintf(jf, "    \"busy_poll_us\": %d,\n", o->busy_poll_us);
             fprintf(jf, "    \"cpu\": %d,\n", o->cpu);
@@ -2265,6 +3127,43 @@ static int run_client(const Options *o) {
             fprintf(jf, "  \"udp_lost_est\": %d,\n", udp_lost_est);
             fprintf(jf, "  \"clock_offset_ns\": %lld,\n", (long long)clock_offset_ns);
             fprintf(jf, "  \"clock_sync_path_delay_ns\": %lld,\n", (long long)clock_sync_path_delay_ns);
+            fprintf(jf, "  \"clock_sync_warmup\": %d,\n", clock_sync_warmup);
+            fprintf(jf, "  \"sync_quality\": \"%s\",\n", clock_sync_stats.quality);
+            fprintf(jf, "  \"clock_sync\": {\n");
+            fprintf(jf, "    \"clock_sync_protocol\": \"%s\",\n", protocol_name(clock_sync_stats.protocol));
+            fprintf(jf, "    \"clock_sync_kernel_timestamp\": %s,\n", clock_sync_stats.kernel_timestamp ? "true" : "false");
+            fprintf(jf, "    \"clock_sync_kernel_timestamp_received\": %d,\n", clock_sync_stats.kernel_timestamp_received);
+            fprintf(jf, "    \"clock_sync_kernel_timestamp_fallback\": %d,\n", clock_sync_stats.kernel_timestamp_fallback);
+            fprintf(jf, "    \"clock_sync_t2_kernel_timestamp_received\": %d,\n", clock_sync_stats.t2_kernel_timestamp_received);
+            fprintf(jf, "    \"clock_sync_t2_kernel_timestamp_fallback\": %d,\n", clock_sync_stats.t2_kernel_timestamp_fallback);
+            fprintf(jf, "    \"clock_sync_t4_kernel_timestamp_received\": %d,\n", clock_sync_stats.t4_kernel_timestamp_received);
+            fprintf(jf, "    \"clock_sync_t4_kernel_timestamp_fallback\": %d,\n", clock_sync_stats.t4_kernel_timestamp_fallback);
+            fprintf(jf, "    \"clock_sync_method\": \"%s\",\n", clock_sync_method_name(clock_sync_stats.method));
+            fprintf(jf, "    \"clock_sync_warmup\": %d,\n", clock_sync_stats.warmup);
+            fprintf(jf, "    \"clock_sync_best_ratio\": %.17g,\n", clock_sync_stats.best_ratio);
+            fprintf(jf, "    \"clock_sync_used_samples\": %d,\n", clock_sync_stats.used_samples);
+            fprintf(jf, "    \"clock_sync_best_path_samples\": %d,\n", clock_sync_stats.best_path_samples);
+            fprintf(jf, "    \"clock_offset_final_ns\": %lld,\n", (long long)clock_offset_ns);
+            fprintf(jf, "    \"clock_offset_mean_ns\": %lld,\n", (long long)clock_sync_stats.offset_mean_ns);
+            fprintf(jf, "    \"clock_offset_median_ns\": %lld,\n", (long long)clock_sync_stats.offset_median_ns);
+            fprintf(jf, "    \"clock_offset_best_path_median_ns\": %lld,\n", (long long)clock_sync_stats.offset_best_path_median_ns);
+            fprintf(jf, "    \"clock_offset_std_ns\": %.17g,\n", clock_sync_stats.offset_std_ns);
+            fprintf(jf, "    \"clock_offset_mad_ns\": %lld,\n", (long long)clock_sync_stats.offset_mad_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_final_ns\": %lld,\n", (long long)clock_sync_path_delay_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_mean_ns\": %lld,\n", (long long)clock_sync_stats.path_delay_mean_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_min_ns\": %lld,\n", (long long)clock_sync_stats.path_delay_min_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_median_ns\": %lld,\n", (long long)clock_sync_stats.path_delay_median_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_p95_ns\": %lld,\n", (long long)clock_sync_stats.path_delay_p95_ns);
+            fprintf(jf, "    \"clock_sync_path_delay_best_median_ns\": %lld,\n", (long long)clock_sync_stats.path_delay_best_median_ns);
+            fprintf(jf, "    \"clock_sync_negative_or_suspicious\": %s,\n", clock_sync_stats.negative_or_suspicious ? "true" : "false");
+            fprintf(jf, "    \"sync_quality\": \"%s\",\n", clock_sync_stats.quality);
+            fprintf(jf, "    \"sync_quality_reasons\": ");
+            json_print_string(jf, clock_sync_stats.reasons);
+            fprintf(jf, ",\n");
+            fprintf(jf, "    \"delay_negative_count\": %d,\n", clock_sync_stats.delay_negative_count);
+            fprintf(jf, "    \"delay_negative_ratio\": %.17g,\n", clock_sync_stats.delay_negative_ratio);
+            fprintf(jf, "    \"delay_signed_p50_ns\": %lld\n", (long long)clock_sync_stats.delay_signed_p50_ns);
+            fprintf(jf, "  },\n");
             fprintf(jf, "  \"kernel_timestamp\": %s,\n", kernel_timestamp_enabled ? "true" : "false");
             fprintf(jf, "  \"kernel_timestamp_received\": %d,\n", kernel_timestamp_received);
             fprintf(jf, "  \"kernel_timestamp_fallback\": %d,\n", kernel_timestamp_fallback);
@@ -2292,12 +3191,13 @@ static int run_client(const Options *o) {
             for (int i = 0; i < sample_idx; ++i) {
                 fprintf(
                     jf,
-                    "%s\n    {\"count_idx\": %d, \"delay_ns\": %lld, \"delay_center_ns\": %lld, \"delay_centered_ns\": %lld, \"clock_offset_ns\": %lld, \"clock_sync_path_delay_ns\": %lld, \"ts_emit_ns\": %llu, \"peer_id\": %u, \"correction_bits\": %u, \"w_swap_raw\": %.17g, \"werner\": %.17g}",
+                    "%s\n    {\"count_idx\": %d, \"delay_ns\": %lld, \"delay_center_ns\": %lld, \"delay_centered_ns\": %lld, \"delay_physical_ns\": %lld, \"clock_offset_ns\": %lld, \"clock_sync_path_delay_ns\": %lld, \"ts_emit_ns\": %llu, \"peer_id\": %u, \"correction_bits\": %u, \"w_swap_raw\": %.17g, \"werner\": %.17g}",
                     i == 0 ? "" : ",",
                     delta_record_counts[i],
                     (long long)delta_samples[i],
                     (long long)delay_center_ns,
                     (long long)delay_stat_samples[i],
+                    (long long)delay_physical_samples[i],
                     (long long)clock_offset_ns,
                     (long long)clock_sync_path_delay_ns,
                     (unsigned long long)sample_msgs[i].msg.ts_emit_ns,
@@ -2335,6 +3235,17 @@ static int run_client(const Options *o) {
         }
         printf("clock_offset_ns=%lld\n", (long long)clock_offset_ns);
         printf("clock_sync_path_delay_ns=%lld\n", (long long)clock_sync_path_delay_ns);
+        printf("clock_sync_warmup=%d\n", clock_sync_warmup);
+        printf("clock_sync_method=%s\n", clock_sync_method_name(clock_sync_stats.method));
+        printf("clock_sync_protocol=%s\n", protocol_name(clock_sync_stats.protocol));
+        printf("clock_sync_kernel_timestamp=%s\n", clock_sync_stats.kernel_timestamp ? "True" : "False");
+        printf("clock_sync_kernel_timestamp_received=%d\n", clock_sync_stats.kernel_timestamp_received);
+        printf("clock_sync_kernel_timestamp_fallback=%d\n", clock_sync_stats.kernel_timestamp_fallback);
+        printf("clock_sync_t2_kernel_timestamp_received=%d\n", clock_sync_stats.t2_kernel_timestamp_received);
+        printf("clock_sync_t2_kernel_timestamp_fallback=%d\n", clock_sync_stats.t2_kernel_timestamp_fallback);
+        printf("clock_sync_t4_kernel_timestamp_received=%d\n", clock_sync_stats.t4_kernel_timestamp_received);
+        printf("clock_sync_t4_kernel_timestamp_fallback=%d\n", clock_sync_stats.t4_kernel_timestamp_fallback);
+        printf("sync_quality=%s\n", clock_sync_stats.quality);
         printf("delay_center_ns=%lld\n", (long long)delay_center_ns);
         char statebuf[96];
         State state_in = {o->client_id, o->werner_in, o->repeater_id, false};
@@ -2366,6 +3277,17 @@ static int run_client(const Options *o) {
         }
         printf("clock_offset_ns=%lld\n", (long long)clock_offset_ns);
         printf("clock_sync_path_delay_ns=%lld\n", (long long)clock_sync_path_delay_ns);
+        printf("clock_sync_warmup=%d\n", clock_sync_warmup);
+        printf("clock_sync_method=%s\n", clock_sync_method_name(clock_sync_stats.method));
+        printf("clock_sync_protocol=%s\n", protocol_name(clock_sync_stats.protocol));
+        printf("clock_sync_kernel_timestamp=%s\n", clock_sync_stats.kernel_timestamp ? "True" : "False");
+        printf("clock_sync_kernel_timestamp_received=%d\n", clock_sync_stats.kernel_timestamp_received);
+        printf("clock_sync_kernel_timestamp_fallback=%d\n", clock_sync_stats.kernel_timestamp_fallback);
+        printf("clock_sync_t2_kernel_timestamp_received=%d\n", clock_sync_stats.t2_kernel_timestamp_received);
+        printf("clock_sync_t2_kernel_timestamp_fallback=%d\n", clock_sync_stats.t2_kernel_timestamp_fallback);
+        printf("clock_sync_t4_kernel_timestamp_received=%d\n", clock_sync_stats.t4_kernel_timestamp_received);
+        printf("clock_sync_t4_kernel_timestamp_fallback=%d\n", clock_sync_stats.t4_kernel_timestamp_fallback);
+        printf("sync_quality=%s\n", clock_sync_stats.quality);
         printf("delay_center_ns=%lld\n", (long long)delay_center_ns);
         char statebuf[96];
         State state_in = {o->client_id, o->werner_in, o->repeater_id, false};
@@ -2385,6 +3307,7 @@ static int run_client(const Options *o) {
     free(delta_samples);
     free(delay_stat_samples);
     free(delay_abs_samples);
+    free(delay_physical_samples);
     free(werner_samples);
     free(werner_raw_samples);
     free(sample_msgs);

@@ -20,12 +20,25 @@ UDP_MSG_FORMAT = "!IQIBd"
 UDP_MSG_SIZE = struct.calcsize(UDP_MSG_FORMAT)
 UDP_HELLO_MAGIC = b"AESOUDP1"
 UDP_READY_BYTE = b"U"
+CLOCK_SYNC_UDP_MAGIC = b"AESOCS1!"
+CLOCK_SYNC_UDP_HELLO = 1
+CLOCK_SYNC_UDP_SYNC = 2
+CLOCK_SYNC_UDP_DELAY_REQ = 3
+CLOCK_SYNC_UDP_DELAY_RESP = 4
 CLOCK_SYNC_SYNC_FORMAT = "!Q"
 CLOCK_SYNC_SYNC_SIZE = struct.calcsize(CLOCK_SYNC_SYNC_FORMAT)
 CLOCK_SYNC_DELAY_REQ_FORMAT = "!QQQ"
 CLOCK_SYNC_DELAY_REQ_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_REQ_FORMAT)
 CLOCK_SYNC_DELAY_RESP_FORMAT = "!QQQQ"
 CLOCK_SYNC_DELAY_RESP_SIZE = struct.calcsize(CLOCK_SYNC_DELAY_RESP_FORMAT)
+CLOCK_SYNC_UDP_HELLO_FORMAT = "!8sB"
+CLOCK_SYNC_UDP_HELLO_SIZE = struct.calcsize(CLOCK_SYNC_UDP_HELLO_FORMAT)
+CLOCK_SYNC_UDP_SYNC_FORMAT = "!8sBIQ"
+CLOCK_SYNC_UDP_SYNC_SIZE = struct.calcsize(CLOCK_SYNC_UDP_SYNC_FORMAT)
+CLOCK_SYNC_UDP_DELAY_REQ_FORMAT = "!8sBIQQQ"
+CLOCK_SYNC_UDP_DELAY_REQ_SIZE = struct.calcsize(CLOCK_SYNC_UDP_DELAY_REQ_FORMAT)
+CLOCK_SYNC_UDP_DELAY_RESP_FORMAT = "!8sBIQQQQB"
+CLOCK_SYNC_UDP_DELAY_RESP_SIZE = struct.calcsize(CLOCK_SYNC_UDP_DELAY_RESP_FORMAT)
 SO_TIMESTAMPNS_CANDIDATES = tuple(
     value for value in (getattr(socket, "SO_TIMESTAMPNS", None), 64, 35) if value is not None
 )
@@ -59,7 +72,12 @@ def parse_args():
     repeater.add_argument("--parallel", action="store_true", help="Send to A/B in parallel threads.")
     repeater.add_argument("--cpu-a", type=int, default=2, help="Pin sender thread A to this CPU core.")
     repeater.add_argument("--cpu-b", type=int, default=3, help="Pin sender thread B to this CPU core.")
-    repeater.add_argument("--shared-send-timestamp", action="store_true", help="Use one timestamp for both A/B messages in non-parallel mode.")
+    repeater.add_argument(
+        "--shared-send-timestamp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use one timestamp for both A/B data messages in non-parallel mode. PTP clock sync always uses per-client timestamps.",
+    )
     repeater.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
     repeater.add_argument("--pace-mode", choices=("sleep", "spin", "hybrid"), default="sleep", help="How --count-interval pacing waits between counts.")
     repeater.add_argument("--spin-margin-us", type=float, default=100.0, help="Final busy-wait window used by --pace-mode hybrid.")
@@ -70,8 +88,18 @@ def parse_args():
     repeater.add_argument("--json", dest="json_output", action=argparse.BooleanOptionalAction, default=True, help="Write JSON metadata when --plot is used.")
     repeater.add_argument("--json-dir", default=None, help="Directory where JSON files are written. Defaults from --plot-dir: csv_x -> json_x.")
     repeater.add_argument("--diag", action="store_true", help="Measure extra repeater send timing diagnostics.")
-    repeater.add_argument("--clock-sync", action="store_true", help="Enable pre-run PTP-style clock offset calibration. Enable it on both clients too.")
+    repeater.add_argument(
+        "--clock-sync",
+        nargs="?",
+        choices=("tcp", "udp"),
+        const="tcp",
+        default=None,
+        metavar="{tcp,udp}",
+        help="Enable pre-run PTP-style clock offset calibration over tcp or udp. Bare --clock-sync keeps old TCP behavior.",
+    )
     repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    repeater.add_argument("--clock-sync-protocol", choices=("tcp", "udp"), default=None, help=argparse.SUPPRESS)
+    repeater.add_argument("--clock-sync-kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
     repeater.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
     repeater.add_argument("--udp-ready-timeout", type=float, default=30.0, help="Seconds to wait for each client's UDP hello.")
 
@@ -99,15 +127,37 @@ def parse_args():
     client.add_argument("--quiet", action="store_true")
     client.add_argument("--t1-ns", type=float, default=1_000_000.0)
     client.add_argument("--diag", action="store_true", help="Measure extra client loop/recv timing diagnostics.")
-    client.add_argument("--clock-sync", action="store_true", help="Estimate repeater-clock minus client-clock offset with a PTP-style exchange before the data loop. Repeater and both clients must enable it.")
+    client.add_argument(
+        "--clock-sync",
+        nargs="?",
+        choices=("tcp", "udp"),
+        const="tcp",
+        default=None,
+        metavar="{tcp,udp}",
+        help="Estimate repeater-clock minus client-clock offset over tcp or udp. Bare --clock-sync keeps old TCP behavior.",
+    )
     client.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    client.add_argument("--clock-sync-warmup", type=int, default=None, help="Clock-sync samples discarded before offset averaging. Defaults to floor(5%% of --clock-sync-samples).")
+    client.add_argument("--clock-sync-method", choices=("mean", "median", "best-path-median"), default="best-path-median", help="Estimator used for the final clock offset after warmup.")
+    client.add_argument("--clock-sync-best-ratio", type=float, default=0.5, help="Fraction of lowest-path-delay samples used by --clock-sync-method best-path-median.")
+    client.add_argument("--clock-sync-protocol", choices=("tcp", "udp"), default=None, help=argparse.SUPPRESS)
+    client.add_argument("--clock-sync-kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
     client.add_argument("--clock-offset-ns", type=int, default=None, help="Manual repeater-clock minus client-clock offset. Skips auto calibration and does not require --clock-sync.")
     client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
     client.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
     client.add_argument("--udp-idle-timeout", type=float, default=5.0, help="Stop waiting for UDP data after this many idle seconds.")
     client.add_argument("--kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS receive timestamps for UDP data.")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    clock_sync_transport = getattr(args, "clock_sync", None)
+    legacy_clock_sync_protocol = getattr(args, "clock_sync_protocol", None)
+    if clock_sync_transport is None:
+        args.clock_sync = False
+        args.clock_sync_protocol = legacy_clock_sync_protocol or "tcp"
+    else:
+        args.clock_sync = True
+        args.clock_sync_protocol = legacy_clock_sync_protocol or clock_sync_transport
+    return args
 
 
 def default_json_dir(plot_dir):
@@ -171,6 +221,18 @@ def parse_kernel_timestamp_ns(ancdata):
     return None
 
 
+def recvfrom_timestamped(sock, size, kernel_timestamp=False):
+    if kernel_timestamp:
+        cmsg_buf_size = socket.CMSG_SPACE(16) if hasattr(socket, "CMSG_SPACE") else 128
+        data, ancdata, _flags, addr = sock.recvmsg(size, cmsg_buf_size)
+        ts_ns = parse_kernel_timestamp_ns(ancdata)
+        if ts_ns is None:
+            return data, addr, time.time_ns(), False
+        return data, addr, ts_ns, True
+    data, addr = sock.recvfrom(size)
+    return data, addr, time.time_ns(), False
+
+
 def pace_wait(interval_ns, mode="sleep", spin_margin_ns=100_000):
     if interval_ns <= 0:
         return
@@ -231,18 +293,206 @@ def serve_clock_sync(sock, samples):
         sock.sendall(struct.pack(CLOCK_SYNC_DELAY_RESP_FORMAT, t1_ns, t2_ns, t3_ns, t4_ns))
 
 
-def estimate_clock_offset(sock, samples):
+def serve_clock_sync_udp(udp_sock, samples, kernel_timestamp=False):
+    if kernel_timestamp:
+        enable_kernel_timestamp_ns(udp_sock)
+    hello_size = CLOCK_SYNC_UDP_HELLO_SIZE
+    max_req_size = max(CLOCK_SYNC_UDP_HELLO_SIZE, CLOCK_SYNC_UDP_DELAY_REQ_SIZE)
+    while True:
+        data, addr, _rx_ns, _got_kernel = recvfrom_timestamped(udp_sock, max_req_size, False)
+        if len(data) != hello_size:
+            continue
+        magic, msg_type = struct.unpack(CLOCK_SYNC_UDP_HELLO_FORMAT, data)
+        if magic == CLOCK_SYNC_UDP_MAGIC and msg_type == CLOCK_SYNC_UDP_HELLO:
+            break
+    for sample_number in range(1, max(0, int(samples)) + 1):
+        t1_ns = time.time_ns()
+        udp_sock.sendto(
+            struct.pack(CLOCK_SYNC_UDP_SYNC_FORMAT, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_SYNC, sample_number, t1_ns),
+            addr,
+        )
+        while True:
+            data, req_addr, t4_ns, t4_got_kernel = recvfrom_timestamped(
+                udp_sock, CLOCK_SYNC_UDP_DELAY_REQ_SIZE, kernel_timestamp
+            )
+            if req_addr != addr or len(data) != CLOCK_SYNC_UDP_DELAY_REQ_SIZE:
+                continue
+            magic, msg_type, echoed_sample, t1_echo_ns, t2_ns, t3_ns = struct.unpack(
+                CLOCK_SYNC_UDP_DELAY_REQ_FORMAT, data
+            )
+            if magic != CLOCK_SYNC_UDP_MAGIC or msg_type != CLOCK_SYNC_UDP_DELAY_REQ:
+                continue
+            if echoed_sample != sample_number or t1_echo_ns != t1_ns:
+                raise ValueError("UDP PTP clock-sync request did not match the Sync timestamp")
+            break
+        udp_sock.sendto(
+            struct.pack(
+                CLOCK_SYNC_UDP_DELAY_RESP_FORMAT,
+                CLOCK_SYNC_UDP_MAGIC,
+                CLOCK_SYNC_UDP_DELAY_RESP,
+                sample_number,
+                t1_ns,
+                t2_ns,
+                t3_ns,
+                t4_ns,
+                1 if t4_got_kernel else 0,
+            ),
+            addr,
+        )
+
+
+def effective_clock_sync_warmup(samples, warmup):
+    sample_total = max(0, int(samples))
+    if sample_total <= 0:
+        return 0
+    if warmup is None:
+        discard = int(sample_total * 0.05)
+    else:
+        discard = max(0, int(warmup))
+    return min(discard, sample_total - 1)
+
+
+def median_int(vals):
+    if not vals:
+        return 0
+    return int(percentile(sorted(vals), 0.50))
+
+
+def mad_ns(vals, median_value):
+    if not vals:
+        return 0
+    return median_int([abs(v - median_value) for v in vals])
+
+
+def empty_clock_sync_stats(method="none", warmup=0, best_ratio=0.0):
+    return {
+        "clock_sync_protocol": "tcp",
+        "clock_sync_kernel_timestamp": False,
+        "clock_sync_kernel_timestamp_received": 0,
+        "clock_sync_kernel_timestamp_fallback": 0,
+        "clock_sync_t2_kernel_timestamp_received": 0,
+        "clock_sync_t2_kernel_timestamp_fallback": 0,
+        "clock_sync_t4_kernel_timestamp_received": 0,
+        "clock_sync_t4_kernel_timestamp_fallback": 0,
+        "clock_sync_method": method,
+        "clock_sync_warmup": int(warmup),
+        "clock_sync_best_ratio": float(best_ratio),
+        "clock_sync_used_samples": 0,
+        "clock_sync_best_path_samples": 0,
+        "clock_offset_mean_ns": 0,
+        "clock_offset_median_ns": 0,
+        "clock_offset_best_path_median_ns": 0,
+        "clock_offset_std_ns": 0.0,
+        "clock_offset_mad_ns": 0,
+        "clock_sync_path_delay_mean_ns": 0,
+        "clock_sync_path_delay_min_ns": 0,
+        "clock_sync_path_delay_median_ns": 0,
+        "clock_sync_path_delay_p95_ns": 0,
+        "clock_sync_path_delay_best_median_ns": 0,
+    }
+
+
+def build_clock_sync_stats(rows, method, warmup, best_ratio):
+    used_rows = [row for row in rows if row["used_for_offset"]]
+    stats = empty_clock_sync_stats(method, warmup, best_ratio)
+    if not used_rows:
+        return 0, 0, stats
+    best_ratio = min(1.0, max(0.0, float(best_ratio)))
+    best_count = max(1, int(math.ceil(len(used_rows) * best_ratio))) if best_ratio > 0 else 1
+    best_rows = sorted(used_rows, key=lambda row: row["path_delay_ns"])[:best_count]
+    best_ids = {row["sample_idx"] for row in best_rows}
+    for row in rows:
+        row["used_for_best_path"] = row["sample_idx"] in best_ids
+
+    offsets = [row["offset_ns"] for row in used_rows]
+    paths = [row["path_delay_ns"] for row in used_rows]
+    best_offsets = [row["offset_ns"] for row in best_rows]
+    best_paths = [row["path_delay_ns"] for row in best_rows]
+    offset_mean_raw = sum(offsets) / len(offsets)
+    path_mean_raw = sum(paths) / len(paths)
+    offset_mean = int(offset_mean_raw)
+    offset_median = median_int(offsets)
+    best_offset_median = median_int(best_offsets)
+    path_median = median_int(paths)
+    best_path_median = median_int(best_paths)
+    stats.update(
+        {
+            "clock_sync_best_ratio": float(best_ratio),
+            "clock_sync_used_samples": int(len(used_rows)),
+            "clock_sync_best_path_samples": int(len(best_rows)),
+            "clock_offset_mean_ns": int(offset_mean),
+            "clock_offset_median_ns": int(offset_median),
+            "clock_offset_best_path_median_ns": int(best_offset_median),
+            "clock_offset_std_ns": float(stddev(offsets, offset_mean_raw)),
+            "clock_offset_mad_ns": int(mad_ns(offsets, offset_median)),
+            "clock_sync_path_delay_mean_ns": int(path_mean_raw),
+            "clock_sync_path_delay_min_ns": int(min(paths)),
+            "clock_sync_path_delay_median_ns": int(path_median),
+            "clock_sync_path_delay_p95_ns": int(percentile(sorted(paths), 0.95)),
+            "clock_sync_path_delay_best_median_ns": int(best_path_median),
+        }
+    )
+    if method == "mean":
+        return offset_mean, int(path_mean_raw), stats
+    if method == "median":
+        return offset_median, path_median, stats
+    return best_offset_median, best_path_median, stats
+
+
+def assess_sync_quality(clock_sync_stats, signed_delays):
+    negative_count = sum(1 for value in signed_delays if value < 0)
+    negative_ratio = (negative_count / len(signed_delays)) if signed_delays else 0.0
+    signed_p50_ns = int(percentile(sorted(signed_delays), 0.50)) if signed_delays else 0
+    reasons = []
+    level = 0
+
+    path_median = int(clock_sync_stats.get("clock_sync_path_delay_median_ns", 0))
+    path_p95 = int(clock_sync_stats.get("clock_sync_path_delay_p95_ns", 0))
+    offset_mad = int(clock_sync_stats.get("clock_offset_mad_ns", 0))
+    if path_median > 1_000_000 or path_p95 > 2_000_000:
+        level = max(level, 1)
+        reasons.append("high_path_delay")
+    if path_median > 5_000_000 or path_p95 > 10_000_000:
+        level = max(level, 2)
+        reasons.append("very_high_path_delay")
+    if offset_mad > 10_000:
+        level = max(level, 1)
+        reasons.append("high_offset_mad")
+    if offset_mad > 100_000:
+        level = max(level, 2)
+        reasons.append("very_high_offset_mad")
+    if negative_ratio > 0.20:
+        level = max(level, 1)
+        reasons.append("many_negative_delays")
+    if negative_ratio > 0.80:
+        level = max(level, 2)
+        reasons.append("mostly_negative_delays")
+    if signed_p50_ns < -1_000_000:
+        level = max(level, 2)
+        reasons.append("negative_delay_p50_ms")
+
+    quality = ("ok", "warn", "bad")[level]
+    return {
+        "sync_quality": quality,
+        "sync_quality_reasons": reasons,
+        "clock_sync_negative_or_suspicious": bool(level > 0),
+        "delay_negative_count": int(negative_count),
+        "delay_negative_ratio": float(negative_ratio),
+        "delay_signed_p50_ns": int(signed_p50_ns),
+    }
+
+
+def estimate_clock_offset(sock, samples, warmup=0, method="best-path-median", best_ratio=0.5):
     # PTP-style four-timestamp exchange with the repeater as master:
     # t1: master Sync transmit, t2: slave Sync receive,
     # t3: slave Delay_Req transmit, t4: master Delay_Req receive.
     # slave_minus_master = ((t2 - t1) - (t4 - t3)) / 2.
     # We return master_minus_slave so the client can correct as:
     # corrected_client_time = client_time + master_minus_slave.
-    offset_total_ns = 0
-    path_delay_total_ns = 0
-    sample_count = 0
     clock_sync_samples = []
-    for _ in range(max(0, int(samples))):
+    sample_total = max(0, int(samples))
+    warmup = min(max(0, int(warmup)), max(0, sample_total - 1))
+    for sample_number in range(1, sample_total + 1):
         (t1_ns,) = struct.unpack(CLOCK_SYNC_SYNC_FORMAT, recv_exact(sock, CLOCK_SYNC_SYNC_SIZE))
         t2_ns = time.time_ns()
         t3_ns = time.time_ns()
@@ -256,25 +506,197 @@ def estimate_clock_offset(sock, samples):
         slave_to_master_ns = t4_ns - t3_ns
         mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) // 2
         offset_ns = (slave_to_master_ns - master_to_slave_ns) // 2
-        offset_total_ns += offset_ns
-        path_delay_total_ns += mean_path_delay_ns
-        sample_count += 1
+        used_for_offset = sample_number > warmup
         clock_sync_samples.append(
-            (
-                sample_count,
-                t1_ns,
-                t2_ns,
-                t3_ns,
-                t4_ns,
-                master_to_slave_ns,
-                slave_to_master_ns,
-                offset_ns,
-                mean_path_delay_ns,
-            )
+            {
+                "sample_idx": sample_number,
+                "t1_ns": t1_ns,
+                "t2_ns": t2_ns,
+                "t3_ns": t3_ns,
+                "t4_ns": t4_ns,
+                "master_to_slave_ns": master_to_slave_ns,
+                "slave_to_master_ns": slave_to_master_ns,
+                "offset_ns": offset_ns,
+                "path_delay_ns": mean_path_delay_ns,
+                "used_for_offset": used_for_offset,
+                "used_for_best_path": False,
+                "t2_kernel_timestamp": False,
+                "t4_kernel_timestamp": False,
+            }
         )
-    if sample_count == 0:
-        return 0, 0, clock_sync_samples
-    return offset_total_ns // sample_count, path_delay_total_ns // sample_count, clock_sync_samples
+    clock_offset_ns, clock_sync_path_delay_ns, stats = build_clock_sync_stats(
+        clock_sync_samples, method, warmup, best_ratio
+    )
+    stats.update(
+        {
+            "clock_sync_protocol": "tcp",
+            "clock_sync_kernel_timestamp": False,
+            "clock_sync_kernel_timestamp_received": 0,
+            "clock_sync_kernel_timestamp_fallback": 0,
+            "clock_sync_t2_kernel_timestamp_received": 0,
+            "clock_sync_t2_kernel_timestamp_fallback": 0,
+            "clock_sync_t4_kernel_timestamp_received": 0,
+            "clock_sync_t4_kernel_timestamp_fallback": 0,
+        }
+    )
+    return clock_offset_ns, clock_sync_path_delay_ns, clock_sync_samples, stats
+
+
+def estimate_clock_offset_udp(
+    host,
+    port,
+    samples,
+    warmup=0,
+    method="best-path-median",
+    best_ratio=0.5,
+    sock_buf=0,
+    busy_poll_us=0,
+    detect_timeout=30.0,
+    detect_interval=0.05,
+    kernel_timestamp=False,
+):
+    # UDP PTP-style exchange. t2 and t4 can be RX kernel timestamps:
+    # t1: repeater user-space timestamp before sendto(Sync)
+    # t2: client RX timestamp of Sync, kernel if available
+    # t3: client user-space timestamp before sendto(Delay_Req)
+    # t4: repeater RX timestamp of Delay_Req, kernel if enabled on repeater
+    sample_total = max(0, int(samples))
+    warmup = min(max(0, int(warmup)), max(0, sample_total - 1))
+    clock_sync_samples = []
+    t2_kernel_received = 0
+    t2_kernel_fallback = 0
+    t4_kernel_received = 0
+    t4_kernel_fallback = 0
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    enable_low_latency_socket(sock, sock_buf, busy_poll_us)
+    if kernel_timestamp:
+        enable_kernel_timestamp_ns(sock)
+    sock.bind(("", 0))
+    server_addr = (host, int(port))
+    timeout = max(0.001, min(0.05, max(0.001, float(detect_interval))))
+    sock.settimeout(timeout)
+    deadline = time.monotonic() + max(0.0, float(detect_timeout))
+    try:
+        sample_number = 1
+        waiting_for_first_sync = True
+        while sample_number <= sample_total:
+            if waiting_for_first_sync:
+                sock.sendto(
+                    struct.pack(CLOCK_SYNC_UDP_HELLO_FORMAT, CLOCK_SYNC_UDP_MAGIC, CLOCK_SYNC_UDP_HELLO),
+                    server_addr,
+                )
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("UDP clock sync did not complete before detect-timeout expired")
+                try:
+                    data, addr, t2_ns, got_kernel = recvfrom_timestamped(
+                        sock, CLOCK_SYNC_UDP_SYNC_SIZE, kernel_timestamp
+                    )
+                except socket.timeout:
+                    if waiting_for_first_sync:
+                        break
+                    continue
+                if addr != server_addr or len(data) != CLOCK_SYNC_UDP_SYNC_SIZE:
+                    continue
+                magic, msg_type, echoed_sample, t1_ns = struct.unpack(CLOCK_SYNC_UDP_SYNC_FORMAT, data)
+                if magic != CLOCK_SYNC_UDP_MAGIC or msg_type != CLOCK_SYNC_UDP_SYNC:
+                    continue
+                if echoed_sample != sample_number:
+                    continue
+                if kernel_timestamp:
+                    if got_kernel:
+                        t2_kernel_received += 1
+                    else:
+                        t2_kernel_fallback += 1
+                waiting_for_first_sync = False
+                break
+            else:
+                continue
+            if waiting_for_first_sync:
+                continue
+            t3_ns = time.time_ns()
+            sock.sendto(
+                struct.pack(
+                    CLOCK_SYNC_UDP_DELAY_REQ_FORMAT,
+                    CLOCK_SYNC_UDP_MAGIC,
+                    CLOCK_SYNC_UDP_DELAY_REQ,
+                    sample_number,
+                    t1_ns,
+                    t2_ns,
+                    t3_ns,
+                ),
+                server_addr,
+            )
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("UDP clock sync response was not received before detect-timeout expired")
+                try:
+                    data, addr, _rx_ns, _got_kernel = recvfrom_timestamped(
+                        sock, CLOCK_SYNC_UDP_DELAY_RESP_SIZE, False
+                    )
+                except socket.timeout:
+                    continue
+                if addr != server_addr or len(data) != CLOCK_SYNC_UDP_DELAY_RESP_SIZE:
+                    continue
+                magic, msg_type, echoed_sample, echoed_t1_ns, echoed_t2_ns, echoed_t3_ns, t4_ns, t4_got_kernel = struct.unpack(
+                    CLOCK_SYNC_UDP_DELAY_RESP_FORMAT, data
+                )
+                if magic != CLOCK_SYNC_UDP_MAGIC or msg_type != CLOCK_SYNC_UDP_DELAY_RESP:
+                    continue
+                if (echoed_sample, echoed_t1_ns, echoed_t2_ns, echoed_t3_ns) != (
+                    sample_number,
+                    t1_ns,
+                    t2_ns,
+                    t3_ns,
+                ):
+                    raise ValueError("UDP PTP clock-sync response did not match the Delay_Req timestamps")
+                break
+            master_to_slave_ns = t2_ns - t1_ns
+            slave_to_master_ns = t4_ns - t3_ns
+            mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) // 2
+            offset_ns = (slave_to_master_ns - master_to_slave_ns) // 2
+            t4_got_kernel = bool(t4_got_kernel)
+            if kernel_timestamp:
+                if t4_got_kernel:
+                    t4_kernel_received += 1
+                else:
+                    t4_kernel_fallback += 1
+            clock_sync_samples.append(
+                {
+                    "sample_idx": sample_number,
+                    "t1_ns": t1_ns,
+                    "t2_ns": t2_ns,
+                    "t3_ns": t3_ns,
+                    "t4_ns": t4_ns,
+                    "master_to_slave_ns": master_to_slave_ns,
+                    "slave_to_master_ns": slave_to_master_ns,
+                    "offset_ns": offset_ns,
+                    "path_delay_ns": mean_path_delay_ns,
+                    "used_for_offset": sample_number > warmup,
+                    "used_for_best_path": False,
+                    "t2_kernel_timestamp": bool(got_kernel) if kernel_timestamp else False,
+                    "t4_kernel_timestamp": t4_got_kernel if kernel_timestamp else False,
+                }
+            )
+            sample_number += 1
+    finally:
+        sock.close()
+    clock_offset_ns, clock_sync_path_delay_ns, stats = build_clock_sync_stats(
+        clock_sync_samples, method, warmup, best_ratio
+    )
+    stats.update(
+        {
+            "clock_sync_protocol": "udp",
+            "clock_sync_kernel_timestamp": bool(kernel_timestamp),
+            "clock_sync_kernel_timestamp_received": int(t2_kernel_received + t4_kernel_received),
+            "clock_sync_kernel_timestamp_fallback": int(t2_kernel_fallback + t4_kernel_fallback),
+            "clock_sync_t2_kernel_timestamp_received": int(t2_kernel_received),
+            "clock_sync_t2_kernel_timestamp_fallback": int(t2_kernel_fallback),
+            "clock_sync_t4_kernel_timestamp_received": int(t4_kernel_received),
+            "clock_sync_t4_kernel_timestamp_fallback": int(t4_kernel_fallback),
+        }
+    )
+    return clock_offset_ns, clock_sync_path_delay_ns, clock_sync_samples, stats
 
 
 def connect_repeater_until_ready(host, port, connect_timeout, detect_timeout, detect_interval, sock_buf, busy_poll_us):
@@ -467,6 +889,8 @@ def print_client_message_state(label, delta_ns, msg, state_out, count_idx=None, 
 
 def run_repeater(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
+    if args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
+        raise ValueError("--clock-sync-kernel-timestamp requires --clock-sync udp")
     count = max(1, int(args.count))
     if args.werner_ar is None:
         args.werner_ar = float(input("werner_ar: ").strip())
@@ -504,7 +928,8 @@ def run_repeater(args):
 
     conn_a = accept_one(args.listen_host_a, args.listen_port_a)
     conn_b = accept_one(args.listen_host_b, args.listen_port_b)
-    if args.data_protocol == "udp":
+    needs_udp_socket = args.data_protocol == "udp" or (args.clock_sync and args.clock_sync_protocol == "udp")
+    if needs_udp_socket:
         udp_a = udp_bind_socket(
             args.listen_host_a, args.listen_port_a, args.sock_buf, args.busy_poll_us, args.udp_ready_timeout
         )
@@ -515,12 +940,20 @@ def run_repeater(args):
         udp_a = None
         udp_b = None
     if args.clock_sync:
-        serve_clock_sync(conn_a, args.clock_sync_samples)
-        serve_clock_sync(conn_b, args.clock_sync_samples)
+        if args.clock_sync_protocol == "tcp":
+            serve_clock_sync(conn_a, args.clock_sync_samples)
+            serve_clock_sync(conn_b, args.clock_sync_samples)
+        else:
+            serve_clock_sync_udp(udp_a, args.clock_sync_samples, args.clock_sync_kernel_timestamp)
+            serve_clock_sync_udp(udp_b, args.clock_sync_samples, args.clock_sync_kernel_timestamp)
     if args.data_protocol == "udp":
         data_a = accept_udp_peer(conn_a, udp_a)
         data_b = accept_udp_peer(conn_b, udp_b)
     else:
+        if udp_a is not None:
+            udp_a.close()
+        if udp_b is not None:
+            udp_b.close()
         data_a = conn_a
         data_b = conn_b
 
@@ -762,6 +1195,8 @@ def run_repeater(args):
 
 def run_client(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
+    if args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
+        raise ValueError("--clock-sync-kernel-timestamp requires --clock-sync udp")
     count = max(1, int(args.count))
     warmup = max(0, min(int(args.warmup), count - 1))
     sample_count = count - warmup
@@ -794,6 +1229,8 @@ def run_client(args):
     kernel_timestamp_received = 0
     kernel_timestamp_fallback = 0
     clock_sync_sample_rows = []
+    clock_sync_warmup = 0
+    clock_sync_stats = empty_clock_sync_stats("manual" if args.clock_offset_ns is not None else "none")
 
     with connect_repeater_until_ready(
         args.repeater_host,
@@ -808,9 +1245,29 @@ def run_client(args):
             clock_offset_ns = int(args.clock_offset_ns)
             clock_sync_path_delay_ns = 0
         elif args.clock_sync:
-            clock_offset_ns, clock_sync_path_delay_ns, clock_sync_sample_rows = estimate_clock_offset(
-                sock, args.clock_sync_samples
-            )
+            clock_sync_warmup = effective_clock_sync_warmup(args.clock_sync_samples, args.clock_sync_warmup)
+            if args.clock_sync_protocol == "tcp":
+                clock_offset_ns, clock_sync_path_delay_ns, clock_sync_sample_rows, clock_sync_stats = estimate_clock_offset(
+                    sock,
+                    args.clock_sync_samples,
+                    clock_sync_warmup,
+                    args.clock_sync_method,
+                    args.clock_sync_best_ratio,
+                )
+            else:
+                clock_offset_ns, clock_sync_path_delay_ns, clock_sync_sample_rows, clock_sync_stats = estimate_clock_offset_udp(
+                    args.repeater_host,
+                    args.repeater_port,
+                    args.clock_sync_samples,
+                    clock_sync_warmup,
+                    args.clock_sync_method,
+                    args.clock_sync_best_ratio,
+                    args.sock_buf,
+                    args.busy_poll_us,
+                    args.detect_timeout,
+                    args.detect_interval,
+                    args.clock_sync_kernel_timestamp,
+                )
         else:
             clock_offset_ns = 0
             clock_sync_path_delay_ns = 0
@@ -950,6 +1407,8 @@ def run_client(args):
 
     delay_center_ns = percentile(sorted(delta_samples), 0.50) if args.center_delay and delta_samples else 0
     delay_stat_samples = [delay_ns - delay_center_ns for delay_ns in delta_samples]
+    delay_physical_samples = [max(0, delay_ns) for delay_ns in delay_stat_samples]
+    clock_sync_stats.update(assess_sync_quality(clock_sync_stats, delta_samples))
     last_raw_msg = (last_ts_emit_ns, last_peer_id, last_correction_bits, last_w_swap_raw)
 
     werner_samples = [
@@ -1001,15 +1460,15 @@ def run_client(args):
         csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n")
-                for idx, delay_ns, delay_centered_ns, loop_gap_ns, recv_block_ns in zip(
-                    delta_record_counts, delta_samples, delay_stat_samples, loop_gap_samples, recv_block_samples
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns, loop_gap_ns, recv_block_ns in zip(
+                    delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, loop_gap_samples, recv_block_samples
                 ):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns}\n")
             else:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
-                for idx, delay_ns, delay_centered_ns in zip(delta_record_counts, delta_samples, delay_stat_samples):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples):
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
         print(f"plot=data_saved ({csv_path})")
         if clock_sync_sample_rows:
             clock_sync_base = f"clock_sync_client_{args.client_id}"
@@ -1018,23 +1477,46 @@ def run_client(args):
                 handle.write(
                     "sample_idx,t1_ns,t2_ns,t3_ns,t4_ns,"
                     "master_to_slave_ns,slave_to_master_ns,offset_ns,path_delay_ns,"
-                    "clock_offset_mean_ns,clock_sync_path_delay_mean_ns\n"
+                    "t2_kernel_timestamp,t4_kernel_timestamp,"
+                    "used_for_offset,used_for_best_path,clock_sync_method,"
+                    "clock_sync_protocol,clock_sync_kernel_timestamp,"
+                    "clock_sync_kernel_timestamp_received,clock_sync_kernel_timestamp_fallback,"
+                    "clock_sync_t2_kernel_timestamp_received,clock_sync_t2_kernel_timestamp_fallback,"
+                    "clock_sync_t4_kernel_timestamp_received,clock_sync_t4_kernel_timestamp_fallback,"
+                    "clock_offset_final_ns,clock_offset_mean_ns,clock_offset_median_ns,"
+                    "clock_offset_best_path_median_ns,clock_offset_std_ns,clock_offset_mad_ns,"
+                    "clock_sync_path_delay_final_ns,clock_sync_path_delay_mean_ns,"
+                    "clock_sync_path_delay_min_ns,clock_sync_path_delay_median_ns,"
+                    "clock_sync_path_delay_p95_ns,clock_sync_path_delay_best_median_ns,"
+                    "clock_sync_negative_or_suspicious,sync_quality\n"
                 )
-                for (
-                    sample_number,
-                    t1_ns,
-                    t2_ns,
-                    t3_ns,
-                    t4_ns,
-                    master_to_slave_ns,
-                    slave_to_master_ns,
-                    offset_ns,
-                    mean_path_delay_ns,
-                ) in clock_sync_sample_rows:
+                for row in clock_sync_sample_rows:
                     handle.write(
-                        f"{sample_number},{t1_ns},{t2_ns},{t3_ns},{t4_ns},"
-                        f"{master_to_slave_ns},{slave_to_master_ns},{offset_ns},{mean_path_delay_ns},"
-                        f"{clock_offset_ns},{clock_sync_path_delay_ns}\n"
+                        f"{row['sample_idx']},{row['t1_ns']},{row['t2_ns']},{row['t3_ns']},{row['t4_ns']},"
+                        f"{row['master_to_slave_ns']},{row['slave_to_master_ns']},{row['offset_ns']},{row['path_delay_ns']},"
+                        f"{1 if row.get('t2_kernel_timestamp') else 0},{1 if row.get('t4_kernel_timestamp') else 0},"
+                        f"{1 if row['used_for_offset'] else 0},{1 if row['used_for_best_path'] else 0},"
+                        f"{clock_sync_stats['clock_sync_method']},"
+                        f"{clock_sync_stats['clock_sync_protocol']},"
+                        f"{1 if clock_sync_stats['clock_sync_kernel_timestamp'] else 0},"
+                        f"{clock_sync_stats['clock_sync_kernel_timestamp_received']},"
+                        f"{clock_sync_stats['clock_sync_kernel_timestamp_fallback']},"
+                        f"{clock_sync_stats['clock_sync_t2_kernel_timestamp_received']},"
+                        f"{clock_sync_stats['clock_sync_t2_kernel_timestamp_fallback']},"
+                        f"{clock_sync_stats['clock_sync_t4_kernel_timestamp_received']},"
+                        f"{clock_sync_stats['clock_sync_t4_kernel_timestamp_fallback']},"
+                        f"{clock_offset_ns},{clock_sync_stats['clock_offset_mean_ns']},"
+                        f"{clock_sync_stats['clock_offset_median_ns']},"
+                        f"{clock_sync_stats['clock_offset_best_path_median_ns']},"
+                        f"{clock_sync_stats['clock_offset_std_ns']:.6f},"
+                        f"{clock_sync_stats['clock_offset_mad_ns']},"
+                        f"{clock_sync_path_delay_ns},{clock_sync_stats['clock_sync_path_delay_mean_ns']},"
+                        f"{clock_sync_stats['clock_sync_path_delay_min_ns']},"
+                        f"{clock_sync_stats['clock_sync_path_delay_median_ns']},"
+                        f"{clock_sync_stats['clock_sync_path_delay_p95_ns']},"
+                        f"{clock_sync_stats['clock_sync_path_delay_best_median_ns']},"
+                        f"{1 if clock_sync_stats['clock_sync_negative_or_suspicious'] else 0},"
+                        f"{clock_sync_stats['sync_quality']}\n"
                     )
             print(f"clock_sync=data_saved ({clock_sync_path})")
         if args.json_output:
@@ -1042,8 +1524,14 @@ def run_client(args):
             os.makedirs(json_dir, exist_ok=True)
             json_path = os.path.join(json_dir, f"{base}{suffix}.json")
             json_samples = []
-            for count_idx, delay_ns, delay_centered_ns, w_swap_raw, werner, sample in zip(
-                delta_record_counts, delta_samples, delay_stat_samples, werner_raw_samples, werner_samples, sample_msgs
+            for count_idx, delay_ns, delay_centered_ns, delay_physical_ns, w_swap_raw, werner, sample in zip(
+                delta_record_counts,
+                delta_samples,
+                delay_stat_samples,
+                delay_physical_samples,
+                werner_raw_samples,
+                werner_samples,
+                sample_msgs,
             ):
                 msg = sample[2] if sample else (0, 0, 0, 0.0)
                 json_samples.append(
@@ -1052,6 +1540,7 @@ def run_client(args):
                         "delay_ns": int(delay_ns),
                         "delay_center_ns": int(delay_center_ns),
                         "delay_centered_ns": int(delay_centered_ns),
+                        "delay_physical_ns": int(delay_physical_ns),
                         "clock_offset_ns": int(clock_offset_ns),
                         "clock_sync_path_delay_ns": int(clock_sync_path_delay_ns),
                         "ts_emit_ns": int(msg[0]),
@@ -1074,6 +1563,13 @@ def run_client(args):
                 "udp_lost_est": int(udp_lost_est),
                 "clock_offset_ns": int(clock_offset_ns),
                 "clock_sync_path_delay_ns": int(clock_sync_path_delay_ns),
+                "clock_sync_warmup": int(clock_sync_warmup),
+                "clock_sync": {
+                    **clock_sync_stats,
+                    "clock_offset_final_ns": int(clock_offset_ns),
+                    "clock_sync_path_delay_final_ns": int(clock_sync_path_delay_ns),
+                },
+                "sync_quality": clock_sync_stats["sync_quality"],
                 "kernel_timestamp": bool(kernel_timestamp_enabled),
                 "kernel_timestamp_received": int(kernel_timestamp_received),
                 "kernel_timestamp_fallback": int(kernel_timestamp_fallback),
@@ -1116,6 +1612,17 @@ def run_client(args):
             print(f"udp_lost_est={udp_lost_est}")
         print(f"clock_offset_ns={clock_offset_ns}")
         print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
+        print(f"clock_sync_warmup={clock_sync_warmup}")
+        print(f"clock_sync_method={clock_sync_stats['clock_sync_method']}")
+        print(f"clock_sync_protocol={clock_sync_stats['clock_sync_protocol']}")
+        print(f"clock_sync_kernel_timestamp={clock_sync_stats['clock_sync_kernel_timestamp']}")
+        print(f"clock_sync_kernel_timestamp_received={clock_sync_stats['clock_sync_kernel_timestamp_received']}")
+        print(f"clock_sync_kernel_timestamp_fallback={clock_sync_stats['clock_sync_kernel_timestamp_fallback']}")
+        print(f"clock_sync_t2_kernel_timestamp_received={clock_sync_stats['clock_sync_t2_kernel_timestamp_received']}")
+        print(f"clock_sync_t2_kernel_timestamp_fallback={clock_sync_stats['clock_sync_t2_kernel_timestamp_fallback']}")
+        print(f"clock_sync_t4_kernel_timestamp_received={clock_sync_stats['clock_sync_t4_kernel_timestamp_received']}")
+        print(f"clock_sync_t4_kernel_timestamp_fallback={clock_sync_stats['clock_sync_t4_kernel_timestamp_fallback']}")
+        print(f"sync_quality={clock_sync_stats['sync_quality']}")
         print(f"delay_center_ns={delay_center_ns}")
         print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
         print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)
@@ -1142,6 +1649,17 @@ def run_client(args):
         print(f"udp_lost_est={udp_lost_est}")
     print(f"clock_offset_ns={clock_offset_ns}")
     print(f"clock_sync_path_delay_ns={clock_sync_path_delay_ns}")
+    print(f"clock_sync_warmup={clock_sync_warmup}")
+    print(f"clock_sync_method={clock_sync_stats['clock_sync_method']}")
+    print(f"clock_sync_protocol={clock_sync_stats['clock_sync_protocol']}")
+    print(f"clock_sync_kernel_timestamp={clock_sync_stats['clock_sync_kernel_timestamp']}")
+    print(f"clock_sync_kernel_timestamp_received={clock_sync_stats['clock_sync_kernel_timestamp_received']}")
+    print(f"clock_sync_kernel_timestamp_fallback={clock_sync_stats['clock_sync_kernel_timestamp_fallback']}")
+    print(f"clock_sync_t2_kernel_timestamp_received={clock_sync_stats['clock_sync_t2_kernel_timestamp_received']}")
+    print(f"clock_sync_t2_kernel_timestamp_fallback={clock_sync_stats['clock_sync_t2_kernel_timestamp_fallback']}")
+    print(f"clock_sync_t4_kernel_timestamp_received={clock_sync_stats['clock_sync_t4_kernel_timestamp_received']}")
+    print(f"clock_sync_t4_kernel_timestamp_fallback={clock_sync_stats['clock_sync_t4_kernel_timestamp_fallback']}")
+    print(f"sync_quality={clock_sync_stats['sync_quality']}")
     print(f"delay_center_ns={delay_center_ns}")
     print(f"state_in={fmt_state((args.client_id, args.werner_in, args.repeater_id))}")
     print_client_group("p50", percentile(delta_sorted, 0.50), percentile_inverse(w_sorted, 0.50), abs_delay_label)

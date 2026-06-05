@@ -1,0 +1,25 @@
+{
+  "role": "repeater",
+  "argv": ["./c_code/minimal_epr_fast_c", "repeater", "--werner-ar", "1", "--werner-br", "1", "--quiet", "--clock-sync", "--clock-sync-samples", "264", "--plot", "--plot-dir", "csv_docker_c_udp_sync264", "--cpu", "3", "--shared-send-timestamp", "--count-interval", "0.00005"],
+  "args": {
+    "count": 2000,
+    "listen_host_a": "0.0.0.0",
+    "listen_port_a": 7401,
+    "listen_host_b": "0.0.0.0",
+    "listen_port_b": 7402,
+    "data_protocol": "udp",
+    "send_mode": "burst",
+    "pace_mode": "sleep",
+    "shared_send_timestamp": true,
+    "count_interval": 5e-05,
+    "sock_buf": 65536,
+    "busy_poll_us": 25,
+    "cpu": 3,
+    "rt_priority": 50
+  },
+  "exchanges": 2000,
+  "csv_path": "csv_docker_c_udp_sync264/repeater_send_hist.csv",
+  "last_msg_a": {"ts_emit_ns": 1780651151589877314, "peer_id": 2, "correction_bits": 3, "w_swap": 1},
+  "last_msg_b": {"ts_emit_ns": 1780651151589877314, "peer_id": 1, "correction_bits": 3, "w_swap": 1},
+  "send_samples": [  ]
+}

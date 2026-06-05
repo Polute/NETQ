@@ -284,6 +284,8 @@ The C port now accepts the same key flags as the Python baseline:
 - `--kernel-timestamp`
 - `--json`, `--no-json`, `--json-dir`
 - `--sock-buf 65536` default on both repeater and client
+- `--clock-sync-method mean|median|best-path-median`
+- `--clock-sync-best-ratio`
 
 It also keeps the extra C-only diagnostic/control option:
 
@@ -326,7 +328,8 @@ Important current options:
 ```text
 --plot --plot-prefix PLOT_PREFIX --plot-dir PLOT_DIR
 --json / --no-json --json-dir JSON_DIR
---clock-sync --clock-sync-samples CLOCK_SYNC_SAMPLES
+--clock-sync --clock-sync-samples CLOCK_SYNC_SAMPLES --clock-sync-warmup CLOCK_SYNC_WARMUP
+--clock-sync-method {mean,median,best-path-median} --clock-sync-best-ratio CLOCK_SYNC_BEST_RATIO
 --clock-offset-ns CLOCK_OFFSET_NS
 --center-delay
 --data-protocol {udp,tcp}
@@ -345,11 +348,14 @@ Current C help includes:
 ```text
 Common: --count --quiet --plot --plot-dir --json/--no-json --json-dir
 Common: --cpu --rt-priority --sock-buf --busy-poll-us
-Common: --data-protocol udp|tcp --clock-sync --clock-sync-samples
+Common: --data-protocol udp|tcp --clock-sync --clock-sync-samples --clock-sync-warmup
+Common: --clock-sync-method mean|median|best-path-median --clock-sync-best-ratio
 Repeater: --shared-send-timestamp --count-interval --pace-mode --spin-margin-us
 Repeater: --send-mode burst|paced|ack --udp-ready-timeout
 Client: --clock-offset-ns --center-delay --udp-idle-timeout --kernel-timestamp
 ```
+
+Clock sync warmup defaults to `floor(0.05 * --clock-sync-samples)`, so `--clock-sync-samples 264` discards the first 13 sync samples. The default offset estimator is `best-path-median` with `--clock-sync-best-ratio 0.5`: after warmup, it keeps the 50% of sync samples with lowest path delay and uses the median offset from that subset. The CSV/JSON still store mean, median, best-path median, path-delay stats and `sync_quality`.
 
 ## Three Real Nodes
 
@@ -404,6 +410,8 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py clie
   --quiet \
   --clock-sync \
   --clock-sync-samples 264 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
   --plot \
   --plot-dir csv_3nodes_py_udp_sync264 \
   --data-protocol udp \
@@ -427,6 +435,8 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py clie
   --quiet \
   --clock-sync \
   --clock-sync-samples 264 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
   --plot \
   --plot-dir csv_3nodes_py_udp_sync264 \
   --data-protocol udp \
@@ -482,6 +492,8 @@ sudo ./c_code/minimal_epr_fast_c client \
   --quiet \
   --clock-sync \
   --clock-sync-samples 264 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
   --plot \
   --plot-dir csv_3nodes_c_udp_sync264 \
   --data-protocol udp \
@@ -505,6 +517,8 @@ sudo ./c_code/minimal_epr_fast_c client \
   --quiet \
   --clock-sync \
   --clock-sync-samples 264 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
   --plot \
   --plot-dir csv_3nodes_c_udp_sync264 \
   --data-protocol udp \
