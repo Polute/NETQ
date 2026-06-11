@@ -174,6 +174,49 @@ def default_json_dir(plot_dir):
     return os.path.join(parent, json_base) if parent else json_base
 
 
+def sudo_output_owner():
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid is None or gid is None:
+        return None
+    try:
+        return int(uid), int(gid)
+    except ValueError:
+        return None
+
+
+def chown_output_path(path):
+    owner = sudo_output_owner()
+    if owner is None:
+        return
+    try:
+        os.chown(path, owner[0], owner[1])
+    except OSError:
+        pass
+
+
+def chown_output_ancestors(path):
+    owner = sudo_output_owner()
+    if owner is None:
+        return
+    abs_path = os.path.abspath(path)
+    roots = [os.path.abspath(os.getcwd()), os.path.abspath("/tmp")]
+    for root in roots:
+        if abs_path == root or not abs_path.startswith(root + os.sep):
+            continue
+        rel_path = os.path.relpath(abs_path, root)
+        current = root
+        for part in rel_path.split(os.sep):
+            current = os.path.join(current, part)
+            chown_output_path(current)
+        break
+
+
+def ensure_output_dir(directory):
+    os.makedirs(directory, exist_ok=True)
+    chown_output_ancestors(directory)
+
+
 def enable_low_latency_socket(sock, sock_buf=0, busy_poll_us=0):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -1089,7 +1132,7 @@ def run_repeater(args):
                 gc.enable()
 
     if args.plot:
-        os.makedirs(args.plot_dir, exist_ok=True)
+        ensure_output_dir(args.plot_dir)
         base = args.plot_prefix
         suffix = ""
         idx = 1
@@ -1108,10 +1151,11 @@ def run_repeater(args):
                 handle.write("count_idx\n")
                 for count_idx in range(1, count + 1):
                     handle.write(f"{count_idx}\n")
+        chown_output_path(csv_path)
         print(f"repeater_plot=data_saved ({csv_path})")
         if args.json_output:
             json_dir = args.json_dir or default_json_dir(args.plot_dir)
-            os.makedirs(json_dir, exist_ok=True)
+            ensure_output_dir(json_dir)
             json_path = os.path.join(json_dir, f"{base}{suffix}.json")
             payload = {
                 "role": "repeater",
@@ -1166,6 +1210,7 @@ def run_repeater(args):
             with open(json_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
                 handle.write("\n")
+            chown_output_path(json_path)
             print(f"repeater_json=data_saved ({json_path})")
 
     if not args.quiet:
@@ -1450,7 +1495,7 @@ def run_client(args):
     signed_delay_label = "signed_centered_repeater_to_client" if args.center_delay else "signed_repeater_to_client"
 
     if args.plot:
-        os.makedirs(args.plot_dir, exist_ok=True)
+        ensure_output_dir(args.plot_dir)
         base = f"{args.plot_prefix}_{args.client_id}"
         suffix = ""
         idx = 1
@@ -1469,6 +1514,7 @@ def run_client(args):
                 handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
                 for idx, delay_ns, delay_centered_ns, delay_physical_ns in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples):
                     handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
+        chown_output_path(csv_path)
         print(f"plot=data_saved ({csv_path})")
         if clock_sync_sample_rows:
             clock_sync_base = f"clock_sync_client_{args.client_id}"
@@ -1518,10 +1564,11 @@ def run_client(args):
                         f"{1 if clock_sync_stats['clock_sync_negative_or_suspicious'] else 0},"
                         f"{clock_sync_stats['sync_quality']}\n"
                     )
+            chown_output_path(clock_sync_path)
             print(f"clock_sync=data_saved ({clock_sync_path})")
         if args.json_output:
             json_dir = args.json_dir or default_json_dir(args.plot_dir)
-            os.makedirs(json_dir, exist_ok=True)
+            ensure_output_dir(json_dir)
             json_path = os.path.join(json_dir, f"{base}{suffix}.json")
             json_samples = []
             for count_idx, delay_ns, delay_centered_ns, delay_physical_ns, w_swap_raw, werner, sample in zip(
@@ -1597,6 +1644,7 @@ def run_client(args):
             with open(json_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
                 handle.write("\n")
+            chown_output_path(json_path)
             print(f"json=data_saved ({json_path})")
 
     if args.quiet:

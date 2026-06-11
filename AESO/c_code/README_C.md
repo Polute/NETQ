@@ -1,244 +1,64 @@
-# Minimal EPR Fast in C
+# Minimal EPR Fast C Port
 
-This directory contains the C port of `../minimal_epr_fast.py`.
-It is meant to run the same local experiments without depending on the Python runtime.
+This directory contains the C implementation of `../minimal_epr_fast.py`.
 
-Updated 2026-06-03: for the Docker/Python/C baseline commands, use
-`../README_DOCKER_AESO_2026-06-03.md`. The C binary now also supports
-`--shared-send-timestamp`, `--pace-mode sleep|spin|hybrid`,
-`--spin-margin-us`, `--kernel-timestamp`, `--json/--no-json`, and
-`--json-dir`.
+The C binary is used to compare the Python implementation against a lower
+runtime-overhead version while keeping the same experiment structure:
 
-## Layout
+- one repeater and two clients;
+- TCP control sockets;
+- UDP or TCP data messages;
+- PTP-like clock synchronization over TCP or UDP;
+- Linux `SO_TIMESTAMPNS` kernel receive timestamps for UDP clock sync;
+- Linux `SO_TIMESTAMPNS` kernel receive timestamps for UDP data;
+- CSV and JSON output;
+- shared swap timestamp for the two data notifications;
+- paced/spin sending.
 
-```text
-AESO/c_code/
-  minimal_epr_fast.c      C source
-  minimal_epr_fast_c      compiled binary
-  README_C.md             this file
-  csv_*                   C experiment CSV folders
-  plots_*                 C plot folders, if generated
-```
+For the full experiment description and the recommended Python/C commands, see
+`../README.md`.
 
 ## Build
 
-From this directory:
+Build from the AESO root:
 
 ```bash
-cd /home/giicc/NETQ/AESO/c_code
-gcc -O3 -Wall -Wextra -pthread -o minimal_epr_fast_c minimal_epr_fast.c -lm
+cd ~/AESO_opt
+
+gcc -O3 -Wall -Wextra -pthread \
+  -o c_code/minimal_epr_fast_c \
+  c_code/minimal_epr_fast.c \
+  -lm
 ```
 
-If you run inside the Ubuntu 22.04 Docker container, compile inside that same
-container. A binary compiled on a newer host can fail in Ubuntu 22.04 with
-`GLIBC_2.38 not found`.
+Build on an Ubuntu 22.04-compatible system or inside the Ubuntu 22.04 Docker
+container. If the binary is compiled on a newer host, the remote Ubuntu 22.04
+machines may fail with:
 
-The binary is:
-
-```bash
-/home/giicc/NETQ/AESO/c_code/minimal_epr_fast_c
+```text
+GLIBC_2.38 not found
 ```
 
-## What This Compares
+## Recommended C run
 
-The C binary keeps the same core structure as the Python script:
+Current best C configuration:
 
-- one `repeater` and two `client` processes;
-- TCP control channel;
-- data over `--data-protocol udp` or `--data-protocol tcp`;
-- send mode with `--send-mode burst|paced|ack`;
-- CSV output with `--plot --plot-dir ...`;
-- JSON output with `--plot --json --json-dir ...`;
-- Linux UDP receive timestamps with client-side `--kernel-timestamp`;
-- non-parallel shared A/B timestamps with repeater-side `--shared-send-timestamp`;
-- pacing with `--pace-mode sleep|spin|hybrid`;
-- CPU pinning with `--cpu`;
-- real-time scheduling by default with `--rt-priority 50`, matching Python.
+- `--data-protocol udp`;
+- `--clock-sync udp`;
+- `--clock-sync-samples 264`;
+- `--clock-sync-kernel-timestamp`;
+- client-side `--kernel-timestamp`;
+- `--sock-buf 65536`;
+- `--busy-poll-us 25`;
+- repeater-side `--send-mode paced`;
+- repeater-side `--count-interval 0.00005`;
+- repeater-side `--pace-mode spin`;
+- `--shared-send-timestamp`.
 
-If C is much faster than Python, the bottleneck is probably Python/runtime scheduling.
-If C behaves similarly, the issue is more likely the PC, VM, kernel, buffers, scheduler, or the test structure.
+See `../README.md` for the exact three-node commands.
 
-## Send Modes
+## Permissions
 
-`--send-mode burst` is the default. The repeater sends all messages as fast as possible.
-Use it to stress queues, buffers, and scheduling.
-
-`--send-mode paced` uses `--count-interval` to space rounds:
-
-```bash
---send-mode paced --count-interval 0.0001
-```
-
-`--send-mode ack` waits for an ACK from both clients before moving to the next `count`.
-Use it to measure without inter-round queue buildup. It lowers throughput, but gives a cleaner latency measurement.
-
-## UDP Local Burst
-
-Terminal 1, repeater:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c repeater \
-  --listen-host-a 127.0.0.1 \
-  --listen-port-a 7401 \
-  --listen-host-b 127.0.0.1 \
-  --listen-port-b 7402 \
-  --werner-ar 1 \
-  --werner-br 1 \
-  --quiet \
-  --data-protocol udp \
-  --send-mode burst \
-  --plot \
-  --plot-dir csv_local_udp_c \
-  --accept-timeout 120 \
-  --cpu 3
-```
-
-Terminal 2, client 1:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c client \
-  --repeater-host 127.0.0.1 \
-  --repeater-port 7401 \
-  --client-id 1 \
-  --quiet \
-  --cpu 5 \
-  --plot \
-  --plot-dir csv_local_udp_c \
-  --data-protocol udp \
-  --send-mode burst
-```
-
-Terminal 3, client 2:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c client \
-  --repeater-host 127.0.0.1 \
-  --repeater-port 7402 \
-  --client-id 2 \
-  --quiet \
-  --cpu 7 \
-  --plot \
-  --plot-dir csv_local_udp_c \
-  --data-protocol udp \
-  --send-mode burst
-```
-
-## UDP Local ACK
-
-Use the same three UDP commands, changing:
-
-```bash
---send-mode burst
-```
-
-to:
-
-```bash
---send-mode ack
-```
-
-and use a separate output folder, for example:
-
-```bash
---plot-dir csv_local_udp_c_ack
-```
-
-## TCP Local Burst
-
-Same setup, changing only protocol and output folder.
-
-Terminal 1, repeater:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c repeater \
-  --listen-host-a 127.0.0.1 \
-  --listen-port-a 7401 \
-  --listen-host-b 127.0.0.1 \
-  --listen-port-b 7402 \
-  --werner-ar 1 \
-  --werner-br 1 \
-  --quiet \
-  --data-protocol tcp \
-  --send-mode burst \
-  --plot \
-  --plot-dir csv_local_tcp_c \
-  --accept-timeout 120 \
-  --cpu 3
-```
-
-Terminal 2, client 1:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c client \
-  --repeater-host 127.0.0.1 \
-  --repeater-port 7401 \
-  --client-id 1 \
-  --quiet \
-  --cpu 5 \
-  --plot \
-  --plot-dir csv_local_tcp_c \
-  --data-protocol tcp \
-  --send-mode burst
-```
-
-Terminal 3, client 2:
-
-```bash
-cd /home/giicc/NETQ/AESO/c_code
-
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc ./minimal_epr_fast_c client \
-  --repeater-host 127.0.0.1 \
-  --repeater-port 7402 \
-  --client-id 2 \
-  --quiet \
-  --cpu 7 \
-  --plot \
-  --plot-dir csv_local_tcp_c \
-  --data-protocol tcp \
-  --send-mode burst
-```
-
-## TCP Local ACK
-
-Use the same three TCP commands, changing:
-
-```bash
---send-mode burst
-```
-
-to:
-
-```bash
---send-mode ack
-```
-
-and use a separate output folder, for example:
-
-```bash
---plot-dir csv_local_tcp_c_ack
-```
-
-## Running Without Sudo
-
-The C binary accepts:
-
-```bash
---rt-priority -1
-```
-
-This disables `SCHED_FIFO`. The commands above do not use it because they reproduce the Python default, where `--rt-priority` is `50`.
-
-## CSV Permissions
-
-When the binary is run with `sudo`, CSV files and the final `--plot-dir` directory are changed back to the original user detected through `SUDO_UID` and `SUDO_GID`.
-That makes the generated files removable without `sudo`.
+When the binary is run with `sudo`, generated CSV/JSON files are changed back to
+the original user when `SUDO_UID` and `SUDO_GID` are available. This keeps output
+folders removable without `sudo`.

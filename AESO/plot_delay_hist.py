@@ -1,8 +1,74 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import json
 import statistics
 import os
+
+
+def sudo_output_owner():
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid is None or gid is None:
+        return None
+    try:
+        return int(uid), int(gid)
+    except ValueError:
+        return None
+
+
+def chown_output_path(path):
+    owner = sudo_output_owner()
+    if owner is None:
+        return
+    try:
+        os.chown(path, owner[0], owner[1])
+    except OSError:
+        pass
+
+
+def chown_output_ancestors(path):
+    owner = sudo_output_owner()
+    if owner is None:
+        return
+    abs_path = os.path.abspath(path)
+    roots = [os.path.abspath(os.getcwd()), os.path.abspath("/tmp")]
+    for root in roots:
+        if abs_path == root or not abs_path.startswith(root + os.sep):
+            continue
+        rel_path = os.path.relpath(abs_path, root)
+        current = root
+        for part in rel_path.split(os.sep):
+            current = os.path.join(current, part)
+            chown_output_path(current)
+        break
+
+
+def ensure_output_dir(directory):
+    os.makedirs(directory, exist_ok=True)
+    chown_output_ancestors(directory)
+
+
+def savefig_owned(plt, path, **kwargs):
+    plt.savefig(path, **kwargs)
+    chown_output_path(path)
+
+
+NODE_INFO = {
+    "223": {
+        "name": "CCS/CEDINT",
+        "link": "Rectorado -> CCS/CEDINT",
+        "distance": "23.3 km",
+        "loss": "6.6 dB",
+    },
+    "226": {"name": "Rectorado", "link": "Repeater / Rectorado", "distance": "-", "loss": "-"},
+    "227": {
+        "name": "Teleco/ETSIT",
+        "link": "Rectorado -> Teleco/ETSIT",
+        "distance": "1.9 km",
+        "loss": "2.3 dB",
+    },
+}
 
 
 def load_delays(csv_path):
@@ -54,19 +120,67 @@ def load_plot_series(csv_path):
             },
         ]
 
-    if {"count_idx", "delay_ns"}.issubset(fieldnames):
-        return [
-            {
-                "kind": "delay",
-                "suffix": "",
-                "title": "delay",
-                "ylabel": "delay (us)",
-                "hist_xlabel": "delay (us)",
-                "x_label": "count",
-                "x": [int(row["count_idx"]) for row in rows],
-                "y": [float(row["delay_ns"]) / 1000.0 for row in rows],
-            }
+    if "count_idx" in fieldnames:
+        series_defs = [
+            ("delay_ns", "", "delay", "delay (us)", "delay (us)"),
+            (
+                "final_e2e_via_r2_ns",
+                "final_e2e_via_r2",
+                "final e2e via R2 clock",
+                "delay (us)",
+                "delay (us)",
+            ),
+            (
+                "stage2_link_delay_ns",
+                "stage2_link_delay",
+                "stage2 link delay",
+                "delay (us)",
+                "delay (us)",
+            ),
+            (
+                "stage1_delay_ns",
+                "stage1_delay",
+                "stage1 link delay",
+                "delay (us)",
+                "delay (us)",
+            ),
+            ("send_a_block_ns", "send_a_block", "send A block", "time (us)", "time (us)"),
+            ("send_b_block_ns", "send_b_block", "send B block", "time (us)", "time (us)"),
+            ("send_gap_ab_ns", "send_gap_ab", "send gap A-B", "time (us)", "time (us)"),
+            ("send_alice_block_ns", "send_alice_block", "send Alice block", "time (us)", "time (us)"),
+            ("send_r2_block_ns", "send_r2_block", "send R2 block", "time (us)", "time (us)"),
+            ("send_gap_ns", "send_gap", "send gap", "time (us)", "time (us)"),
         ]
+        series_list = []
+        for column, suffix, title, ylabel, hist_xlabel in series_defs:
+            if column not in fieldnames:
+                continue
+            x_values = []
+            y_values = []
+            for row in rows:
+                value = row.get(column)
+                if value in (None, ""):
+                    continue
+                try:
+                    x_values.append(int(row["count_idx"]))
+                    y_values.append(float(value) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
+            if not x_values:
+                continue
+            series_list.append(
+                {
+                    "kind": "delay",
+                    "suffix": suffix,
+                    "title": title,
+                    "ylabel": ylabel,
+                    "hist_xlabel": hist_xlabel,
+                    "x_label": "count",
+                    "x": x_values,
+                    "y": y_values,
+                }
+            )
+        return series_list
 
     counts, delays_us = load_delays(csv_path)
     if not counts:
@@ -114,6 +228,278 @@ def read_clock_offset_info(csv_path):
     if mean_ns is None:
         return None
     return f"clock offset mean = {mean_ns / 1000.0:.3f} us"
+
+
+def safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * fraction
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] * (hi - pos) + ordered[hi] * (pos - lo)
+
+
+def detect_node_info(path):
+    parts = os.path.normpath(path).split(os.sep)
+    for part in parts:
+        if part in NODE_INFO:
+            return part, NODE_INFO[part]
+    return None, None
+
+
+def json_dir_from_csv_root(csv_root):
+    csv_root = os.path.normpath(csv_root)
+    parent = os.path.dirname(csv_root)
+    name = os.path.basename(csv_root)
+    if name == "csv":
+        json_name = "json"
+    elif name.startswith("csv_"):
+        json_name = "json_" + name[len("csv_") :]
+    else:
+        return None
+    return os.path.join(parent, json_name) if parent else json_name
+
+
+def equivalent_json_path(csv_path, csv_root):
+    json_root = json_dir_from_csv_root(csv_root)
+    if not json_root:
+        return None
+
+    rel_dir = os.path.relpath(os.path.dirname(csv_path), csv_root)
+    if rel_dir == ".":
+        rel_dir = ""
+    name = os.path.splitext(os.path.basename(csv_path))[0]
+    if name.startswith("clock_sync_client_"):
+        name = "delay_hist_" + name[len("clock_sync_") :]
+    elif name.startswith("clock_sync_deos_"):
+        raw_name = name[len("clock_sync_") :]
+        run_suffix = ""
+        raw_parts = raw_name.rsplit("_", 1)
+        if len(raw_parts) == 2 and raw_parts[1].isdigit():
+            raw_name = raw_parts[0]
+            run_suffix = "_" + raw_parts[1]
+        for suffix in ("_r1", "_r2", "_alice", "_bob"):
+            if raw_name.endswith(suffix):
+                raw_name = raw_name[: -len(suffix)]
+                break
+        name = raw_name + run_suffix
+    candidate = os.path.join(json_root, rel_dir, f"{name}.json")
+    if os.path.exists(candidate):
+        return candidate
+
+    rel_parts = [] if not rel_dir else rel_dir.split(os.sep)
+    role_name = rel_parts[0] if rel_parts else None
+    deos_json_base = {
+        "r1": "deos_r1_send_hist",
+        "r2": "deos_r2_hist",
+        "alice": "deos_alice_hist",
+        "bob": "deos_bob_hist",
+    }.get(role_name)
+    if deos_json_base:
+        suffix = ""
+        for stage_prefix in (
+            "00_r1_swap_start",
+            "01_r1_to_r2_aeso",
+            "01_r1_to_alice_aeso",
+            "02_r2_to_alice_aeso",
+            "01_r2_to_bob_aeso",
+            "03_r1_initial_to_r2_alice_sum",
+            "02_r1_initial_to_r2_bob_sum",
+            "03_summary_final_r1_to_alice",
+            "02_summary_final_r1_to_bob",
+        ):
+            if name == stage_prefix:
+                suffix = ""
+                break
+            if name.startswith(stage_prefix + "_"):
+                suffix = name[len(stage_prefix) :]
+                break
+        candidate = os.path.join(json_root, rel_dir, f"{deos_json_base}{suffix}.json")
+        if os.path.exists(candidate):
+            return candidate
+
+    # Most current exports keep clock-sync CSVs next to delay CSVs, while the
+    # JSON is stored at the json root.
+    candidate = os.path.join(json_root, f"{name}.json")
+    return candidate if os.path.exists(candidate) else None
+
+
+def read_json_payload(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def format_bool(value):
+    if value is None:
+        return None
+    return "yes" if bool(value) else "no"
+
+
+def format_seconds(value):
+    number = safe_float(value)
+    if number is None:
+        return None
+    if number == 0:
+        return "0"
+    if abs(number) < 0.001:
+        return f"{number * 1_000_000:.0f} us"
+    if abs(number) < 1:
+        return f"{number * 1000:.3g} ms"
+    return f"{number:.3g} s"
+
+
+def series_summary(values):
+    if not values:
+        return None
+    mean_value = sum(values) / len(values)
+    return {
+        "mean": mean_value,
+        "p50": statistics.median(values),
+        "p95": percentile(values, 0.95),
+        "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+        "n": len(values),
+    }
+
+
+def build_run_info_box(csv_path, csv_root, series, y_values, json_payload, extra_info=None):
+    node_id, node_info = detect_node_info(csv_path)
+    args = (json_payload or {}).get("args", {})
+    clock_sync = (json_payload or {}).get("clock_sync", {})
+
+    lines = []
+    if node_info:
+        distance_bits = []
+        if node_info.get("distance") and node_info["distance"] != "-":
+            distance_bits.append(node_info["distance"])
+        if node_info.get("loss") and node_info["loss"] != "-":
+            distance_bits.append(node_info["loss"])
+        distance_text = f" ({', '.join(distance_bits)})" if distance_bits else ""
+        lines.append(f"node: {node_id} {node_info['name']}{distance_text}")
+        lines.append(f"link: {node_info['link']}")
+
+    experiment = os.path.basename(os.path.normpath(csv_root))
+    if experiment:
+        if experiment.startswith("csv_"):
+            experiment = experiment[len("csv_") :]
+        lines.append(f"exp: {experiment}")
+
+    role = (json_payload or {}).get("role") or args.get("role")
+    client_id = (json_payload or {}).get("client_id") or args.get("client_id")
+    file_base = os.path.splitext(os.path.basename(csv_path))[0]
+    if client_id is None:
+        for prefix in ("delay_hist_client_", "clock_sync_client_"):
+            if file_base.startswith(prefix):
+                client_id = file_base[len(prefix) :].split("_", 1)[0]
+                role = role or "client"
+                break
+    if role is None and file_base.startswith("repeater_send_hist"):
+        role = "repeater"
+
+    role_line = None
+    if role == "client" and client_id is not None:
+        role_line = f"client {client_id}"
+    elif role:
+        role_line = role
+
+    data_protocol = args.get("data_protocol") or (json_payload or {}).get("data_protocol")
+    experiment_lower = (experiment or "").lower()
+    if data_protocol is None:
+        if "udp" in experiment_lower:
+            data_protocol = "udp"
+        elif "tcp" in experiment_lower:
+            data_protocol = "tcp"
+    clock_protocol = (
+        args.get("clock_sync_protocol")
+        or clock_sync.get("clock_sync_protocol")
+        or ("on" if args.get("clock_sync") else None)
+    )
+    if clock_protocol is None:
+        if "sync_udp" in experiment_lower or "kernel" in experiment_lower:
+            clock_protocol = "udp"
+        elif "tcp_sync" in experiment_lower:
+            clock_protocol = "tcp"
+    proto_line = None
+    if data_protocol or clock_protocol:
+        proto_line = f"data/sync={data_protocol or '-'}/{clock_protocol or '-'}"
+    if role_line or proto_line:
+        lines.append(" | ".join(part for part in [role_line, proto_line] if part))
+
+    kernel_data = args.get("kernel_timestamp")
+    kernel_clock = args.get("clock_sync_kernel_timestamp")
+    if kernel_data is not None or kernel_clock is not None:
+        kernel_parts = []
+        if kernel_data:
+            kernel_parts.append("data")
+        if kernel_clock:
+            kernel_parts.append("sync")
+        if kernel_parts:
+            lines.append(f"kernel ts: {'+'.join(kernel_parts)}")
+        else:
+            lines.append("kernel ts: no")
+
+    pace_mode = args.get("pace_mode")
+    count_interval = args.get("count_interval")
+    pace_line = None
+    if pace_mode or count_interval not in (None, 0, 0.0):
+        pace_line = f"pace={pace_mode or '-'}@{format_seconds(count_interval) or '-'}"
+
+    cpu = args.get("cpu")
+    sock_buf = args.get("sock_buf")
+    busy_poll = args.get("busy_poll_us")
+    runtime_bits = []
+    if cpu is not None:
+        runtime_bits.append(f"cpu={cpu}")
+    if sock_buf is not None:
+        runtime_bits.append(f"buf={sock_buf}")
+    if busy_poll is not None:
+        runtime_bits.append(f"busy={busy_poll}us")
+    runtime_line = " ".join(runtime_bits) if runtime_bits else None
+    if pace_line or runtime_line:
+        lines.append(" | ".join(part for part in [pace_line, runtime_line] if part))
+
+    if series["kind"] == "delay":
+        stats = series_summary(y_values)
+        if stats:
+            lines.append(
+                "delay: "
+                f"mean={stats['mean']:.1f}us "
+                f"p50={stats['p50']:.1f}us "
+                f"p95={stats['p95']:.1f}us "
+                f"std={stats['std']:.1f}us"
+            )
+        lost = (json_payload or {}).get("udp_lost_est")
+        if lost is None:
+            lost = (json_payload or {}).get("udp_lost_est_final")
+        received = (json_payload or {}).get("udp_received")
+        if received is None:
+            received = (json_payload or {}).get("received_final")
+        if received is None:
+            received = (json_payload or {}).get("received_from_r1")
+        sync_quality = (json_payload or {}).get("sync_quality") or clock_sync.get("sync_quality")
+        if lost is not None or received is not None or sync_quality:
+            lines.append(f"udp: recv={received if received is not None else '-'} lost={lost if lost is not None else '-'} | sync={sync_quality or '-'}")
+
+    if extra_info:
+        lines.append(extra_info)
+
+    return "\n".join(line for line in lines if line)
 
 
 def equivalent_clock_sync_csv(csv_path):
@@ -248,10 +634,11 @@ def output_paths(csv_path, csv_root, plots_root, base, clock=False):
         plot_base_dir = os.path.join(plot_base_dir, "_clock")
     hist_path = os.path.join(plot_base_dir, "sec", f"{base}.png")
     seq_path = os.path.join(plot_base_dir, "counter", f"{base}_seq.png")
+    filtered_hist_path = os.path.join(plot_base_dir, "sec_filtered", f"{base}_filtered.png")
     filtered_path = os.path.join(plot_base_dir, "counter_filtered", f"{base}_seq_filtered.png")
     outliers_path = os.path.join(plot_base_dir, "counter_outliers", f"{base}_seq_outliers.png")
     udp_missing_path = os.path.join(plot_base_dir, "udp_missing", f"{base}_udp_missing.png")
-    return hist_path, seq_path, filtered_path, outliers_path, udp_missing_path
+    return hist_path, seq_path, filtered_hist_path, filtered_path, outliers_path, udp_missing_path
 
 
 def series_output_paths(csv_path, csv_root, plots_root, base, series):
@@ -339,7 +726,7 @@ def print_udp_count_report(csv_path, status):
 def write_udp_missing_plot(plt, path, csv_path, counts, status):
     if not status["valid"]:
         return False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_output_dir(os.path.dirname(path))
     count_set = set(counts)
     expected = status["expected"]
     present_counts = [count for count in expected if count in count_set]
@@ -361,7 +748,7 @@ def write_udp_missing_plot(plt, path, csv_path, counts, status):
     if present_counts or missing:
         plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    savefig_owned(plt, path, dpi=150)
     plt.close()
     return True
 
@@ -407,11 +794,15 @@ def add_reference_lines(plt, stats, orientation):
     if not stats:
         return
     if orientation == "vertical":
-        plt.axvline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
-        plt.axvline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
+        if "mean" in stats:
+            plt.axvline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
+        if "median" in stats:
+            plt.axvline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
     else:
-        plt.axhline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
-        plt.axhline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
+        if "mean" in stats:
+            plt.axhline(stats["mean"], color="tab:red", linewidth=0.9, linestyle="--", label="mean")
+        if "median" in stats:
+            plt.axhline(stats["median"], color="tab:green", linewidth=0.9, linestyle=":", label="median")
 
 
 def write_basic_plots(
@@ -436,7 +827,7 @@ def write_basic_plots(
     if reference_stats:
         plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(hist_path, dpi=150)
+    savefig_owned(plt, hist_path, dpi=150)
     plt.close()
 
     plt.figure(figsize=(8, 4))
@@ -449,7 +840,7 @@ def write_basic_plots(
     if reference_stats:
         plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(seq_path, dpi=150)
+    savefig_owned(plt, seq_path, dpi=150)
     plt.close()
 
 
@@ -469,7 +860,7 @@ def main():
     parser.add_argument(
         "--filtered-only",
         action="store_true",
-        help="Only write the filtered/outlier per-count plots, leaving existing plots untouched.",
+        help="Only write the filtered histogram and filtered/outlier per-count plots, leaving existing plots untouched.",
     )
     parser.add_argument(
         "--filter-threshold-us",
@@ -486,6 +877,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=50, help="Warmup counts ignored by the CSV/client.")
     parser.add_argument("--expected-count", type=int, default=2000, help="Expected final count_idx for UDP loss reports.")
     parser.add_argument("--udp-missing", action="store_true", help="Also write UDP missing-count plots.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing plot files without prompting.")
     args = parser.parse_args()
     if args.filtered_only:
         args.filtered = True
@@ -512,6 +904,7 @@ def main():
         if args.prefix:
             base = args.prefix
 
+        json_payload = read_json_payload(equivalent_json_path(csv_path, csv_root))
         is_clock_sync_csv = any(series["kind"] == "clock_sync" for series in series_list)
         show_clock_stats = file_base.startswith("clock_sync")
         clock_offset_info = None
@@ -523,7 +916,7 @@ def main():
             counts = series_list[0]["x"]
             udp_status = udp_count_status(counts, args.warmup, args.expected_count)
             print_udp_count_report(csv_path, udp_status)
-            _, _, _, _, udp_missing_path = output_paths(csv_path, csv_root, plots_root, base)
+            _, _, _, _, _, udp_missing_path = output_paths(csv_path, csv_root, plots_root, base)
             if not args.udp_missing:
                 pass
             elif not args.last or not os.path.exists(udp_missing_path):
@@ -535,24 +928,32 @@ def main():
         written = []
         for series in series_list:
             series_base = base if not series["suffix"] else f"{base}_{series['suffix']}"
-            hist_path, seq_path, filtered_path, outliers_path, _ = series_output_paths(
+            hist_path, seq_path, filtered_hist_path, filtered_path, outliers_path, _ = series_output_paths(
                 csv_path, csv_root, plots_root, base, series
             )
             x_values = series["x"]
             y_values = series["y"]
-            os.makedirs(os.path.dirname(hist_path), exist_ok=True)
-            os.makedirs(os.path.dirname(seq_path), exist_ok=True)
+            ensure_output_dir(os.path.dirname(hist_path))
+            ensure_output_dir(os.path.dirname(seq_path))
 
             if series["kind"] == "clock_sync":
                 clock_stats = series_stats(y_values) if show_clock_stats else None
                 clock_info = format_clock_stats(clock_stats)
+                info_text = build_run_info_box(
+                    csv_path,
+                    csv_root,
+                    series,
+                    y_values,
+                    json_payload,
+                    clock_info,
+                )
                 if args.last and os.path.exists(hist_path) and os.path.exists(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (already plotted)")
                     continue
-                if not args.last and not confirm_overwrite(hist_path):
+                if not args.last and not args.force and not confirm_overwrite(hist_path):
                     print(f"skip {csv_path} {series['suffix']} (no overwrite)")
                     continue
-                if not args.last and not confirm_overwrite(seq_path):
+                if not args.last and not args.force and not confirm_overwrite(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (no overwrite)")
                     continue
                 write_basic_plots(
@@ -564,32 +965,43 @@ def main():
                     series_base,
                     series,
                     args.bins,
-                    clock_info,
+                    info_text,
                     clock_stats,
                 )
                 written.extend([hist_path, seq_path])
                 continue
 
             if args.filtered:
-                os.makedirs(os.path.dirname(filtered_path), exist_ok=True)
-                os.makedirs(os.path.dirname(outliers_path), exist_ok=True)
+                ensure_output_dir(os.path.dirname(filtered_hist_path))
+                ensure_output_dir(os.path.dirname(filtered_path))
+                ensure_output_dir(os.path.dirname(outliers_path))
 
             if args.last:
                 if args.filtered_only:
-                    existing = [filtered_path, outliers_path]
+                    existing = [filtered_hist_path, filtered_path, outliers_path]
                 else:
                     existing = [hist_path, seq_path]
                     if args.filtered:
-                        existing.extend([filtered_path, outliers_path])
+                        existing.extend([filtered_hist_path, filtered_path, outliers_path])
                 if all(os.path.exists(path) for path in existing):
                     print(f"skip {csv_path} (already plotted)")
                     continue
-            elif not args.filtered_only:
+            elif not args.filtered_only and not args.force:
                 if not confirm_overwrite(hist_path) or not confirm_overwrite(seq_path):
                     print(f"skip {csv_path} (no overwrite)")
                     continue
 
             if not args.filtered_only:
+                info_text = build_run_info_box(
+                    csv_path,
+                    csv_root,
+                    series,
+                    y_values,
+                    json_payload,
+                    clock_offset_info,
+                )
+                delay_stats = series_summary(y_values)
+                delay_reference_stats = {"mean": delay_stats["mean"]} if delay_stats else None
                 write_basic_plots(
                     plt,
                     x_values,
@@ -599,9 +1011,19 @@ def main():
                     series_base,
                     series,
                     args.bins,
-                    clock_offset_info,
+                    info_text,
+                    delay_reference_stats,
                 )
                 written.extend([hist_path, seq_path])
+            else:
+                info_text = build_run_info_box(
+                    csv_path,
+                    csv_root,
+                    series,
+                    y_values,
+                    json_payload,
+                    clock_offset_info,
+                )
 
             if not args.filtered:
                 continue
@@ -615,14 +1037,60 @@ def main():
             kept_delays = [delay for _, delay in kept]
             outlier_counts = [count for count, _ in outliers]
             outlier_delays = [delay for _, delay in outliers]
+            filtered_stats = series_summary(kept_delays)
+            filter_info_lines = []
+            if clock_offset_info:
+                filter_info_lines.append(clock_offset_info)
+            filter_info_lines.append(
+                f"filter: <= {threshold_us:.1f}us kept={len(kept_delays)}/{len(y_values)} removed={len(outliers)}"
+            )
+            filtered_info_text = build_run_info_box(
+                csv_path,
+                csv_root,
+                series,
+                kept_delays,
+                json_payload,
+                "\n".join(filter_info_lines),
+            )
+
+            plt.figure(figsize=(8, 4))
+            plt.hist(kept_delays, bins=args.bins)
+            if filtered_stats:
+                plt.axvline(
+                    filtered_stats["mean"],
+                    color="tab:red",
+                    linewidth=0.9,
+                    linestyle="--",
+                    label="filtered mean",
+                )
+            plt.xlabel(series["hist_xlabel"])
+            plt.ylabel("count")
+            plt.title(f"{series['title']} histogram filtered ({series_base}, <= {threshold_us:.1f} us)")
+            add_info_box(plt, filtered_info_text)
+            if filtered_stats:
+                plt.legend(loc="upper right")
+            plt.tight_layout()
+            savefig_owned(plt, filtered_hist_path, dpi=150)
+            plt.close()
 
             plt.figure(figsize=(8, 4))
             plt.plot(kept_counts, kept_delays, linewidth=0.6)
+            if filtered_stats:
+                plt.axhline(
+                    filtered_stats["mean"],
+                    color="tab:red",
+                    linewidth=0.9,
+                    linestyle="--",
+                    label="filtered mean",
+                )
             plt.xlabel(series["x_label"])
             plt.ylabel(series["ylabel"])
             plt.title(f"{series['title']} per {series['x_label']} filtered ({series_base}, <= {threshold_us:.1f} us)")
+            add_info_box(plt, filtered_info_text)
+            if filtered_stats:
+                plt.legend(loc="upper right")
             plt.tight_layout()
-            plt.savefig(filtered_path, dpi=150)
+            savefig_owned(plt, filtered_path, dpi=150)
             plt.close()
 
             plt.figure(figsize=(8, 4))
@@ -630,15 +1098,24 @@ def main():
             if outliers:
                 plt.scatter(outlier_counts, outlier_delays, s=12, color="red", label="filtered out")
                 plt.axhline(threshold_us, color="red", linewidth=0.8, linestyle="--")
+            if filtered_stats:
+                plt.axhline(
+                    filtered_stats["mean"],
+                    color="tab:red",
+                    linewidth=0.9,
+                    linestyle="--",
+                    label="filtered mean",
+                )
             plt.xlabel(series["x_label"])
             plt.ylabel(series["ylabel"])
             plt.title(f"{series['title']} per {series['x_label']} with outliers ({series_base}, > {threshold_us:.1f} us)")
-            if outliers:
-                plt.legend()
+            add_info_box(plt, filtered_info_text)
+            if outliers or filtered_stats:
+                plt.legend(loc="upper right")
             plt.tight_layout()
-            plt.savefig(outliers_path, dpi=150)
+            savefig_owned(plt, outliers_path, dpi=150)
             plt.close()
-            written.extend([filtered_path, outliers_path])
+            written.extend([filtered_hist_path, filtered_path, outliers_path])
             print(f"{series_base}: filtered {len(outliers)} of {len(y_values)} samples above {threshold_us:.1f} us")
 
         if written:

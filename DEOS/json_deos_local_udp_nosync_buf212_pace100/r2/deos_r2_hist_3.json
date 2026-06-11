@@ -1,0 +1,141 @@
+{
+  "role": "deos_r2",
+  "csv_path": "csv_deos_local_udp_nosync_buf212_pace100/r2/01_r1_to_r2_aeso_3.csv",
+  "csv_paths": {
+    "r1_to_r2_aeso": "csv_deos_local_udp_nosync_buf212_pace100/r2/01_r1_to_r2_aeso_3.csv"
+  },
+  "exchanges": 2000,
+  "received_from_r1": 2000,
+  "udp_lost_est": 0,
+  "kernel_timestamp_received": 2000,
+  "kernel_timestamp_fallback": 0,
+  "clock_sync": {
+    "r1": {
+      "clock_sync_protocol": "none",
+      "clock_sync_kernel_timestamp": false,
+      "clock_sync_kernel_timestamp_received": 0,
+      "clock_sync_kernel_timestamp_fallback": 0,
+      "clock_sync_t2_kernel_timestamp_received": 0,
+      "clock_sync_t2_kernel_timestamp_fallback": 0,
+      "clock_sync_t4_kernel_timestamp_received": 0,
+      "clock_sync_t4_kernel_timestamp_fallback": 0,
+      "clock_sync_method": "disabled",
+      "clock_sync_warmup": 0,
+      "clock_sync_best_ratio": 0.5,
+      "clock_sync_used_samples": 0,
+      "clock_sync_best_path_samples": 0,
+      "clock_offset_mean_ns": 0,
+      "clock_offset_median_ns": 0,
+      "clock_offset_best_path_median_ns": 0,
+      "clock_offset_std_ns": 0.0,
+      "clock_offset_mad_ns": 0,
+      "clock_sync_path_delay_mean_ns": 0,
+      "clock_sync_path_delay_min_ns": 0,
+      "clock_sync_path_delay_median_ns": 0,
+      "clock_sync_path_delay_p95_ns": 0,
+      "clock_sync_path_delay_best_median_ns": 0,
+      "clock_offset_final_ns": 0,
+      "clock_sync_path_delay_final_ns": 0
+    }
+  },
+  "state_start": {
+    "left": {
+      "werner": 1.0,
+      "peer_id": 4
+    },
+    "right": {
+      "werner": null,
+      "peer_id": 2
+    }
+  },
+  "state_out": {
+    "left": {
+      "werner": 0.0,
+      "peer_id": null
+    },
+    "right": {
+      "werner": 0.0,
+      "peer_id": null
+    }
+  },
+  "metrics": {
+    "r1_to_r2_delay_ns": {
+      "p50": 6222,
+      "p90": 14384,
+      "p95": 15221,
+      "p99": 32644,
+      "mean": 9370,
+      "std": 7499.596817856791,
+      "min": 3541,
+      "max": 161423
+    },
+    "w_final_raw": {
+      "p50": 1.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "mean": 1.0,
+      "std": 0.0
+    }
+  },
+  "argv": [
+    "deos_fast.py",
+    "r2",
+    "--r1-host",
+    "127.0.0.1",
+    "--listen-host-a",
+    "127.0.0.1",
+    "--listen-host-b",
+    "127.0.0.1",
+    "--w56",
+    "1",
+    "--quiet",
+    "--plot",
+    "--plot-dir",
+    "csv_deos_local_udp_nosync_buf212_pace100",
+    "--cpu",
+    "7",
+    "--sock-buf",
+    "212992"
+  ],
+  "args": {
+    "role": "r2",
+    "count": 2000,
+    "cpu": 7,
+    "rt_priority": 50,
+    "sock_buf": 212992,
+    "busy_poll_us": 50,
+    "connect_timeout": 10.0,
+    "detect_timeout": 120.0,
+    "detect_interval": 0.02,
+    "accept_timeout": 120.0,
+    "udp_ready_timeout": 120.0,
+    "udp_idle_timeout": 5.0,
+    "clock_sync": false,
+    "clock_sync_samples": 264,
+    "clock_sync_warmup": null,
+    "clock_sync_method": "best-path-median",
+    "clock_sync_best_ratio": 0.5,
+    "clock_sync_kernel_timestamp": true,
+    "kernel_timestamp": true,
+    "quiet": true,
+    "plot": true,
+    "plot_dir": "csv_deos_local_udp_nosync_buf212_pace100",
+    "json_output": true,
+    "json_dir": null,
+    "diag": false,
+    "alice_id": 1,
+    "r1_id": 2,
+    "r2_id": 3,
+    "bob_id": 4,
+    "r1_host": "127.0.0.1",
+    "r1_port": 7602,
+    "listen_host_a": "127.0.0.1",
+    "listen_port_a": 7611,
+    "listen_host_b": "127.0.0.1",
+    "listen_port_b": 7612,
+    "w56": 1.0,
+    "plot_prefix": "deos_r2_hist"
+  },
+  "created_at_unix_ns": 1781174222290670135
+}
