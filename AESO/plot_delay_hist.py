@@ -121,36 +121,26 @@ def load_plot_series(csv_path):
         ]
 
     if "count_idx" in fieldnames:
-        series_defs = [
-            ("delay_ns", "", "delay", "delay (us)", "delay (us)"),
+        file_base = os.path.splitext(os.path.basename(csv_path))[0]
+        if file_base.startswith(
             (
-                "final_e2e_via_r2_ns",
-                "final_e2e_via_r2",
-                "final e2e via R2 clock",
-                "delay (us)",
-                "delay (us)",
-            ),
-            (
-                "stage2_link_delay_ns",
-                "stage2_link_delay",
-                "stage2 link delay",
-                "delay (us)",
-                "delay (us)",
-            ),
-            (
-                "stage1_delay_ns",
-                "stage1_delay",
-                "stage1 link delay",
-                "delay (us)",
-                "delay (us)",
-            ),
-            ("send_a_block_ns", "send_a_block", "send A block", "time (us)", "time (us)"),
-            ("send_b_block_ns", "send_b_block", "send B block", "time (us)", "time (us)"),
-            ("send_gap_ab_ns", "send_gap_ab", "send gap A-B", "time (us)", "time (us)"),
-            ("send_alice_block_ns", "send_alice_block", "send Alice block", "time (us)", "time (us)"),
-            ("send_r2_block_ns", "send_r2_block", "send R2 block", "time (us)", "time (us)"),
-            ("send_gap_ns", "send_gap", "send gap", "time (us)", "time (us)"),
-        ]
+                "03_r1_initial_to_r2_alice_sum",
+                "02_r1_initial_to_r2_bob_sum",
+                "03_summary_final_r1_to_alice",
+                "02_summary_final_r1_to_bob",
+            )
+        ):
+            series_defs = [("delay_ns", "", "total DEOS delay", "delay (us)", "delay (us)")]
+        else:
+            series_defs = [
+                ("delay_ns", "", "delay", "delay (us)", "delay (us)"),
+                ("send_a_block_ns", "send_a_block", "send A block", "time (us)", "time (us)"),
+                ("send_b_block_ns", "send_b_block", "send B block", "time (us)", "time (us)"),
+                ("send_gap_ab_ns", "send_gap_ab", "send gap A-B", "time (us)", "time (us)"),
+                ("send_alice_block_ns", "send_alice_block", "send Alice block", "time (us)", "time (us)"),
+                ("send_r2_block_ns", "send_r2_block", "send R2 block", "time (us)", "time (us)"),
+                ("send_gap_ns", "send_gap", "send gap", "time (us)", "time (us)"),
+            ]
         series_list = []
         for column, suffix, title, ylabel, hist_xlabel in series_defs:
             if column not in fieldnames:
@@ -442,7 +432,7 @@ def build_run_info_box(csv_path, csv_root, series, y_values, json_payload, extra
         lines.append(" | ".join(part for part in [role_line, proto_line] if part))
 
     kernel_data = args.get("kernel_timestamp")
-    kernel_clock = args.get("clock_sync_kernel_timestamp")
+    kernel_clock = args.get("clock_sync_kernel_timestamp") if args.get("clock_sync") else None
     if kernel_data is not None or kernel_clock is not None:
         kernel_parts = []
         if kernel_data:
@@ -768,6 +758,51 @@ def add_info_box(plt, text):
     )
 
 
+def add_external_header(plt, title, info_text):
+    fig = plt.gcf()
+    if info_text:
+        fig.text(
+            0.985,
+            0.995,
+            info_text,
+            va="top",
+            ha="right",
+            fontsize=7.5,
+            bbox={"boxstyle": "round,pad=0.16", "facecolor": "white", "alpha": 0.92, "edgecolor": "0.8"},
+        )
+    fig.text(0.03, 0.845, title, va="top", ha="left", fontsize=10)
+
+
+def compact_plot_title_base(base):
+    parts = [part for part in os.path.normpath(base).split(os.sep) if part not in ("", ".")]
+    for part in parts:
+        if part in {"alice", "bob", "r1", "r2"}:
+            return part
+    return os.path.basename(os.path.normpath(base))
+
+
+def format_plot_title(series_title, x_label, base):
+    return f"{series_title} per {x_label} ({compact_plot_title_base(base)})"
+
+
+def format_hist_title(series_title, base):
+    return f"{series_title} histogram ({compact_plot_title_base(base)})"
+
+
+def finish_plot(plt, path, title, info_text=None, overlap=False):
+    if overlap:
+        plt.title(title)
+        add_info_box(plt, info_text)
+        plt.tight_layout()
+    else:
+        add_external_header(plt, title, info_text)
+        line_count = len(info_text.splitlines()) if info_text else 0
+        top = 0.80 if line_count == 0 else min(0.80, 0.74 + 0.010 * line_count)
+        plt.tight_layout(rect=(0.0, 0.0, 1.0, top))
+    savefig_owned(plt, path, dpi=150)
+    plt.close()
+
+
 def series_stats(values):
     if not values:
         return None
@@ -816,32 +851,33 @@ def write_basic_plots(
     bins,
     info_text=None,
     reference_stats=None,
+    overlap=False,
+    plot_kind="all",
 ):
-    plt.figure(figsize=(8, 4))
-    plt.hist(y_values, bins=bins)
-    add_reference_lines(plt, reference_stats, "vertical")
-    plt.xlabel(series["hist_xlabel"])
-    plt.ylabel("count")
-    plt.title(f"{series['title']} histogram ({base})")
-    add_info_box(plt, info_text)
-    if reference_stats:
-        plt.legend(loc="upper right")
-    plt.tight_layout()
-    savefig_owned(plt, hist_path, dpi=150)
-    plt.close()
+    written = []
+    if plot_kind in ("all", "hist"):
+        plt.figure(figsize=(8, 4 if overlap else 4.6))
+        plt.hist(y_values, bins=bins)
+        add_reference_lines(plt, reference_stats, "vertical")
+        plt.xlabel(series["hist_xlabel"])
+        plt.ylabel("count")
+        if reference_stats:
+            plt.legend(loc="upper right")
+        finish_plot(plt, hist_path, format_hist_title(series["title"], base), info_text, overlap)
+        written.append(hist_path)
 
-    plt.figure(figsize=(8, 4))
-    plt.plot(x_values, y_values, linewidth=0.6)
-    add_reference_lines(plt, reference_stats, "horizontal")
-    plt.xlabel(series["x_label"])
-    plt.ylabel(series["ylabel"])
-    plt.title(f"{series['title']} per {series['x_label']} ({base})")
-    add_info_box(plt, info_text)
-    if reference_stats:
-        plt.legend(loc="upper right")
-    plt.tight_layout()
-    savefig_owned(plt, seq_path, dpi=150)
-    plt.close()
+    if plot_kind in ("all", "seq"):
+        plt.figure(figsize=(8, 4 if overlap else 4.6))
+        plt.plot(x_values, y_values, linewidth=0.6)
+        add_reference_lines(plt, reference_stats, "horizontal")
+        plt.xlabel(series["x_label"])
+        plt.ylabel(series["ylabel"])
+        if reference_stats:
+            plt.legend(loc="upper right")
+        finish_plot(plt, seq_path, format_plot_title(series["title"], series["x_label"], base), info_text, overlap)
+        written.append(seq_path)
+
+    return written
 
 
 def main():
@@ -878,6 +914,17 @@ def main():
     parser.add_argument("--expected-count", type=int, default=2000, help="Expected final count_idx for UDP loss reports.")
     parser.add_argument("--udp-missing", action="store_true", help="Also write UDP missing-count plots.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing plot files without prompting.")
+    parser.add_argument(
+        "--plot-kind",
+        choices=("all", "hist", "seq"),
+        default="all",
+        help="Limit normal plots to histogram, per-count sequence, or both.",
+    )
+    parser.add_argument(
+        "--overlap",
+        action="store_true",
+        help="Draw the metadata box inside the axes, preserving the previous plot layout.",
+    )
     args = parser.parse_args()
     if args.filtered_only:
         args.filtered = True
@@ -919,7 +966,7 @@ def main():
             _, _, _, _, _, udp_missing_path = output_paths(csv_path, csv_root, plots_root, base)
             if not args.udp_missing:
                 pass
-            elif not args.last or not os.path.exists(udp_missing_path):
+            elif args.force or not args.last or not os.path.exists(udp_missing_path):
                 if write_udp_missing_plot(plt, udp_missing_path, csv_path, counts, udp_status):
                     print(f"wrote {udp_missing_path}")
             else:
@@ -947,7 +994,7 @@ def main():
                     json_payload,
                     clock_info,
                 )
-                if args.last and os.path.exists(hist_path) and os.path.exists(seq_path):
+                if args.last and not args.force and os.path.exists(hist_path) and os.path.exists(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (already plotted)")
                     continue
                 if not args.last and not args.force and not confirm_overwrite(hist_path):
@@ -956,7 +1003,7 @@ def main():
                 if not args.last and not args.force and not confirm_overwrite(seq_path):
                     print(f"skip {csv_path} {series['suffix']} (no overwrite)")
                     continue
-                write_basic_plots(
+                new_paths = write_basic_plots(
                     plt,
                     x_values,
                     y_values,
@@ -967,8 +1014,10 @@ def main():
                     args.bins,
                     info_text,
                     clock_stats,
+                    args.overlap,
+                    args.plot_kind,
                 )
-                written.extend([hist_path, seq_path])
+                written.extend(new_paths)
                 continue
 
             if args.filtered:
@@ -976,7 +1025,7 @@ def main():
                 ensure_output_dir(os.path.dirname(filtered_path))
                 ensure_output_dir(os.path.dirname(outliers_path))
 
-            if args.last:
+            if args.last and not args.force:
                 if args.filtered_only:
                     existing = [filtered_hist_path, filtered_path, outliers_path]
                 else:
@@ -1002,7 +1051,7 @@ def main():
                 )
                 delay_stats = series_summary(y_values)
                 delay_reference_stats = {"mean": delay_stats["mean"]} if delay_stats else None
-                write_basic_plots(
+                new_paths = write_basic_plots(
                     plt,
                     x_values,
                     y_values,
@@ -1013,8 +1062,10 @@ def main():
                     args.bins,
                     info_text,
                     delay_reference_stats,
+                    args.overlap,
+                    args.plot_kind,
                 )
-                written.extend([hist_path, seq_path])
+                written.extend(new_paths)
             else:
                 info_text = build_run_info_box(
                     csv_path,
@@ -1053,7 +1104,7 @@ def main():
                 "\n".join(filter_info_lines),
             )
 
-            plt.figure(figsize=(8, 4))
+            plt.figure(figsize=(8, 4 if args.overlap else 4.6))
             plt.hist(kept_delays, bins=args.bins)
             if filtered_stats:
                 plt.axvline(
@@ -1065,15 +1116,17 @@ def main():
                 )
             plt.xlabel(series["hist_xlabel"])
             plt.ylabel("count")
-            plt.title(f"{series['title']} histogram filtered ({series_base}, <= {threshold_us:.1f} us)")
-            add_info_box(plt, filtered_info_text)
             if filtered_stats:
                 plt.legend(loc="upper right")
-            plt.tight_layout()
-            savefig_owned(plt, filtered_hist_path, dpi=150)
-            plt.close()
+            finish_plot(
+                plt,
+                filtered_hist_path,
+                f"{series['title']} histogram filtered ({compact_plot_title_base(series_base)}, <= {threshold_us:.1f} us)",
+                filtered_info_text,
+                args.overlap,
+            )
 
-            plt.figure(figsize=(8, 4))
+            plt.figure(figsize=(8, 4 if args.overlap else 4.6))
             plt.plot(kept_counts, kept_delays, linewidth=0.6)
             if filtered_stats:
                 plt.axhline(
@@ -1085,15 +1138,17 @@ def main():
                 )
             plt.xlabel(series["x_label"])
             plt.ylabel(series["ylabel"])
-            plt.title(f"{series['title']} per {series['x_label']} filtered ({series_base}, <= {threshold_us:.1f} us)")
-            add_info_box(plt, filtered_info_text)
             if filtered_stats:
                 plt.legend(loc="upper right")
-            plt.tight_layout()
-            savefig_owned(plt, filtered_path, dpi=150)
-            plt.close()
+            finish_plot(
+                plt,
+                filtered_path,
+                f"{series['title']} per {series['x_label']} filtered ({compact_plot_title_base(series_base)}, <= {threshold_us:.1f} us)",
+                filtered_info_text,
+                args.overlap,
+            )
 
-            plt.figure(figsize=(8, 4))
+            plt.figure(figsize=(8, 4 if args.overlap else 4.6))
             plt.plot(x_values, y_values, linewidth=0.6, label="all samples")
             if outliers:
                 plt.scatter(outlier_counts, outlier_delays, s=12, color="red", label="filtered out")
@@ -1108,13 +1163,15 @@ def main():
                 )
             plt.xlabel(series["x_label"])
             plt.ylabel(series["ylabel"])
-            plt.title(f"{series['title']} per {series['x_label']} with outliers ({series_base}, > {threshold_us:.1f} us)")
-            add_info_box(plt, filtered_info_text)
             if outliers or filtered_stats:
                 plt.legend(loc="upper right")
-            plt.tight_layout()
-            savefig_owned(plt, outliers_path, dpi=150)
-            plt.close()
+            finish_plot(
+                plt,
+                outliers_path,
+                f"{series['title']} per {series['x_label']} with outliers ({compact_plot_title_base(series_base)}, > {threshold_us:.1f} us)",
+                filtered_info_text,
+                args.overlap,
+            )
             written.extend([filtered_hist_path, filtered_path, outliers_path])
             print(f"{series_base}: filtered {len(outliers)} of {len(y_values)} samples above {threshold_us:.1f} us")
 
