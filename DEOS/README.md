@@ -94,71 +94,122 @@ samples, 5 percent sync warmup, and the best-path median estimator.
 
 ## Four-Node Commands
 
-Replace `<R1_HOST>` and `<R2_HOST>` with the reachable hostnames or addresses of R1 and R2.
+Recommended role mapping for the four-node run:
 
-Recommended role mapping:
+- R1: first repeater at CCS-Laboratorio, `192.168.0.223`.
+- Alice: endpoint at CAIT, `192.168.14.1`.
+- R2: second repeater at Rectorado, `192.168.0.226`.
+- Bob: endpoint at Teleco/ETSIT, `192.168.0.227`.
 
-- R1: first repeater.
-- R2: second repeater.
-- Alice: endpoint connected to R1 and R2.
-- Bob: endpoint connected to R1 for clock reference and to R2 for final data.
+Start R1 first and leave it waiting. Then start Alice, R2, and Bob in their own
+terminals. With `--clock-sync`, R1 waits for Alice, R2, and Bob-sync before
+serving the UDP PTP-like synchronization phase.
 
-Start R1 first. Then start Alice, R2, and Bob in their own terminals.
+This command set uses the best settings found in local and network tests so
+far: UDP data, UDP clock synchronization, kernel receive timestamps, explicit
+ports, larger socket buffers, busy polling, and R1 pacing at 100 us.
 
-### R1
+Output directories:
+
+```text
+csv_deos_4nodes_udp_kernel_pace100_buf212_sync
+json_deos_4nodes_udp_kernel_pace100_buf212_sync
+```
+
+### R1: first repeater, `192.168.0.223`
 
 ```bash
 cd ~/DEOS
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r1 \
   --listen-host-a 0.0.0.0 \
+  --listen-port-a 7601 \
   --listen-host-r2 0.0.0.0 \
+  --listen-port-r2 7602 \
   --listen-host-bob-sync 0.0.0.0 \
+  --listen-port-bob-sync 7603 \
   --w12 1 \
   --w34 1 \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --sock-buf 212992 \
+  --busy-poll-us 50 \
+  --count-interval 0.0001 \
+  --pace-mode spin \
   --quiet \
   --plot \
-  --plot-dir csv_deos_udp_kernel_spin \
+  --plot-dir csv_deos_4nodes_udp_kernel_pace100_buf212_sync \
+  --json-dir json_deos_4nodes_udp_kernel_pace100_buf212_sync \
   --cpu 1
 ```
 
-### Alice
+### Alice: endpoint, `192.168.14.1`
 
 ```bash
 cd ~/DEOS
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py alice \
-  --r1-host <R1_HOST> \
-  --r2-host <R2_HOST> \
+  --r1-host 192.168.0.223 \
+  --r1-port 7601 \
+  --r2-host 192.168.0.226 \
+  --r2-port 7611 \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --sock-buf 212992 \
+  --busy-poll-us 50 \
   --quiet \
   --plot \
-  --plot-dir csv_deos_udp_kernel_spin \
+  --plot-dir csv_deos_4nodes_udp_kernel_pace100_buf212_sync \
+  --json-dir json_deos_4nodes_udp_kernel_pace100_buf212_sync \
   --cpu 1
 ```
 
-### R2
+### R2: second repeater, `192.168.0.226`
 
 ```bash
 cd ~/DEOS
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r2 \
-  --r1-host <R1_HOST> \
+  --r1-host 192.168.0.223 \
+  --r1-port 7602 \
   --listen-host-a 0.0.0.0 \
+  --listen-port-a 7611 \
   --listen-host-b 0.0.0.0 \
+  --listen-port-b 7612 \
   --w56 1 \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --sock-buf 212992 \
+  --busy-poll-us 50 \
   --quiet \
   --plot \
-  --plot-dir csv_deos_udp_kernel_spin \
+  --plot-dir csv_deos_4nodes_udp_kernel_pace100_buf212_sync \
+  --json-dir json_deos_4nodes_udp_kernel_pace100_buf212_sync \
   --cpu 1
 ```
 
-### Bob
+### Bob: endpoint, `192.168.0.227`
 
 ```bash
 cd ~/DEOS
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py bob \
-  --r1-sync-host <R1_HOST> \
-  --r2-host <R2_HOST> \
+  --r1-sync-host 192.168.0.223 \
+  --r1-sync-port 7603 \
+  --r2-host 192.168.0.226 \
+  --r2-port 7612 \
+  --clock-sync \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --sock-buf 212992 \
+  --busy-poll-us 50 \
   --quiet \
   --plot \
-  --plot-dir csv_deos_udp_kernel_spin \
+  --plot-dir csv_deos_4nodes_udp_kernel_pace100_buf212_sync \
+  --json-dir json_deos_4nodes_udp_kernel_pace100_buf212_sync \
   --cpu 1
 ```
 

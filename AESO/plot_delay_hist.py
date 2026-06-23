@@ -55,15 +55,18 @@ def savefig_owned(plt, path, **kwargs):
 
 
 NODE_INFO = {
+    "14_1": {"name": "CAIT", "origin": "CAIT", "distance": "-", "loss": "-"},
     "223": {
-        "name": "CCS/CEDINT",
+        "name": "CCS-Laboratorio",
+        "origin": "CCS-Laboratorio",
         "link": "Rectorado -> CCS/CEDINT",
         "distance": "23.3 km",
         "loss": "6.6 dB",
     },
-    "226": {"name": "Rectorado", "link": "Repeater / Rectorado", "distance": "-", "loss": "-"},
+    "226": {"name": "Rectorado", "origin": "Rectorado", "distance": "-", "loss": "-"},
     "227": {
         "name": "Teleco/ETSIT",
+        "origin": "Teleco/ETSIT",
         "link": "Rectorado -> Teleco/ETSIT",
         "distance": "1.9 km",
         "loss": "2.3 dB",
@@ -382,7 +385,9 @@ def build_run_info_box(csv_path, csv_root, series, y_values, json_payload, extra
             distance_bits.append(node_info["loss"])
         distance_text = f" ({', '.join(distance_bits)})" if distance_bits else ""
         lines.append(f"node: {node_id} {node_info['name']}{distance_text}")
-        lines.append(f"link: {node_info['link']}")
+        origin = node_info.get("origin") or node_info.get("link")
+        if origin:
+            lines.append(f"origin: {origin}")
 
     experiment = os.path.basename(os.path.normpath(csv_root))
     if experiment:
