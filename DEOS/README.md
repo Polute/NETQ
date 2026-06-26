@@ -332,3 +332,69 @@ The two `*_sum.csv` files are the main files for evaluating the full classical
 notification time and the final Werner value. R1 itself writes JSON metadata
 with the initial state and arguments, but no separate CSV is needed for the
 origin timestamp because it is already embedded in the link and sum CSVs.
+
+
+
+
+## Production Multi-VM Execution (With LinuxPTP Coordinated Sync)
+
+These commands run the 4-node DEOS execution distributed across your physical VMs. 
+- **R1** acts as the PTP Grandmaster.
+- **R2, Alice, and Bob** automatically synchronize their hardware/software clocks against R1 via unicast PTP before starting the entanglement swapping simulation.
+- Once the network barrier is reached, the `ptp4l` daemons are safely terminated to ensure maximum CPU performance and zero jitter during data transmission.
+
+### 1. Router 1 (VM 192.168.0.223)
+```bash
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r1 \
+   --listen-host-a 0.0.0.0 --listen-port-a 7601 \
+   --listen-host-r2 0.0.0.0 --listen-port-r2 7602 \
+   --listen-host-bob-sync 0.0.0.0 --listen-port-bob-sync 7603 \
+   --w12 1 --w34 1 \
+   --ptp-master \
+   --kernel-timestamp \
+   --sock-buf 212992 --busy-poll-us 50 \
+   --count-interval 0.0001 --pace-mode spin --quiet --plot \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
+   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --cpu 1
+   ```
+
+### 2. Router 2 (VM 192.168.0.226)
+```bash
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r2 \
+   --r1-host 192.168.0.223 --r1-port 7602 \
+   --listen-host-a 0.0.0.0 --listen-port-a 7611 \
+   --listen-host-b 0.0.0.0 --listen-port-b 7612 \
+   --w56 1 \
+   --ptp-slave 192.168.0.223 \
+   --kernel-timestamp \
+   --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
+   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --cpu 1
+   ```
+
+### 3. Bob (Client Node 2) (VM 192.168.0.227)
+```bash
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py alice \
+   --r1-host 192.168.0.223 \
+   --r2-host 192.168.0.226 \
+   --ptp-slave 192.168.0.223 \
+   --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
+   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --cpu 1
+```
+
+### 4. Bob (Client Node 2) (vm 192.168.14.1)
+```bash
+   sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py bob \
+   --r1-sync-host 192.168.0.223 --r1-sync-port 7603 \
+   --r2-host 192.168.0.226 --r2-port 7612 \
+   --ptp-slave 192.168.0.223 \
+   --kernel-timestamp \
+   --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
+   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --cpu 1
+   ```

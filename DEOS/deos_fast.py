@@ -10,6 +10,124 @@ import socket
 import struct
 import sys
 import time
+import subprocess
+import re
+import atexit
+
+# --- PTP UNICAST BACKEND DAEMON CONTROL ---
+_ptp_process = None
+_ptp_activated = False
+PTP_INTERFACE = "enp6s18"
+
+def cleanup_ptp():
+    """Safely terminates the ptp4l background process when the script exits."""
+    global _ptp_process, _ptp_activated
+    _ptp_activated = True
+    if _ptp_process:
+        print("\n[PTP Cleanup] Stopping ptp4l background software process...")
+        try:
+            _ptp_process.terminate()
+            _ptp_process.wait(timeout=2)
+        except:
+            pass
+        subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
+
+def start_ptp_unicast(is_master, master_ip=None, target_offset_ns=10000):
+    """Generates the Unicast configuration, starts ptp4l, and blocks until synchronized."""
+    global _ptp_process
+    
+    # Clean up any lingering ptp4l processes first
+    subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
+    atexit.register(cleanup_ptp)
+
+    config_file = "/tmp/ptp4l_unicast.conf"
+    with open(config_file, "w") as f:
+        # --- GLOBAL SECTION ---
+        f.write("[global]\n")
+        f.write("time_stamping software\n")
+        f.write("delay_mechanism E2E\n")
+        f.write("network_transport UDPv4\n") # Force layer-3 UDP transport
+        if not is_master:
+            f.write("unicast_req_duration 300\n") 
+        
+        # --- INTERFACE SECTION ---
+        f.write(f"\n[{PTP_INTERFACE}]\n")
+        if is_master:
+            f.write("unicast_listen 1\n")        
+        else:
+            f.write("unicast_master_table 1\n")
+            
+            # --- UNICAST TABLE SECTION ---
+            f.write("\n[unicast_master_table]\n")
+            f.write("table_id 1\n")
+            f.write("logQueryInterval 2\n")
+            f.write(f"UDPv4 {master_ip}\n")
+
+    role_str = "MASTER" if is_master else f"SLAVE (Target IP: {master_ip})"
+    print(f"--- Starting PTP in SOFTWARE UNICAST mode ({role_str}) on {PTP_INTERFACE} ---")
+
+    ptp4l_cmd = ["sudo", "ptp4l", "-i", PTP_INTERFACE, "-f", config_file, "-m"]
+    if not is_master:
+        ptp4l_cmd.append("-s")
+
+    _ptp_process = subprocess.Popen(
+        ptp4l_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+
+    if is_master:
+        print("[PTP] Grandmaster daemon running in background. Continuing execution...")
+        return
+
+    offset_regex = re.compile(r"master offset\s+(-?\d+)")
+    print(f"[PTP] Waiting for the clock offset to stabilize below {target_offset_ns} ns...")
+    
+    while True:
+        line = _ptp_process.stdout.readline()
+        if not line:
+            if _ptp_process.poll() is not None:
+                raise RuntimeError("The ptp4l process died unexpectedly.")
+            time.sleep(0.05)
+            continue
+        
+        match = offset_regex.search(line)
+        if match:
+            current_offset = abs(int(match.group(1)))
+            print(f"Current PTP Offset: {current_offset} ns    ", end="\r")
+            if current_offset <= target_offset_ns:
+                print(f"\n[PTP SUCCESS] Clock synced via Unicast! Precision: {current_offset} ns.")
+                break
+
+    def cleanup_ptp(args=None):
+        """Safely terminates the ptp4l background process only if LinuxPTP is active."""
+        global _ptp_process, _ptp_activated
+        
+        # 1. Check if PTP flags were passed in the CLI or if it was globally activated
+        ptp_in_use = False
+        if args is not None:
+            ptp_in_use = getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False)
+        else:
+            ptp_in_use = _ptp_activated
+
+        # 2. If PTP is not active, exit immediately (Total bypass for classic UDP mode)
+        if not ptp_in_use:
+            return
+
+        # 3. If active, proceed to clean up the process and free the CPU
+        print("\n[PTP Cleanup] Stopping ptp4l background process and freeing CPU...")
+        if _ptp_process:
+            try:
+                _ptp_process.terminate()
+                _ptp_process.wait(timeout=2)
+            except:
+                pass
+            _ptp_process = None
+        
+        # Kill any lingering ptp4l processes on the system
+        subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
+        
+        # Reset the global activation flag
+        _ptp_activated = False
+# --------------------------------------------------
 
 UDP_HELLO_MAGIC = b"DEOSUDP1"
 UDP_READY_BYTE = b"U"
@@ -626,11 +744,26 @@ def add_common(parser):
     parser.add_argument("--accept-timeout", type=float, default=120.0)
     parser.add_argument("--udp-ready-timeout", type=float, default=120.0)
     parser.add_argument("--udp-idle-timeout", type=float, default=5.0)
-    parser.add_argument(
+
+    # Mutually exclusive group for clock synchronization strategies
+    sync_group = parser.add_mutually_exclusive_group()
+    sync_group.add_argument(
         "--clock-sync",
         action="store_true",
-        help="Enable UDP PTP-style clock synchronization before data exchange. Disabled by default.",
+        help="Enable the native DEOS software UDP clock synchronization.",
     )
+    sync_group.add_argument(
+        "--ptp-master",
+        action="store_true",
+        help="Run PTP as Grandmaster daemon and disable native DEOS clock-sync corrections.",
+    )
+    sync_group.add_argument(
+        "--ptp-slave",
+        type=str,
+        metavar="IP",
+        help="IP address of the PTP Master. Syncs system clock via Unicast and disables native DEOS corrections.",
+    )
+
     parser.add_argument("--clock-sync-samples", type=int, default=264)
     parser.add_argument("--clock-sync-warmup", type=int, default=None)
     parser.add_argument(
@@ -880,6 +1013,7 @@ def sync_to_master(host, port, args):
 
 
 def connect_data_link(host, port, args, receive=False):
+    
     sock, offset_ns, path_delay_ns, rows, stats, warmup = sync_to_master(host, port, args)
     data_sock = connect_udp_data(
         sock,
@@ -925,6 +1059,9 @@ def setup_server_links(args, specs):
         udps[name] = udp_bind_socket(host, port, args.sock_buf, args.busy_poll_us, args.udp_ready_timeout)
     if args.clock_sync:
         for name, _host, _port in specs:
+            if getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False):
+                print(f"[DEOS] Skipping native UDP synchronization for {name} (PTP already synchronized the system)")
+                continue
             serve_clock_sync_udp(udps[name], args.clock_sync_samples, args.clock_sync_kernel_timestamp)
     return controls, udps
 
@@ -1069,6 +1206,9 @@ def run_r1(args):
     controls["r2"].settimeout(float(args.accept_timeout))
     if controls["r2"].recv(1) != R2_READY_BYTE:
         raise ConnectionError("R2 did not announce that Alice/Bob output links are ready")
+    
+    cleanup_ptp()
+
     send_alice = data["alice"].send
     send_r2 = data["r2"].send
     out_a = bytearray(DEOS_MSG_SIZE)
@@ -1209,6 +1349,10 @@ def run_r2(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
     count = max(1, int(args.count))
     r1_link = connect_data_link(args.r1_host, args.r1_port, args, receive=True)
+
+    if getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False):
+        r1_link["offset_ns"] = 0
+
     controls, udps = setup_server_links(
         args,
         [
@@ -1218,6 +1362,10 @@ def run_r2(args):
     )
     data = accept_server_data_peers(controls, udps, ("alice", "bob"))
     r1_link["control"].sendall(R2_READY_BYTE)
+
+    cleanup_ptp()
+
+
     send_alice = data["alice"].send
     send_bob = data["bob"].send
     recv_r1 = r1_link["data"]
@@ -1694,6 +1842,12 @@ def run_alice(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
     r1 = connect_data_link(args.r1_host, args.r1_port, args, receive=True)
     r2 = connect_data_link(args.r2_host, args.r2_port, args, receive=True)
+
+    if getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False):
+        r1["offset_ns"] = 0
+        r2["offset_ns"] = 0
+
+    cleanup_ptp()
     try:
         rows, all_rows, kernel_rx, kernel_fallback, warmup = receive_client_messages(
             args,
@@ -1711,6 +1865,13 @@ def run_bob(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
     r1 = connect_clock_only(args.r1_sync_host, args.r1_sync_port, args)
     r2 = connect_data_link(args.r2_host, args.r2_port, args, receive=True)
+
+    if getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False):
+        r1["offset_ns"] = 0
+        r2["offset_ns"] = 0
+    
+    cleanup_ptp()
+    
     try:
         rows, all_rows, kernel_rx, kernel_fallback, warmup = receive_client_messages(
             args,
@@ -1725,6 +1886,25 @@ def run_bob(args):
 
 def main():
     args = parse_args()
+    # --- AUTO PTP LOGIC BASED ON NODE ROLE ---
+    # Trigger PTP if either flag was passed in the CLI
+    if getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False):
+        if args.role == "r1":
+            print("[DEOS PTP] Role 'r1' detected -> Auto-configuring as PTP Grandmaster.")
+            start_ptp_unicast(is_master=True)
+        else:
+            # Try to get the Master IP from the --ptp-slave argument.
+            # If empty, fallback to DEOS's standard arguments for R1's IP.
+            master_ip = getattr(args, 'ptp_slave', None)
+            if not master_ip:
+                master_ip = getattr(args, 'r1_sync_host', getattr(args, 'r1_host', None))
+            
+            if not master_ip:
+                raise ValueError(f"[ERROR] Could not determine R1's IP for role '{args.role}'. Please pass it via --ptp-slave <IP>")
+            
+            print(f"[DEOS PTP] Role '{args.role}' detected -> Auto-configuring as PTP Slave targeting {master_ip}.")
+            start_ptp_unicast(is_master=False, master_ip=master_ip)
+    # -----------------------------------------
     if args.role == "r1":
         return run_r1(args)
     if args.role == "r2":
