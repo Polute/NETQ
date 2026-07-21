@@ -17,20 +17,39 @@ import atexit
 # --- PTP UNICAST BACKEND DAEMON CONTROL ---
 _ptp_process = None
 _ptp_activated = False
+_ptp_sync_info = {}
 PTP_INTERFACE = "enp6s18"
 
-def cleanup_ptp():
-    """Safely terminates the ptp4l background process when the script exits."""
+def cleanup_ptp(args=None):
+    """Safely terminates the ptp4l background process only if LinuxPTP is active."""
     global _ptp_process, _ptp_activated
-    _ptp_activated = True
+    
+    # 1. Check if PTP flags were passed in the CLI or if it was globally activated
+    ptp_in_use = False
+    if args is not None:
+        ptp_in_use = getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False)
+    else:
+        ptp_in_use = _ptp_activated
+
+    # 2. If PTP is not active, exit immediately (Total bypass for classic UDP mode)
+    if not ptp_in_use:
+        return
+
+    # 3. If active, proceed to clean up the process and free the CPU
+    print("\n[PTP Cleanup] Stopping ptp4l background process and freeing CPU...")
     if _ptp_process:
-        print("\n[PTP Cleanup] Stopping ptp4l background software process...")
         try:
             _ptp_process.terminate()
             _ptp_process.wait(timeout=2)
         except:
             pass
-        subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
+        _ptp_process = None
+    
+    # Kill any lingering ptp4l processes on the system
+    subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
+    
+    # Reset the global activation flag
+    _ptp_activated = False
 
 def start_ptp_unicast(is_master, master_ip=None, target_offset_ns=10000):
     """Generates the Unicast configuration, starts ptp4l, and blocks until synchronized."""
@@ -94,39 +113,16 @@ def start_ptp_unicast(is_master, master_ip=None, target_offset_ns=10000):
             current_offset = abs(int(match.group(1)))
             print(f"Current PTP Offset: {current_offset} ns    ", end="\r")
             if current_offset <= target_offset_ns:
-                print(f"\n[PTP SUCCESS] Clock synced via Unicast! Precision: {current_offset} ns.")
+                global _ptp_sync_info
+                msg = f"[PTP SUCCESS] Clock synced via Unicast! Precision: {current_offset} ns."
+                print(f"\n{msg}")
+                _ptp_sync_info = {
+                    "ptp_role": "slave",
+                    "ptp_status": "synchronized",
+                    "final_offset_ns": current_offset,
+                    "sync_message": msg
+                }
                 break
-
-    def cleanup_ptp(args=None):
-        """Safely terminates the ptp4l background process only if LinuxPTP is active."""
-        global _ptp_process, _ptp_activated
-        
-        # 1. Check if PTP flags were passed in the CLI or if it was globally activated
-        ptp_in_use = False
-        if args is not None:
-            ptp_in_use = getattr(args, 'ptp_master', False) or getattr(args, 'ptp_slave', False)
-        else:
-            ptp_in_use = _ptp_activated
-
-        # 2. If PTP is not active, exit immediately (Total bypass for classic UDP mode)
-        if not ptp_in_use:
-            return
-
-        # 3. If active, proceed to clean up the process and free the CPU
-        print("\n[PTP Cleanup] Stopping ptp4l background process and freeing CPU...")
-        if _ptp_process:
-            try:
-                _ptp_process.terminate()
-                _ptp_process.wait(timeout=2)
-            except:
-                pass
-            _ptp_process = None
-        
-        # Kill any lingering ptp4l processes on the system
-        subprocess.run(["sudo", "killall", "-q", "ptp4l"], stderr=subprocess.DEVNULL)
-        
-        # Reset the global activation flag
-        _ptp_activated = False
 # --------------------------------------------------
 
 UDP_HELLO_MAGIC = b"DEOSUDP1"
@@ -897,11 +893,25 @@ def write_json(args, base, suffix, payload, role_name=None):
     if not args.json_output or not args.plot:
         return None
     path = json_path_for(args, base, suffix, role_name)
+
+    if _ptp_sync_info:
+        ptp_synchronization = _ptp_sync_info
+    else:
+        ptp_info = {"ptp_status": "not_enabled_or_no_daemon_running"}
+        if os.path.exists("/tmp/ptp_status.json"):
+            try:
+                with open("/tmp/ptp_status.json", "r") as sf:
+                    ptp_info = json.load(sf)
+            except:
+                ptp_info = {"ptp_status": "error_reading_daemon_file"}
+            ptp_synchronization = ptp_info
+    
     payload = {
         **payload,
         "argv": sys.argv,
         "args": vars(args),
         "created_at_unix_ns": time.time_ns(),
+        "ptp_synchronization": ptp_synchronization
     }
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)

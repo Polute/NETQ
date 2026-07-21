@@ -1,0 +1,24 @@
+{
+  "mode": "receiver",
+  "total_packets": 2000,
+  "warmup": 50,
+  "recv_count": 1623,
+  "success_count": 1573,
+  "kernel_timestamp": true,
+  "args": {
+    "cpu": 2,
+    "rt_priority": 50,
+    "sock_buf": 65536,
+    "busy_poll_us": 0,
+    "pace_mode": "hybrid",
+    "count_interval": 0.0,
+    "spin_margin_us": 10.0
+  },
+  "samples": {
+    "s2r_p50_ns": 197391,
+    "s2r_p95_ns": 393548,
+    "s2r_p99_ns": 541705,
+    "r2a_p50_ns": 1277,
+    "r2a_p95_ns": 1848
+  }
+}

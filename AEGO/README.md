@@ -1,107 +1,197 @@
-Fast unified (minimal_epr_fast.py)
+# AEGO - Fast EPR-over-TCP with Clock Synchronization
 
-This repo concentrates the final fast EPR-over-TCP version focused on latency and consistent measurement. Earlier test scripts live in pre_scripts/ with their own README files for historical reference and comparisons.
+This repo contains the fast EPR-over-TCP implementation focused on latency and consistent measurement, with support for multiple clock synchronization strategies.
 
-Arguments (summary of -h)
+## Clock Synchronization Options
 
-Sender mode:
+AEGO supports two clock synchronization modes:
 
-- --receiver-host: Receiver host/IP to connect to.
-- --receiver-port: Receiver TCP port.
-- --count: Number of exchanges to run.
-- --warmup: Initial exchanges to ignore in stats.
-- --connect-timeout: Timeout per connect attempt (seconds).
-- --detect-timeout: Total time to keep probing for receiver (seconds).
-- --detect-interval: Delay between probe attempts (seconds).
-- --cpu: Pin this process to a CPU core.
-- --rt-priority: Set SCHED_FIFO priority (1-99). Needs sudo.
-- --sock-buf: Set SO_SNDBUF/SO_RCVBUF if > 0.
-- --busy-poll-us: Set SO_BUSY_POLL in microseconds if supported.
-- --show-arrows: Print timing arrows tables.
-- --werner-min: Minimum Werner floor.
-- --t1-ns: Werner decay timescale in ns.
-- --quiet: Reduce output to summary tables.
+1. **No sync** - Default mode, no clock synchronization
+2. **Native UDP sync** - Custom UDP-based clock synchronization (no Linux PTP required)
+3. **Linux PTP sync** - Uses Linux PTP (ptp4l) via separate daemon for hardware-assisted synchronization
 
-Receiver mode:
+## Complete Command Examples
 
-- --listen-host: Bind address for the receiver.
-- --listen-port: Bind port for the receiver.
-- --count: Number of exchanges to run.
-- --warmup: Initial exchanges to ignore in stats.
-- --accept-timeout: Time to wait for sender to connect (seconds).
-- --cpu: Pin this process to a CPU core.
-- --rt-priority: Set SCHED_FIFO priority (1-99). Needs sudo.
-- --sock-buf: Set SO_SNDBUF/SO_RCVBUF if > 0.
-- --busy-poll-us: Set SO_BUSY_POLL in microseconds if supported.
-- --werner-min: Minimum Werner floor.
-- --t1-ns: Werner decay timescale in ns.
-- --show-arrows: Print receiver timing table.
-- --quiet: Reduce output to summary tables.
+### 1. Without Clock Synchronization (Default)
 
-Receiver (with sudo for RT):
+**Receiver:**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py receiver \
+  --listen-host 0.0.0.0 \
+  --listen-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --accept-timeout 30.0 \
+  --cpu 3 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --pgen 0.8 \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
 
-    sudo python minimal_epr_fast.py receiver \
-      --listen-host 0.0.0.0 \
-      --listen-port 7401 \
-      --count 1000 \
-      --warmup 50 \
-      --accept-timeout 30.0 \
-      --cpu 3 \
-      --rt-priority 50 \
-      --sock-buf 0 \
-      --busy-poll-us 25 \
-      --werner-min 0.2 \
-      --t1-ns 1000000.0 \
-      --quiet
+**Sender:**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py sender \
+  --receiver-host 127.0.0.1 \
+  --receiver-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --connect-timeout 10.0 \
+  --detect-timeout 30.0 \
+  --detect-interval 0.05 \
+  --cpu 2 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --kernel-timestamp \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
 
-Sender (with sudo for RT):
+### 2. With Native UDP Clock Synchronization
 
-    sudo python minimal_epr_fast.py sender \
-      --receiver-host 127.0.0.1 \
-      --receiver-port 7401 \
-      --count 1000 \
-      --warmup 50 \
-      --connect-timeout 10.0 \
-      --detect-timeout 30.0 \
-      --detect-interval 0.05 \
-      --cpu 2 \
-      --rt-priority 50 \
-      --sock-buf 0 \
-      --busy-poll-us 25 \
-      --show-arrows \
-      --werner-min 0.2 \
-      --t1-ns 1000000.0 \
-      --quiet
+**Receiver (acts as UDP clock sync server):**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py receiver \
+  --listen-host 0.0.0.0 \
+  --listen-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --accept-timeout 30.0 \
+  --cpu 3 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --pgen 0.8 \
+  --clock-sync \
+  --clock-sync-port 7501 \
+  --clock-sync-samples 264 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
+  --clock-sync-kernel-timestamp \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
 
-Best sweep results (mean p50 RTT from run_fast_sweep.sh):
+**Sender (acts as UDP clock sync client):**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py sender \
+  --receiver-host 127.0.0.1 \
+  --receiver-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --connect-timeout 10.0 \
+  --detect-timeout 30.0 \
+  --detect-interval 0.05 \
+  --cpu 2 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --kernel-timestamp \
+  --clock-sync \
+  --clock-sync-port 7501 \
+  --clock-sync-samples 264 \
+  --clock-sync-warmup 10 \
+  --clock-sync-method best-path-median \
+  --clock-sync-best-ratio 0.5 \
+  --clock-sync-kernel-timestamp \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
 
-Defaults in minimal_epr_fast.py were chosen from the sweep results produced by run_fast_sweep.sh.
+### 3. With Linux PTP Clock Synchronization (Separate Daemon)
 
-- Best overall: count=1000, detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-- Best by count:
-  - count=1000: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-  - count=3000: detect_interval=0.05, busy_poll=0, rt_priority=50, sock_buf=0
-- Best by detect_interval:
-  - 0.01: detect_interval=0.01, busy_poll=25, rt_priority=50, sock_buf=0
-  - 0.05: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-  - 0.1: detect_interval=0.1, busy_poll=0, rt_priority=50, sock_buf=4096
-- Best by busy_poll:
-  - 0: detect_interval=0.05, busy_poll=0, rt_priority=50, sock_buf=0
-  - 25: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-  - 50: detect_interval=0.05, busy_poll=50, rt_priority=50, sock_buf=0
-- Best by rt_priority:
-  - 50: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-- Best by sock_buf:
-  - 0: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=0
-  - 4096: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=4096
-  - 65536: detect_interval=0.05, busy_poll=25, rt_priority=50, sock_buf=65536
+**Step 1: Start PTP Master (Grandmaster) on separate CPU:**
 
-Note
+```bash
+sudo taskset -c 4 python3 AEGO/sync_ptp_daemon.py \
+  --master \
+  --interface enp6s18 \
+  --target-offset 10000
+```
 
-- If you do not have RT permissions, remove --rt-priority or run without sudo.
+**Step 2: Start PTP Slave on separate CPU:**
 
+```bash
+sudo taskset -c 5 python3 AEGO/sync_ptp_daemon.py \
+  --slave 192.168.1.100 \
+  --interface enp6s18 \
+  --target-offset 10000
+```
 
-Timing arrows mapping (fast sender output):
+**Step 3: Run AEGO (sender/receiver will read offset from /tmp/ptp_status.json):**
+
+**Receiver:**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py receiver \
+  --listen-host 0.0.0.0 \
+  --listen-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --accept-timeout 30.0 \
+  --cpu 3 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --pgen 0.8 \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
+
+**Sender:**
+```bash
+sudo python3 AEGO/minimal_epr_fast.py sender \
+  --receiver-host 127.0.0.1 \
+  --receiver-port 7401 \
+  --count 2000 \
+  --warmup 50 \
+  --connect-timeout 10.0 \
+  --detect-timeout 30.0 \
+  --detect-interval 0.05 \
+  --cpu 2 \
+  --rt-priority 50 \
+  --sock-buf 65536 \
+  --busy-poll-us 0 \
+  --kernel-timestamp \
+  --plot \
+  --plot-dir csv_aego_3 \
+  --json \
+  --quiet
+```
+
+## Important Notes
+
+- **Linux PTP flag `-S`**: The PTP daemon uses the `-S` flag with ptp4l to **only report offset without changing the system clock**. This preserves precision when requesting timestamps from the kernel.
+- **Separate PTP daemon**: Linux PTP runs as a separate process (`sync_ptp_daemon.py`) on a dedicated CPU to maintain synchronization in the background while AEGO runs. AEGO reads the offset from `/tmp/ptp_status.json`.
+- **pgen**: The `--pgen` argument is only used by the receiver (Bob) to decide success/failure. The sender always sends all packets.
+- **Clock sync options**: Native UDP sync (`--clock-sync`) is mutually exclusive with PTP daemon (which runs separately).
+- **sudo required**: For RT priority (`--rt-priority`) and PTP operations, run with sudo.
+- **Network interface**: Update `--interface` in PTP daemon to match your network interface (e.g., `enp6s18`, `eth0`).
+- **CPU pinning**: Use `taskset` to pin the PTP daemon to a dedicated CPU for best performance.
+
+## Plotting Results
+
+After running with `--plot`, generate plots:
+
+```bash
+python3 AEGO/plot_success_analysis.py csv_aego_3
+```
+
+This will generate RTT histograms, sequential plots, and inter-success analysis in the `plots_aego_2` directory.
+
+## Timing Arrows Mapping
 
 ```
   Sender                             Receiver
@@ -127,12 +217,11 @@ Timing arrows mapping (fast sender output):
   |<-------- total_receiver_view --------->|
 ```
 
-Remote Proxmox VM through SSH jump host
+## Network Configuration
 
-The examples below keep the ports visible and redact usernames, hosts, and IP
-addresses.
+### Remote Proxmox VM through SSH Jump Host
 
-Receiver on PC, sender on VM:
+**Receiver on PC, sender on VM:**
 
 First, open the reverse SSH tunnel from the PC:
 
@@ -143,16 +232,16 @@ ssh -J <jump-user>@<jump-host> -o Compression=no -R 7401:127.0.0.1:7401 <vm-user
 On the PC, run the receiver:
 
 ```bash
-sudo python minimal_epr_fast.py receiver
+sudo python3 AEGO/minimal_epr_fast.py receiver
 ```
 
 On the VM, run the sender:
 
 ```bash
-sudo python3 /home/<vm-user>/minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7401
+sudo python3 AEGO/minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7401
 ```
 
-Sender on PC, receiver on VM:
+**Sender on PC, receiver on VM:**
 
 First, open the local SSH tunnel from the PC:
 
@@ -163,44 +252,43 @@ ssh -J <jump-user>@<jump-host> -L 7402:127.0.0.1:7402 <vm-user>@<vm-private-ip>
 On the PC, run the sender:
 
 ```bash
-sudo python3 minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7402
+sudo python3 AEGO/minimal_epr_fast.py sender --receiver-host 127.0.0.1 --receiver-port 7402
 ```
 
 On the VM, run the receiver:
 
 ```bash
-sudo python3 minimal_epr_fast.py receiver --listen-host 127.0.0.1 --listen-port 7402
+sudo python3 AEGO/minimal_epr_fast.py receiver --listen-host 127.0.0.1 --listen-port 7402
 ```
 
-Direct Ethernet cable
+### Direct Ethernet Cable
 
-Use this mode when the PC and the Proxmox VM are connected through the
-dedicated Ethernet link.
+Use this mode when the PC and the Proxmox VM are connected through the dedicated Ethernet link.
 
-Receiver on VM, sender on PC:
+**Receiver on VM, sender on PC:**
 
 On the VM, run the receiver:
 
 ```bash
-sudo python3 minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7402
+sudo python3 AEGO/minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7402
 ```
 
 On the PC, run the sender:
 
 ```bash
-sudo python3 minimal_epr_fast.py sender --receiver-host 10.10.10.2 --receiver-port 7402
+sudo python3 AEGO/minimal_epr_fast.py sender --receiver-host 10.10.10.2 --receiver-port 7402
 ```
 
-Receiver on PC, sender on VM:
+**Receiver on PC, sender on VM:**
 
 On the PC, run the receiver:
 
 ```bash
-sudo python3 minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7401
+sudo python3 AEGO/minimal_epr_fast.py receiver --listen-host 0.0.0.0 --listen-port 7401
 ```
 
 On the VM, run the sender:
 
 ```bash
-sudo python3 minimal_epr_fast.py sender --receiver-host 10.10.10.1 --receiver-port 7401
+sudo python3 AEGO/minimal_epr_fast.py sender --receiver-host 10.10.10.1 --receiver-port 7401
 ```

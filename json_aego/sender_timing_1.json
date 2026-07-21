@@ -1,0 +1,27 @@
+{
+  "mode": "sender",
+  "total_packets": 2000,
+  "warmup": 50,
+  "sent_count": 1612,
+  "success_count": 1574,
+  "first_emit_ts_ns": 1784028917931046015,
+  "last_emit_ts_ns": 1784028918474402362,
+  "pgen": 0.8,
+  "kernel_timestamp": true,
+  "args": {
+    "cpu": 3,
+    "rt_priority": 50,
+    "sock_buf": 65536,
+    "busy_poll_us": 0,
+    "pace_mode": "hybrid",
+    "count_interval": 0.0,
+    "spin_margin_us": 10.0
+  },
+  "samples": {
+    "rtt_p50_ns": 294133,
+    "rtt_p95_ns": 612507,
+    "rtt_p99_ns": 891303,
+    "e2r_p50_ns": 146792,
+    "e2r_p95_ns": 324074
+  }
+}

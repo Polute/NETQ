@@ -298,10 +298,16 @@ def pace_wait(interval_ns, mode="sleep", spin_margin_ns=100_000):
 
 def apply_cpu_rt(cpu=None, rt_priority=None):
     if cpu is not None:
-        os.sched_setaffinity(0, {int(cpu)})
-    if rt_priority is not None:
-        param = os.sched_param(int(rt_priority))
-        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        try:
+            os.sched_setaffinity(0, {int(cpu)})
+        except OSError:
+            pass  # CPU affinity may not be available
+    if rt_priority is not None and int(rt_priority) > 0:
+        try:
+            param = os.sched_param(int(rt_priority))
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        except OSError:
+            pass  # SCHED_FIFO requires root/CAP_SYS_NICE; graceful fallback
 
 
 def recv_exact_into(sock, buf):
@@ -930,6 +936,38 @@ def print_client_message_state(label, delta_ns, msg, state_out, count_idx=None, 
     print(f"state_out={fmt_state(state_out)}")
 
 
+def pgen_hook(count_idx, ts_ns, outbuf, peer_id, args):
+    """Optional packet generation hook. Can modify or reject packets.
+    
+    Args:
+        count_idx (int): Current packet index.
+        ts_ns (int): Packet timestamp in ns.
+        outbuf (bytearray): Packet buffer.
+        peer_id (int): Destination peer ID.
+        args (argparse.Namespace): CLI arguments.
+    
+    Returns:
+        bool: True to send, False to skip.
+    """
+    # Default: always send (no modification)
+    return True
+
+
+def pswap_hook(msg_a, msg_b, args):
+    """Optional packet swap processing hook. Can transform messages between peers.
+    
+    Args:
+        msg_a (tuple): Message from/to peer A (ts_emit, peer_id, bits, w_swap).
+        msg_b (tuple): Message from/to peer B (ts_emit, peer_id, bits, w_swap).
+        args (argparse.Namespace): CLI arguments.
+    
+    Returns:
+        tuple: (msg_a, msg_b) potentially modified.
+    """
+    # Default: no transformation
+    return msg_a, msg_b
+
+
 def run_repeater(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
     if args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
@@ -1101,26 +1139,34 @@ def run_repeater(args):
                         pack_into(outbuf_a, 0, count_idx, ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
                     else:
                         pack_into(outbuf_a, 0, ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
+                    # pgen hook for peer A (can modify buffer or skip)
+                    send_to_a = pgen_hook(count_idx, ts_emit_a_ns, outbuf_a, peer_a_id, args)
                     if diag:
                         pre_send_a_ns = mono_ns()
-                        send_a(outbuf_a)
+                        if send_to_a:
+                            send_a(outbuf_a)
                         post_send_a_ns = mono_ns()
                         send_a_block_samples[idx] = post_send_a_ns - pre_send_a_ns
                     else:
-                        send_a(outbuf_a)
+                        if send_to_a:
+                            send_a(outbuf_a)
                     last_msg_a = (ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
                     ts_emit_b_ns = ts_emit_a_ns if shared_send_timestamp else time_ns()
                     if is_udp_data:
                         pack_into(outbuf_b, 0, count_idx, ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
                     else:
                         pack_into(outbuf_b, 0, ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
+                    # pgen hook for peer B (can modify buffer or skip)
+                    send_to_b = pgen_hook(count_idx, ts_emit_b_ns, outbuf_b, peer_b_id, args)
                     if diag:
                         pre_send_b_ns = mono_ns()
                         send_gap_ab_samples[idx] = pre_send_b_ns - pre_send_a_ns
-                        send_b(outbuf_b)
+                        if send_to_b:
+                            send_b(outbuf_b)
                         send_b_block_samples[idx] = mono_ns() - pre_send_b_ns
                     else:
-                        send_b(outbuf_b)
+                        if send_to_b:
+                            send_b(outbuf_b)
                     last_msg_b = (ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
                     if pace_interval_ns > 0:
                         if pace_mode == "sleep":

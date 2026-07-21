@@ -1,0 +1,161 @@
+{
+  "role": "deos_r2",
+  "csv_path": "csv_deos_4nodes_udp_kernel_external_ptp/r2/01_r1_to_r2_aeso_11.csv",
+  "csv_paths": {
+    "r1_to_r2_aeso": "csv_deos_4nodes_udp_kernel_external_ptp/r2/01_r1_to_r2_aeso_11.csv"
+  },
+  "exchanges": 2000,
+  "received_from_r1": 2000,
+  "udp_lost_est": 0,
+  "kernel_timestamp_received": 2000,
+  "kernel_timestamp_fallback": 0,
+  "clock_sync": {
+    "r1": {
+      "clock_sync_protocol": "none",
+      "clock_sync_kernel_timestamp": false,
+      "clock_sync_kernel_timestamp_received": 0,
+      "clock_sync_kernel_timestamp_fallback": 0,
+      "clock_sync_t2_kernel_timestamp_received": 0,
+      "clock_sync_t2_kernel_timestamp_fallback": 0,
+      "clock_sync_t4_kernel_timestamp_received": 0,
+      "clock_sync_t4_kernel_timestamp_fallback": 0,
+      "clock_sync_method": "disabled",
+      "clock_sync_warmup": 0,
+      "clock_sync_best_ratio": 0.5,
+      "clock_sync_used_samples": 0,
+      "clock_sync_best_path_samples": 0,
+      "clock_offset_mean_ns": 0,
+      "clock_offset_median_ns": 0,
+      "clock_offset_best_path_median_ns": 0,
+      "clock_offset_std_ns": 0.0,
+      "clock_offset_mad_ns": 0,
+      "clock_sync_path_delay_mean_ns": 0,
+      "clock_sync_path_delay_min_ns": 0,
+      "clock_sync_path_delay_median_ns": 0,
+      "clock_sync_path_delay_p95_ns": 0,
+      "clock_sync_path_delay_best_median_ns": 0,
+      "clock_offset_final_ns": 0,
+      "clock_sync_path_delay_final_ns": 0
+    }
+  },
+  "state_start": {
+    "left": {
+      "werner": 1.0,
+      "peer_id": 4
+    },
+    "right": {
+      "werner": null,
+      "peer_id": 2
+    }
+  },
+  "state_out": {
+    "left": {
+      "werner": 0.0,
+      "peer_id": null
+    },
+    "right": {
+      "werner": 0.0,
+      "peer_id": null
+    }
+  },
+  "metrics": {
+    "r1_to_r2_delay_ns": {
+      "p50": 204837,
+      "p90": 208120,
+      "p95": 210779,
+      "p99": 219849,
+      "mean": 205668,
+      "std": 5786.9425458657415,
+      "min": 198901,
+      "max": 411664
+    },
+    "w_final_raw": {
+      "p50": 1.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "mean": 1.0,
+      "std": 0.0
+    }
+  },
+  "argv": [
+    "deos_fast.py",
+    "r2",
+    "--r1-host",
+    "192.168.0.223",
+    "--r1-port",
+    "7602",
+    "--listen-host-a",
+    "0.0.0.0",
+    "--listen-port-a",
+    "7611",
+    "--listen-host-b",
+    "0.0.0.0",
+    "--listen-port-b",
+    "7612",
+    "--w56",
+    "1",
+    "--kernel-timestamp",
+    "--sock-buf",
+    "212992",
+    "--busy-poll-us",
+    "50",
+    "--quiet",
+    "--plot",
+    "--plot-dir",
+    "csv_deos_4nodes_udp_kernel_external_ptp",
+    "--json-dir",
+    "json_deos_4nodes_udp_kernel_external_ptp"
+  ],
+  "args": {
+    "role": "r2",
+    "count": 2000,
+    "cpu": null,
+    "rt_priority": 50,
+    "sock_buf": 212992,
+    "busy_poll_us": 50,
+    "connect_timeout": 10.0,
+    "detect_timeout": 120.0,
+    "detect_interval": 0.02,
+    "accept_timeout": 120.0,
+    "udp_ready_timeout": 120.0,
+    "udp_idle_timeout": 5.0,
+    "clock_sync": false,
+    "ptp_master": false,
+    "ptp_slave": null,
+    "clock_sync_samples": 264,
+    "clock_sync_warmup": null,
+    "clock_sync_method": "best-path-median",
+    "clock_sync_best_ratio": 0.5,
+    "clock_sync_kernel_timestamp": true,
+    "kernel_timestamp": true,
+    "quiet": true,
+    "plot": true,
+    "plot_dir": "csv_deos_4nodes_udp_kernel_external_ptp",
+    "json_output": true,
+    "json_dir": "json_deos_4nodes_udp_kernel_external_ptp",
+    "diag": false,
+    "alice_id": 1,
+    "r1_id": 2,
+    "r2_id": 3,
+    "bob_id": 4,
+    "r1_host": "192.168.0.223",
+    "r1_port": 7602,
+    "listen_host_a": "0.0.0.0",
+    "listen_port_a": 7611,
+    "listen_host_b": "0.0.0.0",
+    "listen_port_b": 7612,
+    "w56": 1.0,
+    "plot_prefix": "deos_r2_hist"
+  },
+  "created_at_unix_ns": 1783334674261414357,
+  "ptp_synchronization": {
+    "ptp_role": "slave",
+    "ptp_status": "synchronized",
+    "instantaneous_offset_ns": -116954,
+    "precision_p2p_ns": 307660,
+    "precision_stddev_ns": 88996.5,
+    "sync_message": "[PTP ALIVE] P2P Jitter: 307660 ns | StdDev: 88996.5 ns",
+    "timestamp_unix_ns": 1783334674250914707
+  }
+}

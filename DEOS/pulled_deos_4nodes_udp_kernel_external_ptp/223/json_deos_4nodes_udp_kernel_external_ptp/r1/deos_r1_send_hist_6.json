@@ -1,0 +1,126 @@
+{
+  "role": "deos_r1",
+  "csv_path": null,
+  "csv_paths": {},
+  "exchanges": 2000,
+  "state_start": {
+    "left": {
+      "werner": 1.0,
+      "peer_id": 1
+    },
+    "right": {
+      "werner": 1.0,
+      "peer_id": 3
+    }
+  },
+  "state_out": {
+    "left": {
+      "werner": 0.0,
+      "peer_id": null
+    },
+    "right": {
+      "werner": 0.0,
+      "peer_id": null
+    }
+  },
+  "werner_intermediate_raw": 1.0,
+  "send_stats_ns": {
+    "send_alice_block_ns": null,
+    "send_r2_block_ns": null,
+    "send_gap_ns": null
+  },
+  "last_origin": {
+    "count_idx": 2000,
+    "ts_r1_ns": 1783333719461036141,
+    "bits_r1": 0,
+    "w12": 1.0,
+    "w34": 1.0,
+    "w14": 1.0
+  },
+  "argv": [
+    "deos_fast.py",
+    "r1",
+    "--listen-host-a",
+    "0.0.0.0",
+    "--listen-port-a",
+    "7601",
+    "--listen-host-r2",
+    "0.0.0.0",
+    "--listen-port-r2",
+    "7602",
+    "--listen-host-bob-sync",
+    "0.0.0.0",
+    "--listen-port-bob-sync",
+    "7603",
+    "--w12",
+    "1",
+    "--w34",
+    "1",
+    "--kernel-timestamp",
+    "--sock-buf",
+    "212992",
+    "--busy-poll-us",
+    "50",
+    "--count-interval",
+    "0.0001",
+    "--pace-mode",
+    "spin",
+    "--quiet",
+    "--plot",
+    "--plot-dir",
+    "csv_deos_4nodes_udp_kernel_external_ptp",
+    "--json-dir",
+    "json_deos_4nodes_udp_kernel_external_ptp"
+  ],
+  "args": {
+    "role": "r1",
+    "count": 2000,
+    "cpu": null,
+    "rt_priority": 50,
+    "sock_buf": 212992,
+    "busy_poll_us": 50,
+    "connect_timeout": 10.0,
+    "detect_timeout": 120.0,
+    "detect_interval": 0.02,
+    "accept_timeout": 120.0,
+    "udp_ready_timeout": 120.0,
+    "udp_idle_timeout": 5.0,
+    "clock_sync": false,
+    "ptp_master": false,
+    "ptp_slave": null,
+    "clock_sync_samples": 264,
+    "clock_sync_warmup": null,
+    "clock_sync_method": "best-path-median",
+    "clock_sync_best_ratio": 0.5,
+    "clock_sync_kernel_timestamp": true,
+    "kernel_timestamp": true,
+    "quiet": true,
+    "plot": true,
+    "plot_dir": "csv_deos_4nodes_udp_kernel_external_ptp",
+    "json_output": true,
+    "json_dir": "json_deos_4nodes_udp_kernel_external_ptp",
+    "diag": false,
+    "alice_id": 1,
+    "r1_id": 2,
+    "r2_id": 3,
+    "bob_id": 4,
+    "listen_host_a": "0.0.0.0",
+    "listen_port_a": 7601,
+    "listen_host_r2": "0.0.0.0",
+    "listen_port_r2": 7602,
+    "listen_host_bob_sync": "0.0.0.0",
+    "listen_port_bob_sync": 7603,
+    "w12": 1.0,
+    "w34": 1.0,
+    "count_interval": 0.0001,
+    "pace_mode": "spin",
+    "spin_margin_us": 100.0,
+    "plot_prefix": "deos_r1_send_hist"
+  },
+  "created_at_unix_ns": 1783333719462816093,
+  "ptp_synchronization": {
+    "ptp_role": "master",
+    "ptp_status": "grandmaster_active",
+    "timestamp_unix_ns": 1783332635528961307
+  }
+}

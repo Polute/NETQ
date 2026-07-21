@@ -1,0 +1,30 @@
+{
+  "mode": "sender",
+  "protocol": "udp",
+  "data_protocol": "udp",
+  "sync_protocol": "udp",
+  "total_packets": 2000,
+  "warmup": 50,
+  "sent_count": 2000,
+  "success_count": 1950,
+  "first_emit_ts_ns": 1784631287791331839,
+  "last_emit_ts_ns": 1784631288536459108,
+  "pgen": 1.0,
+  "kernel_timestamp": true,
+  "args": {
+    "cpu": 2,
+    "rt_priority": 50,
+    "sock_buf": 65536,
+    "busy_poll_us": 0,
+    "pace_mode": "hybrid",
+    "count_interval": 0.0,
+    "spin_margin_us": 10.0
+  },
+  "samples": {
+    "rtt_p50_ns": 326653,
+    "rtt_p95_ns": 691381,
+    "rtt_p99_ns": 1297557,
+    "e2r_p50_ns": 160775,
+    "e2r_p95_ns": 343318
+  }
+}

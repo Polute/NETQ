@@ -354,14 +354,14 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r1 \
    --kernel-timestamp \
    --sock-buf 212992 --busy-poll-us 50 \
    --count-interval 0.0001 --pace-mode spin --quiet --plot \
-   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
-   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp_2 \
+   --json-dir json_deos_4nodes_udp_kernel_ptp_2 \
    --cpu 1
    ```
 
 ### 2. Router 2 (VM 192.168.0.226)
 ```bash
-sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r2 \
+  sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r2 \
    --r1-host 192.168.0.223 --r1-port 7602 \
    --listen-host-a 0.0.0.0 --listen-port-a 7611 \
    --listen-host-b 0.0.0.0 --listen-port-b 7612 \
@@ -369,32 +369,33 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py r2 \
    --ptp-slave 192.168.0.223 \
    --kernel-timestamp \
    --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
-   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
-   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp_2 \
+   --json-dir json_deos_4nodes_udp_kernel_ptp_2 \
    --cpu 1
    ```
 
 ### 3. Bob (Client Node 2) (VM 192.168.0.227)
+```bash
+  sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py bob \
+   --r1-sync-host 192.168.0.223 --r1-sync-port 7603 \
+   --r2-host 192.168.0.226 --r2-port 7612 \
+   --ptp-slave 192.168.0.223 \
+   --kernel-timestamp \
+   --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp_2 \
+   --json-dir json_deos_4nodes_udp_kernel_ptp_2 \
+   --cpu 1
+
+```
+
+### 4. Alice (Client Node 2) (vm 192.168.14.1)
 ```bash
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py alice \
    --r1-host 192.168.0.223 \
    --r2-host 192.168.0.226 \
    --ptp-slave 192.168.0.223 \
    --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
-   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
-   --json-dir json_deos_4nodes_udp_kernel_ptp \
-   --cpu 1
-```
-
-### 4. Bob (Client Node 2) (vm 192.168.14.1)
-```bash
-   sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 deos_fast.py bob \
-   --r1-sync-host 192.168.0.223 --r1-sync-port 7603 \
-   --r2-host 192.168.0.226 --r2-port 7612 \
-   --ptp-slave 192.168.0.223 \
-   --kernel-timestamp \
-   --sock-buf 212992 --busy-poll-us 50 --quiet --plot \
-   --plot-dir csv_deos_4nodes_udp_kernel_ptp \
-   --json-dir json_deos_4nodes_udp_kernel_ptp \
+   --plot-dir csv_deos_4nodes_udp_kernel_ptp_2 \
+   --json-dir json_deos_4nodes_udp_kernel_ptp_2 \
    --cpu 1
    ```
