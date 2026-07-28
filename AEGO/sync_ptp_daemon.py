@@ -57,6 +57,10 @@ def main():
         f.write("time_stamping software\n")
         f.write("delay_mechanism E2E\n")
         f.write("network_transport UDPv4\n")
+        f.write("clock_servo linreg\n")
+        f.write("logSyncInterval -3\n")
+        f.write("logMinDelayReqInterval -3\n")
+        
         if not args.master:
             f.write("unicast_req_duration 300\n") 
         
@@ -67,7 +71,7 @@ def main():
             f.write("unicast_master_table 1\n")
             f.write("\n[unicast_master_table]\n")
             f.write("table_id 1\n")
-            f.write("logQueryInterval 2\n")
+            f.write("logQueryInterval -3\n")
             f.write(f"UDPv4 {args.slave}\n")
 
     role_str = "MASTER" if args.master else f"SLAVE (Target IP: {args.slave})"

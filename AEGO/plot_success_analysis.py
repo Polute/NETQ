@@ -99,6 +99,7 @@ def parse_csv(csv_path):
             'emit_ts_ns': [list of sender emit timestamps in ns],
             'rtt_ns': [list of RTT values in ns],
             'e2r_ns': [list of E2R values in ns],
+            'r2a_ns': [list of R2A values in ns], #processing time from receiver to ack
             'werner': [list of Werner values],
             'inter_success_gaps': [list of inter-success gaps from Bob],
             'success': [list of success flags (1=success, 0=failure)],
@@ -109,6 +110,7 @@ def parse_csv(csv_path):
         'emit_ts_ns': [],
         'rtt_ns': [],
         'e2r_ns': [],
+        'r2a_ns': [],
         'werner': [],
         'inter_success_gaps': [],
         'success': [],
@@ -128,11 +130,13 @@ def parse_csv(csv_path):
                     emit_ts_ns = int(emit_ts) if emit_ts not in ('', None) else None
                     rtt = int(float(row.get('rtt_ns', row.get('delay_ns', 0))))
                     e2r = int(float(row.get('e2r_ns', row.get('s2r_ns', 0))))
+                    r2a = int(float(row.get('r2a_ns', 0)))
                     werner = float(row.get('werner', 0.0))
                     rows['counts'].append(idx)
                     rows['emit_ts_ns'].append(emit_ts_ns)
                     rows['rtt_ns'].append(rtt)
                     rows['e2r_ns'].append(e2r)
+                    rows['r2a_ns'].append(r2a)
                     rows['werner'].append(werner)
                     if rows['has_inter_success_gap']:
                         rows['inter_success_gaps'].append(int(float(row.get('inter_success_gap', 0))))
@@ -763,9 +767,12 @@ def write_failure_recovery_segment_plots(plt, csv_data, failure_data, sec_dir, c
         top=0.78,
     )
 
+    # segment2_seq is cumulative: segment1 + segment2
+    segment2_cumulative_us = [segment1_us[i] + segment2_us[i] for i in range(len(segment1_us))]
+    
     segment_specs = [
         ("segment1", segment1_us, "tab:blue", "first failure -> Bob success"),
-        ("segment2", segment2_us, "tab:orange", "Bob success -> sender ack"),
+        ("segment2", segment2_cumulative_us, "tab:orange", "Bob success -> sender ack (cumulative)"),
     ]
     for suffix, values, color, label in segment_specs:
         plt.figure(figsize=(8, 4.6))
@@ -781,6 +788,30 @@ def write_failure_recovery_segment_plots(plt, csv_data, failure_data, sec_dir, c
             force,
             overlap=False,
         )
+    
+    # segment3 shows 3 panels: segment1, segment2, and total
+    fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    axes[0].plot(failure_counts, segment1_us, linewidth=0.7, color='tab:blue')
+    axes[0].scatter(failure_counts, segment1_us, color='tab:blue', s=10, zorder=3)
+    axes[0].set_ylabel("duration (us)")
+    axes[0].set_title("first failure -> Bob success")
+    axes[1].plot(failure_counts, segment2_us, linewidth=0.7, color='tab:orange')
+    axes[1].scatter(failure_counts, segment2_us, color='tab:orange', s=10, zorder=3)
+    axes[1].set_ylabel("duration (us)")
+    axes[1].set_title("Bob success -> sender ack")
+    axes[2].plot(failure_counts, total_us, linewidth=0.7, color='tab:green')
+    axes[2].scatter(failure_counts, total_us, color='tab:green', s=10, zorder=3)
+    axes[2].set_xlabel("failure start count")
+    axes[2].set_ylabel("duration (us)")
+    axes[2].set_title("total (segment1 + segment2)")
+    finish_panel_figure(
+        fig,
+        os.path.join(counter_dir, f"{prefix}_failure_recovery_segment3_seq.png"),
+        f"Failure recovery all segments per count ({prefix})",
+        info_text,
+        force,
+        top=0.78,
+    )
 
 
 def write_sender_component_plots(plt, x_values, outbound_us, remainder_us, total_us, hist_path, seq_path, base, series, info_text=None, plot_kind="all", force=False):
@@ -845,6 +876,188 @@ def write_sender_component_plots(plt, x_values, outbound_us, remainder_us, total
         plt.close()
 
     return written
+
+def write_sender_combined_plot(plt, x_values, outbound_us, remainder_us, total_us, hist_path, seq_path, base, series, info_text=None, plot_kind="all", force=False):
+    """Write sender combined plot showing 3 independent graphs (outbound, remainder, total) all starting at 0 in the same PNG."""
+    written = []
+
+    components = [
+        ("ida / outbound", outbound_us, "tab:blue"),
+        ("resto (proc+vuelta)", remainder_us, "tab:orange"),
+        ("total (ida+proc+vuelta)", total_us, "tab:green"),
+    ]
+
+    if plot_kind in ("all", "hist"):
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        for axis, (label, values, color) in zip(axes, components):
+            axis.hist(values, bins=50, edgecolor="black", alpha=0.75, color=color)
+            axis.set_title(label)
+            axis.set_xlabel("time (us)")
+            axis.set_ylabel("count")
+        fig.suptitle(f"AEGO sender path components ({base})", fontsize=11, fontweight="bold")
+        if info_text:
+            fig.text(
+                0.02,
+                0.98,
+                info_text,
+                transform=fig.transFigure,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+            )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
+        if confirm_overwrite(hist_path, force):
+            savefig_owned(plt=plt, path=hist_path, dpi=150)
+            written.append(hist_path)
+        plt.close()
+
+    if plot_kind in ("all", "seq"):
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        for axis, (label, values, color) in zip(axes, components):
+            axis.plot(x_values, values, linewidth=0.7, color=color)
+            axis.set_title(label)
+            axis.set_ylabel("time (us)")
+        axes[-1].set_xlabel(series["x_label"])
+        fig.suptitle(f"AEGO sender path components per {series['x_label']} ({base})", fontsize=11, fontweight="bold")
+        if info_text:
+            fig.text(
+                0.02,
+                0.98,
+                info_text,
+                transform=fig.transFigure,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+            )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
+        if confirm_overwrite(seq_path, force):
+            savefig_owned(plt=plt, path=seq_path, dpi=150)
+            written.append(seq_path)
+        plt.close()
+
+    return written
+
+def write_sender_sub_combined_plot(plt, x_values, outbound_us, remainder_us, hist_path, seq_path, base, series, info_text=None, plot_kind="all", force=False):
+    """Write sender sub-combined plot showing only first 2 components (outbound and remainder) for better precision."""
+    written = []
+
+    components = [
+        ("ida / outbound", outbound_us, "tab:blue"),
+        ("resto (proc+vuelta)", remainder_us, "tab:orange"),
+    ]
+
+    if plot_kind in ("all", "hist"):
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        for axis, (label, values, color) in zip(axes, components):
+            axis.hist(values, bins=50, edgecolor="black", alpha=0.75, color=color)
+            axis.set_title(label)
+            axis.set_xlabel("time (us)")
+            axis.set_ylabel("count")
+        fig.suptitle(f"AEGO sender path sub-components ({base})", fontsize=11, fontweight="bold")
+        if info_text:
+            fig.text(
+                0.02,
+                0.98,
+                info_text,
+                transform=fig.transFigure,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+            )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
+        if confirm_overwrite(hist_path, force):
+            savefig_owned(plt=plt, path=hist_path, dpi=150)
+            written.append(hist_path)
+        plt.close()
+
+    if plot_kind in ("all", "seq"):
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        for axis, (label, values, color) in zip(axes, components):
+            axis.plot(x_values, values, linewidth=0.7, color=color)
+            axis.set_title(label)
+            axis.set_ylabel("time (us)")
+        axes[-1].set_xlabel(series["x_label"])
+        fig.suptitle(f"AEGO sender path sub-components per {series['x_label']} ({base})", fontsize=11, fontweight="bold")
+        if info_text:
+            fig.text(
+                0.02,
+                0.98,
+                info_text,
+                transform=fig.transFigure,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+            )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
+        if confirm_overwrite(seq_path, force):
+            savefig_owned(plt=plt, path=seq_path, dpi=150)
+            written.append(seq_path)
+        plt.close()
+
+    return written
+
+def plot_processing_time(csv_data, output_dir, prefix, info_text, force=False, plot_kind="all", bins=50):
+    """Plot receiver processing time (r2a_ns) in 'sec' (histogram) and 'counter' (sequential per count)."""
+    if not HAS_MATPLOTLIB:
+        return
+
+    counts = csv_data.get('counts', [])
+    r2a_ns = csv_data.get('r2a_ns', [])
+
+    # Filter valid entries where r2a_ns > 0
+    valid_pairs = [(c, r / 1000.0) for c, r in zip(counts, r2a_ns) if r > 0]
+    if not valid_pairs:
+        return
+
+    x_counts, proc_us = zip(*valid_pairs)
+    proc_stats = series_summary(proc_us)
+
+    sec_dir = os.path.join(output_dir, "sec")
+    counter_dir = os.path.join(output_dir, "counter")
+    ensure_output_dir(sec_dir)
+    ensure_output_dir(counter_dir)
+
+    series_info = {
+        "title": "Receiver Processing Time (r2a)",
+        "ylabel": "Processing time r2a (us)",
+        "hist_xlabel": "Processing time r2a (us)",
+        "x_label": "Absolute count",
+    }
+
+    # 1. Histogram for 'sec' directory
+    if plot_kind in ("all", "hist"):
+        hist_path = os.path.join(sec_dir, f"{prefix}_processing_time.png")
+        plt.figure(figsize=(8, 4.6))
+        plt.hist(proc_us, bins=bins, color='tab:purple', edgecolor='black', alpha=0.75)
+        add_reference_lines(plt, proc_stats, "vertical")
+        plt.xlabel(series_info["hist_xlabel"])
+        plt.ylabel("count")
+        if proc_stats:
+            plt.legend(loc="upper right")
+        finish_plot(
+            plt, hist_path, f"{series_info['title']} histogram ({prefix})",
+            info_text, force, overlap=False
+        )
+
+    # 2. Sequential plot for 'counter' directory (X-axis = Absolute Count)
+    if plot_kind in ("all", "seq"):
+        seq_path = os.path.join(counter_dir, f"{prefix}_processing_time_seq.png")
+        plt.figure(figsize=(8, 4.6))
+        plt.plot(x_counts, proc_us, linewidth=0.6, color='tab:purple')
+        add_reference_lines(plt, proc_stats, "horizontal")
+        plt.xlabel(series_info["x_label"])
+        plt.ylabel(series_info["ylabel"])
+        if proc_stats:
+            plt.legend(loc="upper right")
+        finish_plot(
+            plt, seq_path, f"{series_info['title']} per {series_info['x_label']} ({prefix})",
+            info_text, force, overlap=False
+        )
+
 def plot_gap_durations(csv_data, output_dir, prefix, json_data, info_text, force, plot_kind="all"):
     """Plot the time duration of count gaps (jumps) both by time (sequential) and count index."""
     if not HAS_MATPLOTLIB:
@@ -1021,7 +1234,7 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
         inter_x_values = inter_counts
         inter_x_label = "Bob success count" if inter_source_data is not csv_data else "success count"
     else:
-        inter_x_values = list(range(len(inter_times)))
+        inter_x_values = list(range(1, len(inter_times) + 1))
         inter_x_label = "success index"
     inter_series = {
         "title": "Inter-Success-Interval",
@@ -1042,12 +1255,31 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
     if inter_times:
         inter_times_display = inter_times
         inter_stats = series_summary(inter_times)
-        write_basic_plots(
-            plt, inter_x_values, inter_times_display,
-            os.path.join(sec_dir, f"{prefix}_inter_success.png"),
-            os.path.join(counter_dir, f"{prefix}_inter_success_seq.png"),
-            prefix, inter_series, bins, info_text, inter_stats, plot_kind, force, convert_to_us=False
-        )
+        # For sequential plot, filter out initial 0 and adjust x-axis
+        if inter_times_display and inter_times_display[0] == 0:
+            inter_times_seq = inter_times_display[1:]
+            inter_x_seq = inter_x_values[1:]
+        else:
+            inter_times_seq = inter_times_display
+            inter_x_seq = inter_x_values
+        
+        # Histogram uses all data (including initial 0)
+        if plot_kind in ("all", "hist"):
+            write_basic_plots(
+                plt, inter_x_values, inter_times_display,
+                os.path.join(sec_dir, f"{prefix}_inter_success.png"),
+                os.path.join(sec_dir, f"{prefix}_inter_success_seq.png"),  # dummy path
+                prefix, inter_series, bins, info_text, inter_stats, "hist", force, convert_to_us=False
+            )
+        
+        # Sequential plot uses filtered data (without initial 0)
+        if plot_kind in ("all", "seq"):
+            write_basic_plots(
+                plt, inter_x_seq, inter_times_seq,
+                os.path.join(sec_dir, f"{prefix}_inter_success.png"),  # dummy path
+                os.path.join(counter_dir, f"{prefix}_inter_success_seq.png"),
+                prefix, inter_series, bins, info_text, inter_stats, "seq", force, convert_to_us=False
+            )
 
     write_rtt_gap_plots(
         plt, csv_data, failure_data, sec_dir, counter_dir, prefix,
@@ -1062,6 +1294,38 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
         info_text, total_packets, warmup, force, plot_kind
     )
     
+    # Add sender component plots (outbound vs remainder)
+    e2r_ns = csv_data.get('e2r_ns', [])
+    if rtts and e2r_ns and len(rtts) == len(e2r_ns):
+        outbound_us = [v / 1000.0 for v in e2r_ns]
+        remainder_us = [(rtts[i] - e2r_ns[i]) / 1000.0 for i in range(len(rtts))]
+        total_us = [v / 1000.0 for v in rtts]
+        
+        write_sender_combined_plot(
+            plt, count_axis, outbound_us, remainder_us, total_us,
+            os.path.join(sec_dir, f"{prefix}_sender_combined.png"),
+            os.path.join(counter_dir, f"{prefix}_sender_combined_seq.png"),
+            prefix, rtt_series, info_text, plot_kind, force
+        )
+        
+        # Add sub-combined plot with only first 2 components for better precision
+        write_sender_sub_combined_plot(
+            plt, count_axis, outbound_us, remainder_us,
+            os.path.join(sec_dir, f"{prefix}_sub_sender_combined.png"),
+            os.path.join(counter_dir, f"{prefix}_sub_sender_combined_seq.png"),
+            prefix, rtt_series, info_text, plot_kind, force
+        )
+    
+    plot_processing_time(
+        inter_source_data, 
+        output_dir, 
+        prefix, 
+        info_text, 
+        force=force, 
+        plot_kind=plot_kind, 
+        bins=bins
+    )
+
     if filtered:
         if rtts:
             write_filtered_plots(

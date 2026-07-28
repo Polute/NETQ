@@ -85,7 +85,142 @@ all data receive timestamps. The current recommended estimator is
 
 ## Recommended Python run: three nodes
 
-Run the repeater first on node `226`, then run both clients.
+Run the repeater first, then run both clients. The two clients are differentiated by port:
+- **Client A** connects to port `7401` with `--client-id 1`
+- **Client B** connects to port `7402` with `--client-id 2`
+
+### Local example (all on localhost)
+
+```bash
+# Terminal 1: Repeater
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+  --listen-host-a 0.0.0.0 \
+  --listen-port-a 7401 \
+  --listen-host-b 0.0.0.0 \
+  --listen-port-b 7402 \
+  --werner-ar 1 \
+  --werner-br 1 \
+  --pswap 1.0 \
+  --count 2000 \
+  --quiet \
+  --data-protocol udp \
+  --plot \
+  --plot-dir csv_local \
+  --accept-timeout 120 \
+  --cpu 3 \
+  --sock-buf 65536 \
+  --busy-poll-us 50 \
+  --count-interval 0.00005 \
+  --pace-mode spin
+
+# Terminal 2: Client A
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 127.0.0.1 \
+  --repeater-port 7401 \
+  --client-id 1 \
+  --count 2000 \
+  --warmup 50 \
+  --quiet \
+  --data-protocol udp \
+  --plot \
+  --plot-dir csv_local \
+  --connect-timeout 10 \
+  --detect-timeout 120 \
+  --detect-interval 0.02 \
+  --cpu 5 \
+  --sock-buf 65536 \
+  --busy-poll-us 50
+
+# Terminal 3: Client B
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 127.0.0.1 \
+  --repeater-port 7402 \
+  --client-id 2 \
+  --count 2000 \
+  --warmup 50 \
+  --quiet \
+  --data-protocol udp \
+  --plot \
+  --plot-dir csv_local \
+  --connect-timeout 10 \
+  --detect-timeout 120 \
+  --detect-interval 0.02 \
+  --cpu 7 \
+  --sock-buf 65536 \
+  --busy-poll-us 50
+```
+
+### External example (separate machines)
+
+```bash
+# Machine 1 (Repeater at 192.168.1.100): Repeater
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repeater \
+  --listen-host-a 0.0.0.0 \
+  --listen-port-a 7401 \
+  --listen-host-b 0.0.0.0 \
+  --listen-port-b 7402 \
+  --werner-ar 1 \
+  --werner-br 1 \
+  --pswap 0.8 \
+  --count 2000 \
+  --quiet \
+  --data-protocol udp \
+  --clock-sync udp \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --plot \
+  --plot-dir csv_external \
+  --accept-timeout 120 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 50 \
+  --count-interval 0.00005 \
+  --pace-mode spin
+
+# Machine 2 (Client A at 192.168.1.101): Client A
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 192.168.1.100 \
+  --repeater-port 7401 \
+  --client-id 1 \
+  --count 2000 \
+  --warmup 50 \
+  --quiet \
+  --data-protocol udp \
+  --clock-sync udp \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --plot \
+  --plot-dir csv_external \
+  --connect-timeout 10 \
+  --detect-timeout 120 \
+  --detect-interval 0.02 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 50
+
+# Machine 3 (Client B at 192.168.1.102): Client B
+sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
+  --repeater-host 192.168.1.100 \
+  --repeater-port 7402 \
+  --client-id 2 \
+  --count 2000 \
+  --warmup 50 \
+  --quiet \
+  --data-protocol udp \
+  --clock-sync udp \
+  --clock-sync-samples 264 \
+  --clock-sync-kernel-timestamp \
+  --kernel-timestamp \
+  --plot \
+  --plot-dir csv_external \
+  --connect-timeout 10 \
+  --detect-timeout 120 \
+  --detect-interval 0.02 \
+  --cpu 1 \
+  --sock-buf 65536 \
+  --busy-poll-us 50
+```
 
 ### Repeater, Rectorado, node `226`
 
@@ -322,7 +457,9 @@ The clock-sync CSV includes per-sample PTP values and summary fields such as:
 
 ## Plotting
 
-Use the plotter from the repository root:
+### Delay histogram plotter
+
+Use the delay histogram plotter from the repository root:
 
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib \
@@ -331,6 +468,15 @@ MPLCONFIGDIR=/tmp/matplotlib \
   AESO/pulled_all_csv_json/227/csv_3nodes_py_udp_kernel_spin \
   --filtered \
   --force
+```
+
+### Success/failure analysis plotter
+
+Use the success/failure analysis plotter for pswap statistics. It accepts a directory and analyzes all CSV files:
+
+```bash
+# Analyze all CSVs in directory (repeater + both clients)
+python AESO/plot_success_analysis.py csv_local_pswap --plot
 ```
 
 The plotter writes output to the matching `plots_*` folder. It adds a small
@@ -379,3 +525,9 @@ Known site metadata used in the plotter:
   per-client/per-sample.
 - `--diag` adds extra clock calls inside hot loops. Use it for diagnosis, not for
   the cleanest performance run.
+- `--pswap` (probability of swap success) controls the repeater's swap success rate:
+  - `--pswap 1.0`: All swaps succeed (default)
+  - `--pswap 0.8`: 80% of swaps succeed, 20% fail
+  - Failed swaps set `w_swap = 0.0` in the message sent to clients
+  - The repeater tracks success/failure statistics in JSON output
+  - Use `plot_success_analysis.py` to analyze pswap statistics

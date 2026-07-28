@@ -59,11 +59,11 @@ def parse_args():
     repeater.add_argument("--listen-host-b", default="0.0.0.0")
     repeater.add_argument("--listen-port-b", type=int, default=7402)
     repeater.add_argument("--count", type=int, default=2000)
-    repeater.add_argument("--accept-timeout", type=float, default=30.0)
+    repeater.add_argument("--accept-timeout", type=float, default=120.0)
     repeater.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
     repeater.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
     repeater.add_argument("--sock-buf", type=int, default=65536, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
-    repeater.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
+    repeater.add_argument("--busy-poll-us", type=int, default=50, help="Set SO_BUSY_POLL in microseconds if supported.")
     repeater.add_argument("--repeater-id", type=int, default=0)
     repeater.add_argument("--client-a-id", type=int, default=1)
     repeater.add_argument("--client-b-id", type=int, default=2)
@@ -78,8 +78,8 @@ def parse_args():
         default=True,
         help="Use one timestamp for both A/B data messages in non-parallel mode. PTP clock sync always uses per-client timestamps.",
     )
-    repeater.add_argument("--count-interval", type=float, default=0.0, help="Sleep seconds between counts.")
-    repeater.add_argument("--pace-mode", choices=("sleep", "spin", "hybrid"), default="sleep", help="How --count-interval pacing waits between counts.")
+    repeater.add_argument("--count-interval", type=float, default=0.00005, help="Sleep seconds between counts.")
+    repeater.add_argument("--pace-mode", choices=("sleep", "spin", "hybrid"), default="spin", help="How --count-interval pacing waits between counts.")
     repeater.add_argument("--spin-margin-us", type=float, default=100.0, help="Final busy-wait window used by --pace-mode hybrid.")
     repeater.add_argument("--quiet", action="store_true")
     repeater.add_argument("--plot", action="store_true", help="Write repeater send timing CSV data.")
@@ -97,11 +97,12 @@ def parse_args():
         metavar="{tcp,udp}",
         help="Enable pre-run PTP-style clock offset calibration over tcp or udp. Bare --clock-sync keeps old TCP behavior.",
     )
-    repeater.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    repeater.add_argument("--clock-sync-samples", type=int, default=264, help="Calibration exchanges used only with --clock-sync.")
     repeater.add_argument("--clock-sync-protocol", choices=("tcp", "udp"), default=None, help=argparse.SUPPRESS)
-    repeater.add_argument("--clock-sync-kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
+    repeater.add_argument("--clock-sync-kernel-timestamp", action=argparse.BooleanOptionalAction, default=True, help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
     repeater.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
-    repeater.add_argument("--udp-ready-timeout", type=float, default=30.0, help="Seconds to wait for each client's UDP hello.")
+    repeater.add_argument("--udp-ready-timeout", type=float, default=120.0, help="Seconds to wait for each client's UDP hello.")
+    repeater.add_argument("--pswap", type=float, default=1.0, help="Probability of swap success (0.0-1.0). Repeater decides success/failure.")
 
     client = subparsers.add_parser("client", help="Run in client mode.")
     client.add_argument("--repeater-host", default="127.0.0.1")
@@ -109,12 +110,12 @@ def parse_args():
     client.add_argument("--count", type=int, default=2000)
     client.add_argument("--warmup", type=int, default=50)
     client.add_argument("--connect-timeout", type=float, default=10.0)
-    client.add_argument("--detect-timeout", type=float, default=30.0)
-    client.add_argument("--detect-interval", type=float, default=0.05)
+    client.add_argument("--detect-timeout", type=float, default=120.0)
+    client.add_argument("--detect-interval", type=float, default=0.02)
     client.add_argument("--cpu", type=int, default=None, help="Pin this process to one CPU core.")
     client.add_argument("--rt-priority", type=int, default=50, help="Set SCHED_FIFO priority (1-99), usually needs sudo.")
     client.add_argument("--sock-buf", type=int, default=65536, help="Set both SO_SNDBUF/SO_RCVBUF if > 0.")
-    client.add_argument("--busy-poll-us", type=int, default=25, help="Set SO_BUSY_POLL in microseconds if supported.")
+    client.add_argument("--busy-poll-us", type=int, default=50, help="Set SO_BUSY_POLL in microseconds if supported.")
     client.add_argument("--client-id", type=int, default=1)
     client.add_argument("--repeater-id", type=int, default=0)
     client.add_argument("--werner-in", type=float, default=1)
@@ -136,17 +137,17 @@ def parse_args():
         metavar="{tcp,udp}",
         help="Estimate repeater-clock minus client-clock offset over tcp or udp. Bare --clock-sync keeps old TCP behavior.",
     )
-    client.add_argument("--clock-sync-samples", type=int, default=8, help="Calibration exchanges used only with --clock-sync.")
+    client.add_argument("--clock-sync-samples", type=int, default=264, help="Calibration exchanges used only with --clock-sync.")
     client.add_argument("--clock-sync-warmup", type=int, default=None, help="Clock-sync samples discarded before offset averaging. Defaults to floor(5%% of --clock-sync-samples).")
     client.add_argument("--clock-sync-method", choices=("mean", "median", "best-path-median"), default="best-path-median", help="Estimator used for the final clock offset after warmup.")
     client.add_argument("--clock-sync-best-ratio", type=float, default=0.5, help="Fraction of lowest-path-delay samples used by --clock-sync-method best-path-median.")
     client.add_argument("--clock-sync-protocol", choices=("tcp", "udp"), default=None, help=argparse.SUPPRESS)
-    client.add_argument("--clock-sync-kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
+    client.add_argument("--clock-sync-kernel-timestamp", action=argparse.BooleanOptionalAction, default=True, help="Use Linux SO_TIMESTAMPNS RX timestamps for UDP clock sync.")
     client.add_argument("--clock-offset-ns", type=int, default=None, help="Manual repeater-clock minus client-clock offset. Skips auto calibration and does not require --clock-sync.")
     client.add_argument("--center-delay", action="store_true", help="Center delay stats around the run median; raw signed delay stays in CSV.")
     client.add_argument("--data-protocol", choices=("udp", "tcp"), default="udp", help="Transport for swapping result messages after TCP/PTP setup.")
     client.add_argument("--udp-idle-timeout", type=float, default=5.0, help="Stop waiting for UDP data after this many idle seconds.")
-    client.add_argument("--kernel-timestamp", action="store_true", help="Use Linux SO_TIMESTAMPNS receive timestamps for UDP data.")
+    client.add_argument("--kernel-timestamp", action=argparse.BooleanOptionalAction, default=True, help="Use Linux SO_TIMESTAMPNS receive timestamps for UDP data.")
 
     args = parser.parse_args()
     clock_sync_transport = getattr(args, "clock_sync", None)
@@ -970,7 +971,7 @@ def pswap_hook(msg_a, msg_b, args):
 
 def run_repeater(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
-    if args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
+    if args.clock_sync and args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
         raise ValueError("--clock-sync-kernel-timestamp requires --clock-sync udp")
     count = max(1, int(args.count))
     if args.werner_ar is None:
@@ -994,6 +995,11 @@ def run_repeater(args):
     send_b_block_samples = [0] * count if args.diag else []
     send_gap_ab_samples = [0] * count if args.diag else []
     correction_bits_samples = [random.randrange(4) for _ in range(count)]
+    
+    # pswap (probability of swap success) tracking
+    pswap = min(1.0, max(0.0, float(getattr(args, 'pswap', 1.0))))
+    swap_success_samples = [False] * count  # Track success/failure for each swap
+    swap_send_time_ns = [0] * count  # Track time taken to send swap result
 
     def accept_one(host, port):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1134,6 +1140,14 @@ def run_repeater(args):
                 for idx in range(count):
                     correction_bits = correction_bits_samples[idx]
                     count_idx = idx + 1
+                    
+                    # Determine swap success based on pswap probability
+                    swap_success = (pswap >= 1.0) or (random.random() <= pswap)
+                    swap_success_samples[idx] = swap_success
+                    
+                    # If swap fails, set w_swap to 0.0 to indicate failure
+                    w_swap = 1.0 if swap_success else 0.0
+                    
                     ts_emit_a_ns = time_ns()
                     if is_udp_data:
                         pack_into(outbuf_a, 0, count_idx, ts_emit_a_ns, peer_a_id, correction_bits, w_swap)
@@ -1168,6 +1182,9 @@ def run_repeater(args):
                         if send_to_b:
                             send_b(outbuf_b)
                     last_msg_b = (ts_emit_b_ns, peer_b_id, correction_bits, w_swap)
+                    
+                    # Track swap send timing
+                    swap_send_time_ns[idx] = (ts_emit_b_ns - ts_emit_a_ns) if shared_send_timestamp else 0
                     if pace_interval_ns > 0:
                         if pace_mode == "sleep":
                             sleep(count_interval)
@@ -1188,21 +1205,27 @@ def run_repeater(args):
         csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,send_a_block_ns,send_b_block_ns,send_gap_ab_ns\n")
-                for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns) in enumerate(
-                    zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples), start=1
+                handle.write("count_idx,send_a_block_ns,send_b_block_ns,send_gap_ab_ns,swap_success,swap_send_time_ns\n")
+                for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns, swap_success, swap_time) in enumerate(
+                    zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples, swap_success_samples, swap_send_time_ns), start=1
                 ):
-                    handle.write(f"{count_idx},{send_a_ns},{send_b_ns},{send_gap_ab_ns}\n")
+                    handle.write(f"{count_idx},{send_a_ns},{send_b_ns},{send_gap_ab_ns},{1 if swap_success else 0},{swap_time}\n")
             else:
-                handle.write("count_idx\n")
-                for count_idx in range(1, count + 1):
-                    handle.write(f"{count_idx}\n")
+                handle.write("count_idx,swap_success,swap_send_time_ns\n")
+                for count_idx, (swap_success, swap_time) in enumerate(zip(swap_success_samples, swap_send_time_ns), start=1):
+                    handle.write(f"{count_idx},{1 if swap_success else 0},{swap_time}\n")
         chown_output_path(csv_path)
         print(f"repeater_plot=data_saved ({csv_path})")
         if args.json_output:
             json_dir = args.json_dir or default_json_dir(args.plot_dir)
             ensure_output_dir(json_dir)
             json_path = os.path.join(json_dir, f"{base}{suffix}.json")
+            
+            # Calculate pswap statistics
+            success_count = sum(1 for s in swap_success_samples if s)
+            failure_count = count - success_count
+            success_rate = success_count / count if count > 0 else 0.0
+            
             payload = {
                 "role": "repeater",
                 "argv": sys.argv,
@@ -1211,6 +1234,14 @@ def run_repeater(args):
                 "created_at_unix_ns": time.time_ns(),
                 "exchanges": int(count),
                 "data_protocol": args.data_protocol,
+                "pswap": float(pswap),
+                "pswap_stats": {
+                    "total_swaps": int(count),
+                    "success_count": int(success_count),
+                    "failure_count": int(failure_count),
+                    "success_rate": float(success_rate),
+                    "expected_success_rate": float(pswap),
+                },
                 "state_ar_start": {
                     "local_id": int(args.repeater_id),
                     "werner": float(w_ar_init),
@@ -1241,6 +1272,7 @@ def run_repeater(args):
                     "send_a_block_ns": ns_summary(send_a_block_samples),
                     "send_b_block_ns": ns_summary(send_b_block_samples),
                     "send_gap_ab_ns": ns_summary(send_gap_ab_samples),
+                    "swap_send_time_ns": ns_summary(swap_send_time_ns),
                 }
                 payload["samples"] = [
                     {
@@ -1248,10 +1280,21 @@ def run_repeater(args):
                         "send_a_block_ns": int(send_a_ns),
                         "send_b_block_ns": int(send_b_ns),
                         "send_gap_ab_ns": int(send_gap_ab_ns),
+                        "swap_success": bool(swap_success),
+                        "swap_send_time_ns": int(swap_time),
                     }
-                    for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns) in enumerate(
-                        zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples), start=1
+                    for count_idx, (send_a_ns, send_b_ns, send_gap_ab_ns, swap_success, swap_time) in enumerate(
+                        zip(send_a_block_samples, send_b_block_samples, send_gap_ab_samples, swap_success_samples, swap_send_time_ns), start=1
                     )
+                ]
+            else:
+                payload["samples"] = [
+                    {
+                        "count_idx": int(count_idx),
+                        "swap_success": bool(swap_success),
+                        "swap_send_time_ns": int(swap_time),
+                    }
+                    for count_idx, (swap_success, swap_time) in enumerate(zip(swap_success_samples, swap_send_time_ns), start=1)
                 ]
             with open(json_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
@@ -1286,7 +1329,7 @@ def run_repeater(args):
 
 def run_client(args):
     apply_cpu_rt(args.cpu, args.rt_priority)
-    if args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
+    if args.clock_sync and args.clock_sync_kernel_timestamp and args.clock_sync_protocol != "udp":
         raise ValueError("--clock-sync-kernel-timestamp requires --clock-sync udp")
     count = max(1, int(args.count))
     warmup = max(0, min(int(args.warmup), count - 1))
@@ -1424,6 +1467,9 @@ def run_client(args):
                     count_idx, ts_emit_ns, peer_id, correction_bits, w_swap = udp_unpack_from(inbuf)
                     if count_idx <= 0 or count_idx > count:
                         continue
+                    # Skip negative count_idx (should not happen, but safety check)
+                    if count_idx < 0:
+                        continue
                     udp_received += 1
                     if not udp_seen_counts[count_idx]:
                         udp_seen_counts[count_idx] = 1
@@ -1551,15 +1597,17 @@ def run_client(args):
         csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns\n")
-                for idx, delay_ns, delay_centered_ns, delay_physical_ns, loop_gap_ns, recv_block_ns in zip(
-                    delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, loop_gap_samples, recv_block_samples
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns,success\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns, loop_gap_ns, recv_block_ns, w_swap_raw in zip(
+                    delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, loop_gap_samples, recv_block_samples, werner_raw_samples
                 ):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns}\n")
+                    success = 1 if w_swap_raw > 0 else 0
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns},{success}\n")
             else:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns\n")
-                for idx, delay_ns, delay_centered_ns, delay_physical_ns in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples):
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns}\n")
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,success\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns, w_swap_raw in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, werner_raw_samples):
+                    success = 1 if w_swap_raw > 0 else 0
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{success}\n")
         chown_output_path(csv_path)
         print(f"plot=data_saved ({csv_path})")
         if clock_sync_sample_rows:

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import gc
+from http import server
+from itertools import count
 import json
 import math
 import os
@@ -9,7 +11,7 @@ import socket
 import struct
 import time
 
-TS_FORMAT = "!Q"
+TS_FORMAT = "!QB"
 TS_SIZE = struct.calcsize(TS_FORMAT)
 
 
@@ -85,27 +87,32 @@ def recvfrom_timestamped(sock, size, kernel_timestamp=False):
     data, addr = sock.recvfrom(size)
     return data, addr, time.time_ns(), False
 
-
-import math
-import socket
-import struct
-import time
-
-
 def serve_clock_sync_udp(udp_sock, samples=5, kernel_timestamp=False):
     if kernel_timestamp:
         enable_kernel_timestamp_ns(udp_sock)
 
     hello_size = CLOCK_SYNC_UDP_HELLO_SIZE
+    
+    # CORRECCIÓN 1: Usar un tamaño máximo para vaciar siempre el buffer UDP sin truncar paquetes
     max_req_size = max(
-        CLOCK_SYNC_UDP_HELLO_SIZE, CLOCK_SYNC_UDP_DELAY_REQ_SIZE
+        CLOCK_SYNC_UDP_HELLO_SIZE, 
+        CLOCK_SYNC_UDP_SYNC_SIZE,
+        CLOCK_SYNC_UDP_DELAY_REQ_SIZE,
+        CLOCK_SYNC_UDP_DELAY_RESP_SIZE
     )
 
-    # 1. Espera el HELLO inicial del cliente
+    # Timeout de seguridad para no congelar el proceso si la red pierde paquetes
+    udp_sock.settimeout(2.0)
+
+    # 1. Espera el HELLO inicial del cliente (AEGOCS1!)
     while True:
-        data, addr, _rx_ns, _got_kernel = recvfrom_timestamped(
-            udp_sock, max_req_size, False
-        )
+        try:
+            data, addr, _rx_ns, _got_kernel = recvfrom_timestamped(
+                udp_sock, max_req_size, False
+            )
+        except socket.timeout:
+            continue
+
         if len(data) == hello_size:
             magic, msg_type = struct.unpack(CLOCK_SYNC_UDP_HELLO_FORMAT, data)
             if (
@@ -114,7 +121,7 @@ def serve_clock_sync_udp(udp_sock, samples=5, kernel_timestamp=False):
             ):
                 break
 
-    # 2. Ráfaga rápida de sincronización
+    # 2. Ráfaga rápida de sincronización AEGO
     for sample_number in range(1, max(0, int(samples)) + 1):
         t1_ns = time.time_ns()
         udp_sock.sendto(
@@ -128,28 +135,40 @@ def serve_clock_sync_udp(udp_sock, samples=5, kernel_timestamp=False):
             addr,
         )
 
+        sample_matched = False
         while True:
-            data, req_addr, t4_ns, t4_got_kernel = recvfrom_timestamped(
-                udp_sock, CLOCK_SYNC_UDP_DELAY_REQ_SIZE, kernel_timestamp
-            )
-            if req_addr != addr or len(data) != CLOCK_SYNC_UDP_DELAY_REQ_SIZE:
-                continue
-
-            (
-                magic,
-                msg_type,
-                echoed_sample,
-                t1_echo_ns,
-                t2_ns,
-                t3_ns,
-            ) = struct.unpack(CLOCK_SYNC_UDP_DELAY_REQ_FORMAT, data)
-            if (
-                magic == CLOCK_SYNC_UDP_MAGIC
-                and msg_type == CLOCK_SYNC_UDP_DELAY_REQ
-                and echoed_sample == sample_number
-                and t1_echo_ns == t1_ns
-            ):
+            try:
+                # CORRECCIÓN 2: Leer con max_req_size en vez de CLOCK_SYNC_UDP_DELAY_REQ_SIZE
+                data, req_addr, t4_ns, t4_got_kernel = recvfrom_timestamped(
+                    udp_sock, max_req_size, kernel_timestamp
+                )
+            except socket.timeout:
+                # Si se pierde la solicitud, descartamos la muestra actual en vez de congelar el socket
                 break
+
+            if req_addr != addr:
+                continue
+                
+            if len(data) == CLOCK_SYNC_UDP_DELAY_REQ_SIZE:
+                (
+                    magic,
+                    msg_type,
+                    echoed_sample,
+                    t1_echo_ns,
+                    t2_ns,
+                    t3_ns,
+                ) = struct.unpack(CLOCK_SYNC_UDP_DELAY_REQ_FORMAT, data)
+    
+                if (
+                    magic == CLOCK_SYNC_UDP_MAGIC
+                    and msg_type == CLOCK_SYNC_UDP_DELAY_REQ
+                    and echoed_sample == sample_number
+                ):
+                    sample_matched = True
+                    break
+
+        if not sample_matched:
+            continue
 
         udp_sock.sendto(
             struct.pack(
@@ -176,10 +195,11 @@ def estimate_clock_offset_udp(
     best_ratio=0.5,
     sock_buf=65536,
     busy_poll_us=0,
-    detect_timeout=1.0,  # Timeout global corto de 1 segundo
-    detect_interval=0.001,  # Read timeout de socket agresivo (1 ms)
+    detect_timeout=1.0,
+    detect_interval=0.001,
     kernel_timestamp=False,
 ):
+    """Estimate clock offset against UDP sync server (Client side)."""
     sample_total = max(1, int(samples))
     clock_sync_samples = []
 
@@ -199,9 +219,18 @@ def estimate_clock_offset_udp(
     sock.bind(("", 0))
     server_addr = (host, int(port))
 
-    # Timeout de lectura de 1 ms para ráfaga directa
-    sock.settimeout(max(0.001, float(detect_interval)))
-    deadline = time.monotonic() + max(0.1, float(detect_timeout))
+    sock.settimeout(max(0.05, float(detect_interval))) # Timeout ágil
+    
+    # CORRECCIÓN 3: Refrescaremos este deadline si hay progreso para evitar crasheos prematuros
+    base_timeout = max(2.0, float(detect_timeout))
+    deadline = time.monotonic() + base_timeout
+
+    max_req_size = max(
+        CLOCK_SYNC_UDP_HELLO_SIZE, 
+        CLOCK_SYNC_UDP_SYNC_SIZE,
+        CLOCK_SYNC_UDP_DELAY_REQ_SIZE,
+        CLOCK_SYNC_UDP_DELAY_RESP_SIZE
+    )
 
     try:
         sample_number = 1
@@ -209,7 +238,9 @@ def estimate_clock_offset_udp(
 
         while sample_number <= sample_total:
             if time.monotonic() >= deadline:
-                raise TimeoutError("UDP clock sync timeout in deos_fast mode")
+                # CORRECCIÓN 4: Si superamos el límite global por red caída, rompemos el bucle
+                # en lugar de lanzar TimeoutError, y devolvemos lo que hayamos logrado.
+                break
 
             if waiting_for_first_sync:
                 sock.sendto(
@@ -221,42 +252,46 @@ def estimate_clock_offset_udp(
                     server_addr,
                 )
 
-            # Recepción de SYNC
+            # Receive SYNC packet
+            sync_received = False
             while True:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("Timeout waiting for SYNC")
+                    break
                 try:
                     data, addr, t2_ns, got_kernel = recvfrom_timestamped(
-                        sock, CLOCK_SYNC_UDP_SYNC_SIZE, kernel_timestamp
+                        sock, max_req_size, kernel_timestamp
                     )
                 except socket.timeout:
                     if waiting_for_first_sync:
-                        break
-                    continue
-
-                if (
-                    addr != server_addr
-                    or len(data) != CLOCK_SYNC_UDP_SYNC_SIZE
-                ):
-                    continue
-
-                magic, msg_type, echoed_sample, t1_ns = struct.unpack(
-                    CLOCK_SYNC_UDP_SYNC_FORMAT, data
-                )
-                if (
-                    magic == CLOCK_SYNC_UDP_MAGIC
-                    and msg_type == CLOCK_SYNC_UDP_SYNC
-                    and echoed_sample == sample_number
-                ):
-                    waiting_for_first_sync = False
+                        break # Salir para volver a mandar HELLO
+                    # Salir del bucle interno para evaluar si el proceso ha muerto
                     break
-            else:
+
+                if addr != server_addr:
+                    continue
+                    
+                if len(data) == CLOCK_SYNC_UDP_SYNC_SIZE:
+                    magic, msg_type, echoed_sample, t1_ns = struct.unpack(
+                        CLOCK_SYNC_UDP_SYNC_FORMAT, data
+                    )
+                    if (
+                        magic == CLOCK_SYNC_UDP_MAGIC
+                        and msg_type == CLOCK_SYNC_UDP_SYNC
+                        and echoed_sample >= sample_number  # CORRECCIÓN 5: ¡Fast-Forward! Aceptamos si el servidor avanzó la muestra
+                    ):
+                        sample_number = echoed_sample
+                        waiting_for_first_sync = False
+                        sync_received = True
+                        deadline = time.monotonic() + base_timeout # Hubo progreso, refrescamos vida
+                        break
+
+            if time.monotonic() >= deadline:
+                break
+
+            if waiting_for_first_sync or not sync_received:
                 continue
 
-            if waiting_for_first_sync:
-                continue
-
-            # Envío de DELAY_REQ
+            # Send DELAY_REQ packet
             t3_ns = time.time_ns()
             sock.sendto(
                 struct.pack(
@@ -271,54 +306,53 @@ def estimate_clock_offset_udp(
                 server_addr,
             )
 
-            # Recepción de DELAY_RESP
+            # Receive DELAY_RESP packet
+            resp_received = False
             while True:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("Timeout waiting for DELAY_RESP")
+                    break
                 try:
                     data, addr, _rx_ns, _got_kernel = recvfrom_timestamped(
-                        sock, CLOCK_SYNC_UDP_DELAY_RESP_SIZE, False
+                        sock, max_req_size, False
                     )
                 except socket.timeout:
+                    # CORRECCIÓN 6: Romper el bucle infinito si se pierde la respuesta
+                    break
+
+                if addr != server_addr:
                     continue
 
-                if (
-                    addr != server_addr
-                    or len(data) != CLOCK_SYNC_UDP_DELAY_RESP_SIZE
-                ):
-                    continue
-
-                (
-                    magic,
-                    msg_type,
-                    echoed_sample,
-                    echoed_t1_ns,
-                    echoed_t2_ns,
-                    echoed_t3_ns,
-                    t4_ns,
-                    t4_got_kernel,
-                ) = struct.unpack(CLOCK_SYNC_UDP_DELAY_RESP_FORMAT, data)
-
-                if (
-                    magic == CLOCK_SYNC_UDP_MAGIC
-                    and msg_type == CLOCK_SYNC_UDP_DELAY_RESP
-                    and (
+                if len(data) == CLOCK_SYNC_UDP_DELAY_RESP_SIZE:
+                    (
+                        magic,
+                        msg_type,
                         echoed_sample,
                         echoed_t1_ns,
                         echoed_t2_ns,
                         echoed_t3_ns,
-                    )
-                    == (sample_number, t1_ns, t2_ns, t3_ns)
-                ):
-                    break
+                        t4_ns,
+                        t4_got_kernel,
+                    ) = struct.unpack(CLOCK_SYNC_UDP_DELAY_RESP_FORMAT, data)
 
-            # Cálculo de offset de la muestra
+                    if (
+                        magic == CLOCK_SYNC_UDP_MAGIC
+                        and msg_type == CLOCK_SYNC_UDP_DELAY_RESP
+                        and echoed_sample == sample_number
+                    ):
+                        resp_received = True
+                        deadline = time.monotonic() + base_timeout # Hubo progreso, refrescamos vida
+                        break
+
+            if not resp_received:
+                # Si falló, simplemente repetimos el bucle principal. 
+                # El servidor mandará un nuevo SYNC y el Fast-Forward (>=) actualizará sample_number.
+                continue
+
+            # --- CÁLCULO DE OFFSET ---
             master_to_slave_ns = t2_ns - t1_ns
             slave_to_master_ns = t4_ns - t3_ns
-            mean_path_delay_ns = (
-                master_to_slave_ns + slave_to_master_ns
-            ) // 2
-            offset_ns = (slave_to_master_ns - master_to_slave_ns) // 2
+            mean_path_delay_ns = (master_to_slave_ns + slave_to_master_ns) // 2
+            offset_ns = (master_to_slave_ns - slave_to_master_ns) // 2
 
             clock_sync_samples.append(
                 {
@@ -340,9 +374,9 @@ def estimate_clock_offset_udp(
         sock.close()
 
     if not clock_sync_samples:
+        # Si fallaron todas, no petamos la aplicación, devolvemos 0
         return 0, 0, []
 
-    # Selección de los mejores paquetes según RTT / path_delay
     best_count = max(
         1, int(math.ceil(len(clock_sync_samples) * float(best_ratio)))
     )
@@ -577,7 +611,7 @@ def connect_receiver_until_ready_udp(host, port, connect_timeout, detect_timeout
         try:
             sock.sendto(b"AEGOPING", server_addr)
             data, _ = sock.recvfrom(16)
-            if data == b"AEGOPONG":
+            if b"AEGOPONG" in data:
                 sock.connect(server_addr)
                 return sock
         except OSError as exc:
@@ -655,6 +689,7 @@ def run_sender(args):
     if ptp_offset_ns != 0:
         print(f"[PTP] Using offset from daemon: {ptp_offset_ns} ns")
     
+    clock_offset_ns = 0
     if getattr(args, 'clock_sync', False):
         clock_sync_host = args.receiver_host
         clock_sync_port = getattr(args, 'clock_sync_port', 7501)
@@ -692,8 +727,9 @@ def run_sender(args):
     emit_to_remote_samples = []
     sent_count = 0
     success_count = 0
-    success_indices = []
+    indices = []
     emit_ts_samples = []
+    success_bits = []
     last_emit_to_remote = 0
     last_round_trip_perf = 0
     outbuf = bytearray(TS_SIZE)
@@ -723,7 +759,7 @@ def run_sender(args):
         with sock:
             for i in range(count):
                 ts_emit_ns = time.time_ns()
-                struct.pack_into(TS_FORMAT, outbuf, 0, ts_emit_ns)
+                struct.pack_into(TS_FORMAT, outbuf, 0, ts_emit_ns-clock_offset_ns, 1)
                 
                 if not pgen_hook(i, ts_emit_ns, outbuf, args):
                     continue
@@ -745,8 +781,10 @@ def run_sender(args):
                     send_timings.append(t_send_post - t_send_pre)
                     recv_timings.append(t_rtt1 - t_rtt0)
                 
-                ts_remote_update_ns = struct.unpack(TS_FORMAT, inbuf)[0]
-                last_emit_to_remote = max(0, abs(ts_remote_update_ns - ts_emit_ns))
+                ts_remote_update_ns, success_bit = struct.unpack(TS_FORMAT, inbuf[:TS_SIZE])
+                ts_remote_corrected_ns = ts_remote_update_ns + clock_offset_ns
+
+                last_emit_to_remote = max(0, abs(ts_remote_corrected_ns - ts_emit_ns))
                 last_round_trip_perf = max(0, t_rtt1 - t_rtt0)
                 
                 if i >= warmup:
@@ -754,7 +792,8 @@ def run_sender(args):
                     emit_to_remote_samples.append(last_emit_to_remote)
                     emit_ts_samples.append(ts_emit_ns)
                     success_count += 1
-                    success_indices.append(i)
+                    indices.append(i)
+                    success_bits.append(success_bit)
                 
                 if count_interval_ns > 0:
                     pace_wait(count_interval_ns, args.pace_mode, spin_margin_ns)
@@ -781,9 +820,9 @@ def run_sender(args):
         json_path = get_available_filename(json_base, ".json")
         
         with open(csv_path, "w") as f:
-            f.write("count_index,emit_ts_ns,rtt_ns,e2r_ns,werner\n")
-            for count_idx, emit_ts_ns, rtt_val, e2r_val, w_val in zip(success_indices, emit_ts_samples, rtt_perf_samples, emit_to_remote_samples, werner_samples):
-                f.write(f"{count_idx},{int(emit_ts_ns)},{int(rtt_val)},{int(e2r_val)},{w_val:.6f}\n")
+            f.write("count_index,emit_ts_ns,rtt_ns,e2r_ns,werner,success_bit\n")
+            for count_idx, emit_ts_ns, rtt_val, e2r_val, w_val, success_bit in zip(indices, emit_ts_samples, rtt_perf_samples, emit_to_remote_samples, werner_samples, success_bits):
+                f.write(f"{count_idx},{int(emit_ts_ns)},{int(rtt_val)},{int(e2r_val)},{w_val:.6f},{int(success_bit)}\n")
         
         if args.json_output:
             ensure_output_dir(json_dir)
@@ -855,22 +894,22 @@ def run_receiver(args):
         print(f"[PTP] Using offset from daemon: {ptp_offset_ns} ns")
     
     if getattr(args, 'clock_sync', False):
-        import threading
         clock_sync_port = getattr(args, 'clock_sync_port', 7501)
         clock_sync_samples = getattr(args, 'clock_sync_samples', 264)
         clock_sync_kernel_ts = getattr(args, 'clock_sync_kernel_timestamp', True)
         
-        def run_clock_sync_server():
-            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp_sock.bind(("0.0.0.0", clock_sync_port))
-            print(f"[Clock Sync] Starting UDP clock sync server on port {clock_sync_port}...")
-            serve_clock_sync_udp(udp_sock, clock_sync_samples, clock_sync_kernel_ts)
-            print(f"[Clock Sync] UDP clock sync server completed.")
-        
-        clock_sync_thread = threading.Thread(target=run_clock_sync_server, daemon=True)
-        clock_sync_thread.start()
-        time.sleep(0.5)
+        print(f"[Clock Sync AEGO] Starting UDP clock sync server on port {clock_sync_port}...")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+                udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                udp_sock.bind(("0.0.0.0", clock_sync_port))
+                
+                serve_clock_sync_udp(udp_sock, clock_sync_samples, clock_sync_kernel_ts)
+                
+            print("[Clock Sync AEGO] UDP clock sync server completed. Starting experiments...")
+        except Exception as e:
+            print(f"[Clock Sync AEGO] Failed: {e}")
+            print("[Clock Sync AEGO] Continuing to experiments without sync...")
     
     apply_cpu_rt(args.cpu, args.rt_priority)
     count = max(1, int(args.count))
@@ -941,9 +980,17 @@ def run_receiver(args):
                     t_recv_post = time.perf_counter_ns()
                     recv_timings.append(t_recv_post - t_recv_pre)
                 
-                ts_emit_ns = struct.unpack(TS_FORMAT, inbuf)[0]
+                # 1. Unpack the timestamp and the client flag
+                ts_emit_ns, sender_flag = struct.unpack(TS_FORMAT, inbuf[:TS_SIZE])
                 ts_recv_ns = time.time_ns()
-                struct.pack_into(TS_FORMAT, outbuf, 0, ts_recv_ns)
+                
+                # 2. Determine success/failure before packing the response
+                is_success = True
+                if pgen < 1.0 and i >= warmup:
+                    is_success = random.random() <= pgen
+                
+                # 3. Pack the receive timestamp and the success bit (1 or 0)
+                struct.pack_into(TS_FORMAT, outbuf, 0, ts_recv_ns, 1 if is_success else 0)
                 
                 if args.diag:
                     t_ack_pre = time.perf_counter_ns()
@@ -957,10 +1004,6 @@ def run_receiver(args):
                 server.sendto(outbuf, client_addr)
                 last_sender_to_receiver = max(0, abs(ts_recv_ns - ts_emit_ns))
                 last_recv_to_ack = max(0, ts_ack_sent_ns - ts_recv_ns)
-                
-                is_success = True
-                if pgen < 1.0 and i >= warmup:
-                    is_success = random.random() <= pgen
                 
                 if i >= warmup:
                     if is_success:
