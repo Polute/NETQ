@@ -1339,6 +1339,7 @@ def run_client(args):
     werner_raw_samples = [0.0] * sample_count
     sample_msgs = [None] * sample_count
     delta_record_counts = [0] * sample_count
+    ts_emit_samples = [0] * sample_count  # Track repeater timestamps
     loop_gap_samples = [0] * sample_count if args.diag else []
     recv_block_samples = [0] * sample_count if args.diag else []
     last_delta = 0
@@ -1484,6 +1485,7 @@ def run_client(args):
                         raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
                         delta_samples[sample_idx] = last_delta
                         werner_raw_samples[sample_idx] = w_swap_raw
+                        ts_emit_samples[sample_idx] = ts_emit_ns  # Record repeater timestamp
                         sample_msgs[sample_idx] = (last_delta, count_idx, raw_msg, None)
                         delta_record_counts[sample_idx] = count_idx
                         if diag:
@@ -1517,6 +1519,7 @@ def run_client(args):
                         raw_msg = (ts_emit_ns, peer_id, correction_bits, w_swap_raw)
                         delta_samples[sample_idx] = last_delta
                         werner_raw_samples[sample_idx] = w_swap_raw
+                        ts_emit_samples[sample_idx] = ts_emit_ns  # Record repeater timestamp
                         sample_msgs[sample_idx] = (last_delta, i + 1, raw_msg, None)
                         delta_record_counts[sample_idx] = i + 1
                         if diag:
@@ -1536,6 +1539,7 @@ def run_client(args):
 
     delta_samples = delta_samples[:sample_idx]
     werner_raw_samples = werner_raw_samples[:sample_idx]
+    ts_emit_samples = ts_emit_samples[:sample_idx]
     sample_msgs = sample_msgs[:sample_idx]
     delta_record_counts = delta_record_counts[:sample_idx]
     if args.diag:
@@ -1597,17 +1601,17 @@ def run_client(args):
         csv_path = os.path.join(args.plot_dir, f"{base}{suffix}.csv")
         with open(csv_path, "w", encoding="utf-8") as handle:
             if args.diag:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns,success\n")
-                for idx, delay_ns, delay_centered_ns, delay_physical_ns, loop_gap_ns, recv_block_ns, w_swap_raw in zip(
-                    delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, loop_gap_samples, recv_block_samples, werner_raw_samples
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,loop_gap_ns,recv_block_ns,ts_emit_ns,success\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns, loop_gap_ns, recv_block_ns, ts_emit, w_swap_raw in zip(
+                    delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, loop_gap_samples, recv_block_samples, ts_emit_samples, werner_raw_samples
                 ):
                     success = 1 if w_swap_raw > 0 else 0
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns},{success}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{loop_gap_ns},{recv_block_ns},{ts_emit},{success}\n")
             else:
-                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,success\n")
-                for idx, delay_ns, delay_centered_ns, delay_physical_ns, w_swap_raw in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, werner_raw_samples):
+                handle.write("count_idx,delay_ns,delay_center_ns,delay_centered_ns,delay_physical_ns,clock_offset_ns,clock_sync_path_delay_ns,ts_emit_ns,success\n")
+                for idx, delay_ns, delay_centered_ns, delay_physical_ns, ts_emit, w_swap_raw in zip(delta_record_counts, delta_samples, delay_stat_samples, delay_physical_samples, ts_emit_samples, werner_raw_samples):
                     success = 1 if w_swap_raw > 0 else 0
-                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{success}\n")
+                    handle.write(f"{idx},{delay_ns},{delay_center_ns},{delay_centered_ns},{delay_physical_ns},{clock_offset_ns},{clock_sync_path_delay_ns},{ts_emit},{success}\n")
         chown_output_path(csv_path)
         print(f"plot=data_saved ({csv_path})")
         if clock_sync_sample_rows:
@@ -1665,15 +1669,19 @@ def run_client(args):
             ensure_output_dir(json_dir)
             json_path = os.path.join(json_dir, f"{base}{suffix}.json")
             json_samples = []
-            for count_idx, delay_ns, delay_centered_ns, delay_physical_ns, w_swap_raw, werner, sample in zip(
+            for count_idx, delay_ns, delay_centered_ns, delay_physical_ns, ts_emit, w_swap_raw, werner, sample in zip(
                 delta_record_counts,
                 delta_samples,
                 delay_stat_samples,
                 delay_physical_samples,
+                ts_emit_samples,
                 werner_raw_samples,
                 werner_samples,
                 sample_msgs,
             ):
+                # Skip negative count_idx in JSON output
+                if count_idx < 0:
+                    continue
                 msg = sample[2] if sample else (0, 0, 0, 0.0)
                 json_samples.append(
                     {
@@ -1684,7 +1692,7 @@ def run_client(args):
                         "delay_physical_ns": int(delay_physical_ns),
                         "clock_offset_ns": int(clock_offset_ns),
                         "clock_sync_path_delay_ns": int(clock_sync_path_delay_ns),
-                        "ts_emit_ns": int(msg[0]),
+                        "ts_emit_ns": int(ts_emit),
                         "peer_id": int(msg[1]),
                         "correction_bits": int(msg[2]),
                         "w_swap_raw": float(w_swap_raw),

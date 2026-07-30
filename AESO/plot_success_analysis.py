@@ -101,8 +101,10 @@ def parse_csv(csv_path):
             'delay_physical_ns': [list of physical delay values in ns],
             'clock_offset_ns': [list of clock offset values in ns],
             'clock_sync_path_delay_ns': [list of sync path delay values in ns],
+            'ts_emit_ns': [list of repeater emit timestamps in ns],
             'success': [list of success flags (1=success, 0=failure)],
             'has_success_column': bool,
+            'has_ts_emit_column': bool,
         }
     """
     rows = {
@@ -111,14 +113,17 @@ def parse_csv(csv_path):
         'delay_physical_ns': [],
         'clock_offset_ns': [],
         'clock_sync_path_delay_ns': [],
+        'ts_emit_ns': [],
         'success': [],
         'has_success_column': False,
+        'has_ts_emit_column': False,
     }
     try:
         with open(csv_path, 'r') as f:
             reader = csv.DictReader(f)
             fieldnames = set(reader.fieldnames or [])
             rows['has_success_column'] = 'success' in fieldnames
+            rows['has_ts_emit_column'] = 'ts_emit_ns' in fieldnames
             for row in reader:
                 try:
                     count_idx = int(row.get('count_idx', 0))
@@ -129,11 +134,13 @@ def parse_csv(csv_path):
                     delay_physical_ns = int(float(row.get('delay_physical_ns', 0)))
                     clock_offset_ns = int(float(row.get('clock_offset_ns', 0)))
                     clock_sync_path_delay_ns = int(float(row.get('clock_sync_path_delay_ns', 0)))
+                    ts_emit = int(float(row.get('ts_emit_ns', 0))) if rows['has_ts_emit_column'] else 0
                     rows['counts'].append(count_idx)
                     rows['delay_ns'].append(delay_ns)
                     rows['delay_physical_ns'].append(delay_physical_ns)
                     rows['clock_offset_ns'].append(clock_offset_ns)
                     rows['clock_sync_path_delay_ns'].append(clock_sync_path_delay_ns)
+                    rows['ts_emit_ns'].append(ts_emit)
                     if rows['has_success_column']:
                         rows['success'].append(int(row.get('success', 1)))
                 except (ValueError, KeyError):
@@ -274,6 +281,9 @@ def compute_inter_success_times(csv_data):
         # Fallback: use all positive counts
         success_counts = [c for c in counts if c > 0]
     
+    # Sort success_counts to ensure gaps are positive
+    success_counts = sorted(success_counts)
+    
     if len(success_counts) < 2:
         return {
             'inter_success_times_ns': [],
@@ -290,7 +300,10 @@ def compute_inter_success_times(csv_data):
         if i == 0:
             inter_times.append(0)  # First gap is 0 (like AEGO)
         else:
-            inter_times.append(success_counts[i] - success_counts[i - 1])
+            gap = success_counts[i] - success_counts[i - 1]
+            # Filter negative gaps (should not happen after sorting, but safety)
+            if gap >= 0:
+                inter_times.append(gap)
     
     if not inter_times:
         inter_times = [0]
@@ -727,8 +740,9 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
     count_axis = counts
     count_axis_label = "count"
     
-    # Delay plots (one-way only)
-    if delays:
+    # Delay plots (one-way only) - only for clients, not for repeater
+    role = json_data.get('role', 'client')
+    if delays and role != 'repeater':
         delay_us = [v / 1000.0 for v in delays]
         delay_stats = series_summary(delay_us)
         
@@ -746,9 +760,10 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
             prefix, delay_series, 50, info_text, delay_stats, plot_kind, force, convert_to_us=True
         )
     
-    # Inter-success-time plots
+    # Inter-success-time plots (only for clients, not for repeater)
+    role = json_data.get('role', 'client')
     inter_times = inter_success_data.get('inter_success_times_ns', [])
-    if inter_times:
+    if inter_times and role != 'repeater':
         inter_stats = series_summary(inter_times)
         
         # Get success_counts for x-axis (only successful counts)
@@ -797,13 +812,15 @@ def plot_histograms(csv_data, failure_data, inter_success_data, output_dir, pref
                 prefix, inter_series_seq, 50, info_text, inter_stats, "seq", force, convert_to_us=False
             )
     
-    # Failure plots
-    total_packets = json_data.get('total_packets', max(counts) + 1 if counts else 0)
-    warmup = json_data.get('warmup', 0)
-    write_failure_plots(
-        plt, csv_data, failure_data, sec_dir, counter_dir, prefix,
-        info_text, total_packets, warmup, force, plot_kind
-    )
+    # Failure plots (only for repeater, not for clients)
+    role = json_data.get('role', 'client')
+    if role == 'repeater':
+        total_packets = json_data.get('total_packets', max(counts) + 1 if counts else 0)
+        warmup = json_data.get('warmup', 0)
+        write_failure_plots(
+            plt, csv_data, failure_data, sec_dir, counter_dir, prefix,
+            info_text, total_packets, warmup, force, plot_kind
+        )
     
     print(f"Saved plots in: {output_dir}")
 
@@ -815,6 +832,20 @@ def iter_csv_files(directory):
             yield os.path.join(directory, filename)
 
 
+def csv_dir_to_plots_dir(csv_dir):
+    """Convert csv_ directory name to plots_ directory name."""
+    basename = os.path.basename(csv_dir)
+    if basename.startswith('csv_'):
+        return 'plots_' + basename[4:]
+    return basename
+
+
+def is_csv_dir(path):
+    """Check if path is a csv_ directory."""
+    basename = os.path.basename(path)
+    return basename.startswith('csv_') and os.path.isdir(path)
+
+
 def collect_jobs(inputs, output_dir):
     """Collect CSV files from input directories and map to output directory."""
     jobs = []
@@ -822,13 +853,19 @@ def collect_jobs(inputs, output_dir):
         for input_path in inputs:
             if os.path.isdir(input_path):
                 if output_dir is None:
-                    output_dir = input_path
+                    # For csv_ directories, create plots_ in parent directory
+                    if is_csv_dir(input_path):
+                        parent_dir = os.path.dirname(input_path)
+                        plots_name = csv_dir_to_plots_dir(os.path.basename(input_path))
+                        output_dir = os.path.join(parent_dir, plots_name) if parent_dir else plots_name
+                    else:
+                        output_dir = input_path
                 for csv_path in iter_csv_files(input_path):
                     jobs.append((csv_path, output_dir))
             else:
                 if output_dir is None:
                     csv_dir = os.path.dirname(input_path)
-                    output_dir = csv_dir
+                    output_dir = csv_dir_to_plots_dir(csv_dir) if is_csv_dir(csv_dir) else csv_dir
                 jobs.append((input_path, output_dir))
         return jobs
     return []
@@ -891,33 +928,32 @@ def main():
             print(f"Failure rate: {failure_data['failure_rate']:.2%}")
             print()
         
-        # Save JSON report
-        ensure_output_dir(output_dir)
+        # Generate prefix for plots (needed for both repeater and clients)
         prefix = os.path.splitext(os.path.basename(csv_path))[0]
-        report = {
-            'csv_file': csv_path,
-            'role': role,
-            'argv': json_data.get('argv', []),
-            'args': json_data.get('args', {}),
-            'created_at_unix_ns': json_data.get('created_at_unix_ns'),
-            'total_packets': total_packets,
-            'data_protocol': json_data.get('data_protocol', 'udp'),
-            'failure_analysis': failure_data,
-            'inter_success_analysis': inter_success_data,
-        }
         
+        # Save JSON report (only for repeater)
         if role == 'repeater':
-            report.update({
+            ensure_output_dir(output_dir)
+            report = {
+                'csv_file': csv_path,
+                'role': role,
+                'argv': json_data.get('argv', []),
+                'args': json_data.get('args', {}),
+                'created_at_unix_ns': json_data.get('created_at_unix_ns'),
+                'total_packets': total_packets,
+                'data_protocol': json_data.get('data_protocol', 'udp'),
+                'failure_analysis': failure_data,
+                'inter_success_analysis': inter_success_data,
                 'pswap': json_data.get('pswap', 1.0),
                 'pswap_stats': pswap_stats,
-            })
-        
-        json_output = os.path.join(output_dir, f'{prefix}_analysis.json')
-        with open(json_output, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        if not args.quiet:
-            print(f"Saved analysis report: {json_output}")
+            }
+            
+            json_output = os.path.join(output_dir, f'{prefix}_analysis.json')
+            with open(json_output, 'w') as f:
+                json.dump(report, f, indent=2)
+            
+            if not args.quiet:
+                print(f"Saved analysis report: {json_output}")
         
         # Generate plots if requested
         if args.plot:
