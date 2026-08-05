@@ -323,12 +323,16 @@ def plot_sequential_comparison(df_res, output_plot, selected_indices=None):
     axes[0].grid(True, linestyle='--', alpha=0.5, axis='y')
     axes[0].legend()
 
-    # Subplot 2: Rate Attempt-Normalized (3 Barras)
-    axes[1].bar(x - width, df_res['Rate_fixed_attempt'], width, label='Rate Fixed', color='#7f7f7f', alpha=0.85)
-    axes[1].bar(x, df_res['Rate_real_attempt'], width, label='Rate Real (Emit TS)', color='#9467bd', alpha=0.85)
-    axes[1].bar(x + width, df_res['Rate_rtt_attempt'], width, label='Rate Real (RTT Sum)', color='#2ca02c', alpha=0.85)
-    axes[1].set_title("Attempt-Normalized Rate", loc='left', fontsize=11, fontweight='bold')
-    axes[1].set_xlabel("pgen step", fontsize=10)
+    # Subplot 2: Attempt-Normalized Rate vs. Burst Rate (4 Bars)
+    width = 0.20  # Adjust bar width to fit 4 bars cleanly
+
+    axes[1].bar(x - 1.5 * width, df_res['Rate_fixed_attempt'], width, label='Fixed Rate', color='#7f7f7f', alpha=0.85)
+    axes[1].bar(x - 0.5 * width, df_res['Rate_real_attempt'], width, label='Real Rate (Emit TS)', color='#9467bd', alpha=0.85)
+    axes[1].bar(x + 0.5 * width, df_res['Rate_rtt_attempt'], width, label='Real Rate (RTT Sum)', color='#2ca02c', alpha=0.85)
+    axes[1].bar(x + 1.5 * width, df_res['Rate_real_indiv_mean'], width, label=r'$\langle R_{indiv} \rangle$ (Burst Rate)', color='#ff7f0e', alpha=0.85)
+
+    axes[1].set_title('Attempt-Normalized vs. Burst Rate', loc='left', fontsize=11, fontweight='bold')
+    axes[1].set_xlabel('$p_{gen}$ step', fontsize=10)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(df_res['pgen'])
     axes[1].grid(True, linestyle='--', alpha=0.5, axis='y')
