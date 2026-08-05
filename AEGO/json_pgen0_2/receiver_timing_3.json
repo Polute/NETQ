@@ -1,0 +1,28 @@
+{
+  "mode": "receiver",
+  "protocol": "udp",
+  "data_protocol": "udp",
+  "sync_protocol": "none",
+  "total_packets": 1000,
+  "warmup": 50,
+  "recv_count": 1000,
+  "success_count": 197,
+  "pgen": 0.2,
+  "kernel_timestamp": true,
+  "args": {
+    "cpu": null,
+    "rt_priority": 50,
+    "sock_buf": 65536,
+    "busy_poll_us": 0,
+    "pace_mode": "hybrid",
+    "count_interval": 0.0,
+    "spin_margin_us": 10.0
+  },
+  "samples": {
+    "s2r_p50_ns": 159190,
+    "s2r_p95_ns": 164903,
+    "s2r_p99_ns": 170566,
+    "r2a_p50_ns": 720,
+    "r2a_p95_ns": 820
+  }
+}
