@@ -37,7 +37,7 @@ T_ATTEMPT_DEFAULT_NS = (
 TAU_RELATIVISTIC_NS = 116581.0  # Tau relativista fijo (116.581 us)
 
 # Experimental initial fidelity and memory coherence time
-W0_INITIAL = 1.00  # Initial fidelity before decay
+W0_INITIAL = 0.98  # Initial fidelity before decay
 T_MEMORY_NS = 1000000.0  # Memory coherence time (1 ms)
 
 
@@ -376,7 +376,7 @@ def plot_overlay_comparison(df_res, output_plot):
       'x:',
       color='#ff7f0e',
       linewidth=2,
-      label=r'$\langle R_{indiv} \rangle$ (Burst Rate)',
+      label=r'$\langle R_{indiv} \rangle$ (Burst Rate): Rate $\sum(E_N/t_{exp}) / N_{exp}$'
   )
   axes[1].set_xlabel(r'Generation Probability ($p_{gen}$)', fontsize=11)
   axes[1].set_ylabel(r'Rate $\sum(E_N/t_{exp}) / N_{attempts}$', fontsize=11)
@@ -462,7 +462,7 @@ def plot_sequential_comparison(df_res, output_plot, selected_indices=None):
       x + 1.5 * width,
       df_res['Rate_real_indiv_mean'],
       width,
-      label=r'$\langle R_{indiv} \rangle$ (Burst Rate)',
+      label=r'$\langle R_{indiv} \rangle$ (Burst Rate): Rate $\sum(E_N/t_{exp}) / N_{exp}$',
       color='#ff7f0e',
       alpha=0.85,
   )
