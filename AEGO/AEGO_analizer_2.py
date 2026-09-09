@@ -127,6 +127,7 @@ def generate_summary_table(pgen_data_dict, sorted_pgens, mode_key, mode_label, t
         tr_ns = df_gen['e2r_ns'].values if mode_key == 'one_way' else df_gen['rtt_ns'].values
         w_vals = compute_w_experimental(tr_ns, t_coh_ref_ns, w0=w0_val)
         en_vals = compute_log_negativity(w_vals)
+        en_vals[en_vals < 0.3] = 0.0  # Truncamiento a 0 si es menor a 0.3 e-bits
         
         EN_mean = float(np.mean(en_vals))
         Rate_indiv_mean = float(np.mean(en_vals / df_gen['t_gen_s'].values))
@@ -207,10 +208,32 @@ def plot_tgen_vs_pgen(tgen_means_ms, tgen_stds_ms, sorted_pgens, mode_label, w0_
 
     plt.xlabel('Generation Probability ($p_{gen}$)', fontsize=11)
     plt.ylabel('Generation Time $t_{gen}$ [ms]', fontsize=11)
-    plt.title(f'Generation Time $t_{{gen}}$ vs $p_{{gen}}$ ({mode_label}, Mean $\pm \sigma$)', fontsize=12, fontweight='bold')
+    plt.title(f'Generation Time $t_{{gen}}$ vs $p_{{gen}}$ (Mean $\pm \sigma$)', fontsize=12, fontweight='bold')
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.legend(loc='upper right', fontsize=10)
 
+
+    plt.tight_layout()
+    plt.savefig(file_path, dpi=300)
+    plt.close()
+    print(f"[+] Plot saved: {file_path}")
+
+def plot_ngen_vs_pgen(ngen_means, ngen_stds, sorted_pgens, mode_label, w0_val, output_dir=OUTPUT_DIR):
+    """Plots N_gen vs pgen showing mean and standard deviation."""
+    file_path = os.path.join(output_dir, f"plot_2b_ngen_vs_pgen.png")
+    plt.figure(figsize=(8, 5))
+    pgens_str = [f"{p:.1f}" for p in sorted_pgens]
+    
+    plt.errorbar(
+        pgens_str, ngen_means, yerr=ngen_stds, marker='s', color='navy', 
+        ecolor='crimson', capsize=5, capthick=1.5, linewidth=2, label='Empirical $N_{gen}$'
+    )
+
+    plt.xlabel('Generation Probability ($p_{gen}$)', fontsize=11)
+    plt.ylabel('Number of Attempts $N_{gen}$', fontsize=11)
+    plt.title(f'Attempts $N_{{gen}}$ vs $p_{{gen}}$ (Mean $\pm \sigma$)', fontsize=12, fontweight='bold')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='upper right', fontsize=10)
 
     plt.tight_layout()
     plt.savefig(file_path, dpi=300)
@@ -241,6 +264,20 @@ def plot_rate_heatmap(rate_matrix, sorted_pgens, mode_label, w0_val, output_dir=
     plt.close()
     print(f"[+] Plot saved: {file_path}")
 
+
+def report_extreme_rtt_outliers(df_raw, pgen, file_path, threshold_us=500.0):
+    """Identifies and prints attempt rows where RTT exceeds the specified threshold in microseconds."""
+    df_check = df_raw.dropna(subset=['rtt_ns']).copy()
+    df_check['rtt_us'] = df_check['rtt_ns'] / 1000.0
+    outliers = df_check[df_check['rtt_us'] > threshold_us]
+    
+    if not outliers.empty:
+        print(f"  [OUTLIER DETECTED - HIGH RTT] pgen = {pgen:.1f} | File: {os.path.basename(file_path)}")
+        for idx, row in outliers.iterrows():
+            print(f"      -> Attempt Row #{idx}: RTT = {row['rtt_us']:.2f} µs ({row['rtt_ns']:.0f} ns) | Success = {int(row.get('success_bit', 0))}")
+    return outliers
+
+
 def main():
     parser = argparse.ArgumentParser(description="AEGO Entanglement Analysis Suite")
     parser.add_argument(
@@ -254,6 +291,12 @@ def main():
         type=float,
         default=1.0,
         help="Initial Werner state parameter W0 (default: 1.0)"
+    )
+    parser.add_argument(
+        "--threshold-us",
+        type=float,
+        default=500.0,
+        help="Microsecond (µs) threshold to alert on extreme t_gen values (default: 500.0)"
     )
     args = parser.parse_args()
 
@@ -282,6 +325,8 @@ def main():
                     df_single = pd.read_csv(f)
                     df_proc = process_sender_data_pure_empirical(df_single, mode=mode_key)
                     if not df_proc.empty:
+                        # Report extreme outliers before percentile filtering
+                        report_extreme_rtt_outliers(df_proc, pgen, f, threshold_us=args.threshold_us)
                         gen_dfs.append(df_proc)
 
             if gen_dfs:
@@ -308,18 +353,24 @@ def main():
 
         tgen_means_ms = []
         tgen_stds_ms = []
+        ngen_means = []
+        ngen_stds = []
 
         for col_idx, pgen in enumerate(sorted_pgens):
             df_gen = pgen_data_dict[pgen]
             t_gen_s = df_gen['t_gen_s'].values
+            n_gen_vals = df_gen['N_gen'].values
             t_roundtrip_ns = df_gen['t_roundtrip_ns'].values
 
             tgen_means_ms.append(np.mean(t_gen_s) * 1000.0)
             tgen_stds_ms.append(np.std(t_gen_s) * 1000.0)
+            ngen_means.append(np.mean(n_gen_vals))
+            ngen_stds.append(np.std(n_gen_vals))
 
             for row_idx, t_coh_ns in enumerate(TCOH_VALUES_NS):
                 w_vals = compute_w_experimental(t_roundtrip_ns, t_coh_ns, w0=args.w0)
                 en_vals = compute_log_negativity(w_vals)
+                en_vals[en_vals < 0.3] = 0.0 
                 
                 en_means_matrix[row_idx, col_idx] = np.mean(en_vals)
                 en_stds_matrix[row_idx, col_idx] = np.std(en_vals)
@@ -330,6 +381,7 @@ def main():
         plot_en_vs_tcoh(en_means_matrix, en_stds_matrix, sorted_pgens, mode_label, args.w0, filename_suffix=mode_key)
         if not already_plotted:
             plot_tgen_vs_pgen(tgen_means_ms, tgen_stds_ms, sorted_pgens, mode_label, args.w0)
+            plot_ngen_vs_pgen(ngen_means, ngen_stds, sorted_pgens, mode_label, args.w0)
             already_plotted = True
         plot_rate_heatmap(rate_matrix, sorted_pgens, mode_label, args.w0, filename_suffix=mode_key)
 
