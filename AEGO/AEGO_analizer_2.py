@@ -18,6 +18,8 @@ import os
 import re
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.colors as mcolors
+from matplotlib.colors import LogNorm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -258,12 +260,40 @@ def plot_rate_heatmap(rate_matrix, sorted_pgens, mode_label, w0_val, output_dir=
 
     plt.xlabel('Generation Probability ($p_{gen}$)', fontsize=11, labelpad=10)
     plt.ylabel('Coherence Time ($T_{coh}$)', fontsize=11, labelpad=10)
-    plt.title(r'Individual Rate Heatmap $\langle R_{indiv} \rangle = \frac{1}{M} \sum \frac{E_N(i)}{t_{gen}(i)}$' + f'\n({mode_label}, $W_0={w0_val:.2f}$)', fontsize=12, fontweight='bold', pad=12)
+    plt.title(r'Individual Rate Heatmap $\langle R_{\mathrm{indiv}} \rangle = \frac{1}{M} \sum \frac{E_N(i)}{t_{\mathrm{gen}}(i)}$' + '\n' +
+        f'({mode_label}, $W_0={w0_val:.2f}$, $E_N = 0$ if $E_N \\leq 1/3$)', fontsize=12, fontweight='bold', pad=12)
     plt.tight_layout()
     plt.savefig(file_path, dpi=300)
     plt.close()
     print(f"[+] Plot saved: {file_path}")
 
+def plot_raw_en_heatmap(df_pivot, mode_label, output_dir=OUTPUT_DIR, filename_suffix="one_way"):
+    """Plots raw Logarithmic Negativity E_N heatmap with warm colors."""
+    file_path = os.path.join(output_dir, f"plot_4_raw_EN_heatmap_{filename_suffix}.png")
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    sns.heatmap(
+        df_pivot,
+        annot=True,
+        fmt=".3f",
+        cmap="YlOrRd",
+        cbar_kws={"label": r"Logarithmic Negativity $\langle E_N \rangle$ [e-bits]"},
+        ax=ax
+    )
+
+    ax.set_xlabel('Generation Probability ($p_{\mathrm{gen}}$)', fontsize=11, labelpad=10)
+    ax.set_ylabel('Coherence Time ($T_{\mathrm{coh}}$)', fontsize=11, labelpad=10)
+    ax.set_title(
+        f"Heatmap of Raw $E_N$ vs $p_{{gen}}$ and $T_{{coh}}$ ({mode_label})",
+        fontsize=11, fontweight="bold", pad=12
+    )
+
+    plt.xticks(rotation=0)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(file_path, dpi=300)
+    plt.close()
+    print(f"[+] Plot saved: {file_path}")
 
 def report_extreme_rtt_outliers(df_raw, pgen, file_path, threshold_us=500.0):
     """Identifies and prints attempt rows where RTT exceeds the specified threshold in microseconds."""
@@ -308,6 +338,7 @@ def main():
         ('one_way', 'One-Way Time ($E2R$)'),
         ('roundtrip', 'Full Round-Trip Time ($RTT$)')
     ]
+
     already_plotted = False
     for mode_key, mode_label in modes:
         print(f"\n[*] Processing mode: {mode_label} (W0 = {args.w0:.2f})")
@@ -349,6 +380,7 @@ def main():
 
         rate_matrix = np.zeros((num_tcoh, num_pgen))
         en_means_matrix = np.zeros((num_tcoh, num_pgen))
+        raw_en_means_matrix = np.zeros((num_tcoh, num_pgen))
         en_stds_matrix = np.zeros((num_tcoh, num_pgen))
 
         tgen_means_ms = []
@@ -369,7 +401,11 @@ def main():
 
             for row_idx, t_coh_ns in enumerate(TCOH_VALUES_NS):
                 w_vals = compute_w_experimental(t_roundtrip_ns, t_coh_ns, w0=args.w0)
-                en_vals = compute_log_negativity(w_vals)
+                en_vals_raw = compute_log_negativity(w_vals)
+                
+                raw_en_means_matrix[row_idx, col_idx] = np.sum(en_vals_raw) / np.sum(n_gen_vals)
+
+                en_vals = en_vals_raw.copy()
                 en_vals[en_vals < 0.3] = 0.0 
                 
                 en_means_matrix[row_idx, col_idx] = np.mean(en_vals)
@@ -378,12 +414,17 @@ def main():
                 r_indiv_gen = en_vals / t_gen_s
                 rate_matrix[row_idx, col_idx] = np.mean(r_indiv_gen)
 
+        pgens_str = [f"{p:.1f}" for p in sorted_pgens]
+        df_raw_pivot = pd.DataFrame(raw_en_means_matrix, index=TCOH_LABELS, columns=pgens_str)
+
         plot_en_vs_tcoh(en_means_matrix, en_stds_matrix, sorted_pgens, mode_label, args.w0, filename_suffix=mode_key)
         if not already_plotted:
             plot_tgen_vs_pgen(tgen_means_ms, tgen_stds_ms, sorted_pgens, mode_label, args.w0)
             plot_ngen_vs_pgen(ngen_means, ngen_stds, sorted_pgens, mode_label, args.w0)
             already_plotted = True
         plot_rate_heatmap(rate_matrix, sorted_pgens, mode_label, args.w0, filename_suffix=mode_key)
+
+        plot_raw_en_heatmap(df_raw_pivot, mode_label, filename_suffix=mode_key)
 
         generate_summary_table(pgen_data_dict, sorted_pgens, mode_key, mode_label, t_coh_ref_ns=1.0*1e6, w0_val=args.w0)
 
@@ -392,6 +433,7 @@ def main():
         df_res.to_csv(output_csv)
         print(f"[+] Filtering applied: Percentile <= {args.percentile}%")
         print(f"[+] Rate matrix exported to: {output_csv}")
+
 
 if __name__ == '__main__':
     main()
