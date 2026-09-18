@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aeso.py – Optimized AESO Binary UDP Simulator (Enhanced Edition)
+aeso.py - Optimized AESO Binary UDP Simulator (Enhanced Edition)
 
 Optimizations & Features:
   • Zero-heap allocation in hot loop via pre-allocated bytearrays & Struct.pack_into.
