@@ -169,7 +169,7 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repe
   --clock-sync-samples 264 \
   --clock-sync-kernel-timestamp \
   --plot \
-  --plot-dir csv_external \
+  --plot-dir csv_external_TEST \
   --accept-timeout 120 \
   --cpu 1 \
   --sock-buf 65536 \
@@ -179,7 +179,7 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py repe
 
 # Machine 2 (Client A at 192.168.1.101): Client A
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
-  --repeater-host 192.168.1.100 \
+  --repeater-host 192.168.0.223 \
   --repeater-port 7401 \
   --client-id 1 \
   --count 2000 \
@@ -191,7 +191,7 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py clie
   --clock-sync-kernel-timestamp \
   --kernel-timestamp \
   --plot \
-  --plot-dir csv_external \
+  --plot-dir csv_external_TEST \
   --connect-timeout 10 \
   --detect-timeout 120 \
   --detect-interval 0.02 \
@@ -201,7 +201,7 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py clie
 
 # Machine 3 (Client B at 192.168.1.102): Client B
 sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py client \
-  --repeater-host 192.168.1.100 \
+  --repeater-host 192.168.0.227 \
   --repeater-port 7402 \
   --client-id 2 \
   --count 2000 \
@@ -213,7 +213,7 @@ sudo env PYTHONUNBUFFERED=1 PYTHONMALLOC=malloc python3 minimal_epr_fast.py clie
   --clock-sync-kernel-timestamp \
   --kernel-timestamp \
   --plot \
-  --plot-dir csv_external \
+  --plot-dir csv_external_TEST \
   --connect-timeout 10 \
   --detect-timeout 120 \
   --detect-interval 0.02 \
