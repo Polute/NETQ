@@ -1,2 +1,3 @@
 MoonGen/*.tar.gz
 netq_env/
+.env/
