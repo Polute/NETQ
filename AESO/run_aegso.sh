@@ -9,17 +9,18 @@ Usage:
   ./run_aegso.sh <role> <node-id> <dest-ip>
 
 Timing (all nodes share PTP clock -> same schedule):
-  SLOT          seconds per combo slot   (default 10)
+  SLOT          seconds per combo slot   (default 70)
+  EXEC_TIMEOUT  timeout per execution    (default 60s)
   REP_OFFSET    repeater start offset in slot (default 0)
   CLIENT_OFFSET clients start offset in slot  (default 1)
 
 Launch all three within one SLOT window -> they lockstep.
-Repeater starts CLIENT_OFFSET seconds before the clients, every combo.
+Repeater starts 1s before clients (OFFSET=0 vs OFFSET=1).
 
 Examples:
-  SLOT=10 bash run_aegso.sh repeater - 192.168.0.226
-  SLOT=10 bash run_aegso.sh client A  192.168.0.226
-  SLOT=10 bash run_aegso.sh client B  192.168.0.226
+  SLOT=70 bash run_aegso.sh repeater - 192.168.0.226
+  SLOT=70 bash run_aegso.sh client A  192.168.0.226
+  SLOT=70 bash run_aegso.sh client B  192.168.0.226
 EOF
   exit 1
 }
@@ -74,8 +75,13 @@ CPU_REP="${CPU_REP:-1}"
 CPU_A="${CPU_A:-1}"
 CPU_B="${CPU_B:-1}"
 
+# Líneas esperadas (2000 registros + 1 cabecera)
+EXPECTED_LINES=$(( COUNT + 1 ))
+
 # ── Lockstep timing (shared via PTP wall clock) ──
-SLOT="${SLOT:-10}"
+# Ampliado a 70s para dar margen de 60s de ejecución + 10s de sincronización/limpieza
+SLOT="${SLOT:-70}"
+EXEC_TIMEOUT="${EXEC_TIMEOUT:-60s}"
 REP_OFFSET="${REP_OFFSET:-0}"
 CLIENT_OFFSET="${CLIENT_OFFSET:-1}"
 
@@ -86,7 +92,6 @@ else
 fi
 
 # First slot boundary: next multiple of SLOT on the shared clock.
-# All nodes launched within one SLOT window compute the same BASE.
 NOW0="$(date +%s)"
 BASE=$(( (NOW0 / SLOT + 1) * SLOT ))
 
@@ -117,13 +122,15 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# Envía SIGINT a los 60s y evita abortar el script Bash si devuelve código != 0
 run_python() {
-  echo "[run_aegso] CMD: $*"
-  "$PYTHON" "$PY" "$@"
+  echo "[run_aegso] CMD: timeout --signal=SIGINT $EXEC_TIMEOUT $*"
+  timeout --signal=SIGINT "$EXEC_TIMEOUT" "$PYTHON" "$PY" "$@" || true
 }
 
 total=$(( ${#PGENS[@]} * ${#PSWAPS[@]} ))
 combo_idx=0
+active_slot_idx=0
 
 echo "[run_aegso] role=$ROLE node=${NODE_ID:--} base=$BASE slot=$SLOT offset=$OFFSET combos=$total"
 
@@ -131,8 +138,35 @@ for pgen in "${PGENS[@]}"; do
   for pswap in "${PSWAPS[@]}"; do
     combo_idx=$((combo_idx + 1))
 
-    # Wall-clock anchor: this combo starts at BASE + (idx-1)*SLOT + OFFSET.
-    slot_start=$(( BASE + (combo_idx - 1) * SLOT + OFFSET ))
+    # Formatear ruta del CSV correspondiente al nodo
+    pswap_str="${pswap//./_}"
+    pgen_str="${pgen//./_}"
+    folder="aegso_report_pswap${pswap_str}/pgen${pgen_str}"
+
+    if [[ "$ROLE" == "client" ]]; then
+      if [[ "$NODE_ID" == "A" ]]; then
+        target_csv="${folder}/client_lab_1.csv"
+      else
+        target_csv="${folder}/client_teleco_1.csv"
+      fi
+    else
+      target_csv="${folder}/repeater_swap_1.csv"
+    fi
+
+    # Verificación de ejecución previa exitosa
+    if [[ -f "$target_csv" ]]; then
+      lines=$(wc -l < "$target_csv" 2>/dev/null || echo 0)
+      if (( lines >= EXPECTED_LINES )); then
+        echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> OMITIDO (completado con $lines líneas)"
+        continue
+      fi
+    fi
+
+    # Incrementar índice de slots ejecutados para mantener sincronización PTP
+    active_slot_idx=$((active_slot_idx + 1))
+
+    # Sincronización temporal basada en el reloj de pared PTP
+    slot_start=$(( BASE + (active_slot_idx - 1) * SLOT + OFFSET ))
     now="$(date +%s)"
     delta=$(( slot_start - now ))
 

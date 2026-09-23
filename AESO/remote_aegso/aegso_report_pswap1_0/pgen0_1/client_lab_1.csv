@@ -1,0 +1,3 @@
+round,gen_attempts,t_gen_total_ns,gen_rtt_ns,ts_gen_success_ns,ts_swap_ns,swap_to_recv_ns,t_exp_ns,werner,pgen_success_bit,pswap_success_bit
+0,2,1001176,443238,1790179839877425112,1790179839877143451,281741,0,0.424502,1,1
+1,3,1216150,403717,1790179839878677923,1790179839879017536,275298,339613,0.536482,1,1
