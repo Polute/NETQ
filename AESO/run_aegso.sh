@@ -46,7 +46,7 @@ case "$ROLE" in
     ;;
 esac
 
-PY="${PY:-$SCRIPT_DIR/aegso.py}"
+PY="${PY:-$SCRIPT_DIR/aegso_2.py}"
 PYTHON="${PYTHON:-$(command -v python3 || echo /usr/bin/python3)}"
 
 if [[ ! -f "$PY" ]]; then
@@ -76,7 +76,7 @@ CPU_A="${CPU_A:-1}"
 CPU_B="${CPU_B:-1}"
 
 # Líneas esperadas (2000 registros + 1 cabecera)
-EXPECTED_LINES=$(( COUNT + 1 ))
+EXPECTED_LINES=$(( COUNT + 10000 ))
 
 # ── Lockstep timing (shared via PTP wall clock) ──
 # Ampliado a 70s para dar margen de 60s de ejecución + 10s de sincronización/limpieza

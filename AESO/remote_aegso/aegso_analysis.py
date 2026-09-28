@@ -3,8 +3,8 @@
 aegso_analysis.py – Analysis & Visualization for AESO 3-Node Protocol
 
 Expected CSV (per client):
-  round, gen_attempts, t_gen_total_ns, gen_rtt_ns, ts_gen_success_ns,
-  ts_swap_ns, swap_to_recv_ns, t_exp_ns, werner,
+  round, gen_attempts, t_gen_total_ns, gen_rtt_ns, ts_swap_ns,
+  swap_to_recv_ns, t_exp_ns, werner,
   pgen_success_bit, pswap_success_bit
 
 Directory layout:
@@ -18,6 +18,8 @@ Outputs (in 'analysis_AEGSO/'):
   1. E_N vs Tcoh (Scatter points only, bounded error bars [0, 1])
   2. t_swap vs pswap (Scatter points only, non-negative error bars)
   2b. gen_rtt vs pswap (Scatter points only, non-negative error bars)
+  3. Pswap vs Entanglement Rate (10 lines, one per pgen)
+  4. Individual Rate Heatmap (pgen × Tcoh for fixed Pswap=1.0)
   5. 60s-Normalized Rate Heatmap (pgen × pswap, YlOrRd colormap)
   6. gen_rtt histogram
   7. pswap success rate bar chart
@@ -249,6 +251,201 @@ def plot_time_vs_pswap(values, stds, pswaps, ylabel, title, label, outdir, fname
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  [+] {path}")
+
+
+def plot_pswap_vs_rate_10_lines(
+    df_master: pd.DataFrame,
+    label: str,
+    w0: float,
+    outdir: str,
+    t_coh_ns: float = 1.0e6,
+    n_expected_attempts: int = 2000,
+):
+  """Plot 3: Individual Rate corrected by fixed total swap attempts (N = 2000).
+
+  Formula: Rate = (1 / N_expected_attempts) * sum(E_N(i) / t_gen(i)) over
+  successful swaps.
+  """
+  path = os.path.join(
+      outdir, f"03_pswap_vs_rate_10lines_n2000_{label}.png"
+  )
+  _style()
+
+  if (
+      df_master.empty
+      or "pgen" not in df_master.columns
+      or "pswap" not in df_master.columns
+  ):
+    return
+
+  df_calc = df_master.copy()
+
+  # 1. Convert individual generation time to seconds
+  df_calc["t_gen_s"] = df_calc["t_gen_total_ns"] / 1e9
+
+  # 2. Compute Werner state fidelity and Log-Negativity (E_N)
+  df_calc["w_exp"] = compute_w_experimental(
+      df_calc["t_exp_ns"].values, t_coh_ns, w0=w0
+  )
+  df_calc["en"] = compute_en(df_calc["w_exp"].values)
+
+  records = []
+
+  # Group by pgen and pswap
+  for (pgen_val, pswap_val), sub in df_calc.groupby(["pgen", "pswap"]):
+    # Filter only successful swaps (M)
+    ok_sub = sub[sub["pswap_success_bit"] == 1]
+
+    if len(ok_sub) > 0:
+      # Sum of individual rates (E_N / t_gen) for successful swaps
+      r_indiv_sum = (ok_sub["en"] / ok_sub["t_gen_s"]).sum()
+
+      # Correct by dividing over the fixed 2000 total swap attempts
+      rate_corrected = r_indiv_sum / float(n_expected_attempts)
+    else:
+      rate_corrected = 0.0
+
+    records.append({
+        "pgen": pgen_val,
+        "pswap": pswap_val,
+        "rate_corrected": rate_corrected,
+    })
+
+  grouped = pd.DataFrame(records)
+  pgen_unique = sorted(grouped["pgen"].unique())
+
+  fig, ax = plt.subplots(figsize=(9, 6))
+  colors = plt.cm.viridis(np.linspace(0, 1, max(len(pgen_unique), 1)))
+
+  for idx, pgen_val in enumerate(pgen_unique):
+    sub = grouped[grouped["pgen"] == pgen_val].sort_values("pswap")
+    ax.plot(
+        sub["pswap"],
+        sub["rate_corrected"],
+        marker="o",
+        color=colors[idx],
+        linewidth=2,
+        label=f"$p_{{gen}} = {pgen_val:.1f}$",
+    )
+
+  ax.set_xlabel(r"Swap Probability ($P_{\mathrm{swap}}$)", fontsize=11)
+  ax.set_ylabel(
+      r"Corrected Rate $\langle R_{\mathrm{indiv}} \rangle$ [e-bits / s]",
+      fontsize=11,
+  )
+  ax.set_title(
+      f"Individual Rate Corrected by $N={n_expected_attempts}$ Attempts vs"
+      f" $P_{{swap}}$ ({label})",
+      fontsize=12,
+      fontweight="bold",
+  )
+  ax.grid(True, linestyle="--", alpha=0.5)
+  ax.legend(
+      title=r"Probability $p_{\mathrm{gen}}$",
+      bbox_to_anchor=(1.05, 1),
+      loc="upper left",
+  )
+
+  plt.tight_layout()
+  plt.savefig(path, dpi=300, bbox_inches="tight")
+  plt.close(fig)
+  print(f"   [+] Fixed plot saved: {path}")
+
+def plot_rate_heatmap_pswap(
+    df_master: pd.DataFrame,
+    label: str,
+    outdir: str,
+    target_pswap: float = 1.0,
+    n_expected_attempts: float = 2000.0,
+):
+  path = os.path.join(
+      outdir, f"04_rate_heatmap_rtt_pswap{target_pswap:.1f}_{label}.png"
+  )
+  _style()
+
+  if (
+      df_master.empty
+      or "pgen" not in df_master.columns
+      or "pswap" not in df_master.columns
+  ):
+    return
+
+  available_pswaps = df_master["pswap"].unique()
+  if len(available_pswaps) == 0:
+    return
+  best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+  df_p = df_master[df_master["pswap"] == best_pswap].copy()
+
+  if df_p.empty:
+    return
+
+  pgens = sorted(df_p["pgen"].unique())
+  rate_matrix = np.zeros((len(TCOH_VALUES_NS), len(pgens)))
+
+  for j, pgen_val in enumerate(pgens):
+    df_pg = df_p[(df_p["pgen"] == pgen_val) & (df_p["pswap_success_bit"] == 1)]
+    if df_pg.empty:
+      continue
+
+    # 1. Extraer gen_rtt_ns en lugar de t_exp_ns
+    rtt_vals = df_pg["gen_rtt_ns"].values
+    t_gen_sec = df_pg["t_gen_total_ns"].values / 1e9
+    t_gen_sec = np.where(t_gen_sec > 0, t_gen_sec, 1e-9)
+
+    # 2. Tomar W inicial desde la simulación (o base)
+    if "werner" in df_pg.columns:
+      w0_vals = df_pg["werner"].values
+    else:
+      w0_vals = np.ones_like(rtt_vals)
+
+    # 3. Barrida sobre Tcoh aplicando la degradación en gen_rtt_ns
+    for i, t_coh in enumerate(TCOH_VALUES_NS):
+      if np.isinf(t_coh):
+        w_exp = w0_vals
+      else:
+        w_exp = w0_vals * np.exp(-rtt_vals / t_coh)
+
+      # Calcular Log-Negativity (E_N) con el nuevo W
+      en_exp = compute_en(w_exp)
+
+      # Promedio ponderado por las RTT
+      indiv_rate = np.sum(en_exp / t_gen_sec) / n_expected_attempts
+      rate_matrix[i, j] = indiv_rate
+
+  # Renderizado del heatmap
+  fig, ax = plt.subplots(figsize=(10, 6))
+  pgens_str = [f"{p:.1f}" for p in pgens]
+
+  sns.heatmap(
+      rate_matrix,
+      annot=True,
+      fmt=".1f",
+      cmap="YlOrRd",
+      xticklabels=pgens_str,
+      yticklabels=TCOH_LABELS,
+      cbar_kws={
+          "label": r"Rate $\langle R_{\mathrm{indiv}} \rangle$ [e-bits / s]"
+      },
+      ax=ax,
+  )
+
+  ax.set_xlabel(
+      r"Generation Probability ($p_{\mathrm{gen}}$)", fontsize=11, labelpad=10
+  )
+  ax.set_ylabel(
+      r"Coherence Time ($T_{\mathrm{coh}}$)", fontsize=11, labelpad=10
+  )
+  ax.set_title(
+      f"Rate Heatmap basada en RTT ($P_{{swap}} = {best_pswap:.1f}$, {label})",
+      fontsize=12,
+      fontweight="bold",
+      pad=12,
+  )
+
+  plt.tight_layout()
+  plt.savefig(path, dpi=300, bbox_inches="tight")
+  plt.close(fig)
+  print(f"   [+] Updated heatmap (RTT-based) saved: {path}")
 
 
 def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float, outdir: str, t_coh_ns: float = 1.0e6):
@@ -697,6 +894,8 @@ def main():
             "$gen\\_rtt$ [µs]", f"Generation RTT vs $p_{{swap}}$ ({mode_label})",
             mode_key, OUTPUT_DIR, f"02b_gen_rtt_vs_pswap_{mode_key}.png"
         )
+        plot_pswap_vs_rate_10_lines(df_master, mode_key, w0, OUTPUT_DIR)
+        plot_rate_heatmap_pswap(df_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_rate_pgen_pswap_heatmap(df_master, mode_key, w0, OUTPUT_DIR)
         plot_rtt_hist(all_rtt, mode_key, OUTPUT_DIR)
         plot_pswap_success_rate(pswap_rates, sorted_pswaps, mode_key, OUTPUT_DIR)

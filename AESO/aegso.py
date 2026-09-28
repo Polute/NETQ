@@ -178,6 +178,7 @@ def run_repeater(args):
     folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
               f"/pgen{str(args.pgen).replace('.', '_')}")
     out_path = get_unique_filepath(folder, "repeater_swap")
+    out_gen_path = get_unique_filepath(folder, "repeater_gen")
 
     sock_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_a.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -241,11 +242,13 @@ def run_repeater(args):
     ack_buf = bytearray(TS_SIZE)
     swap_buf = bytearray(PAYLOAD_SIZE)
     records = []
+    gen_records = []
 
     gc_was_enabled = gc.isenabled()
     gc.disable()
 
     round_idx = 0
+    total_gen_attempts = 0
     try:
         while running and round_idx < args.count:
             for key, _ in sel.select(timeout=0.005):
@@ -261,11 +264,19 @@ def run_repeater(args):
                     continue
 
                 link.attempts += 1
+                total_gen_attempts += 1
                 ts_recv_ns = time_ns()
+                
+                ts_emit, _ = TS_UNPACK(in_buf, 0)
+                e2r_ns = max(0, ts_recv_ns - ts_emit)
+
                 is_success = (pgen >= 1.0) or (rnd() <= pgen)
 
                 TS_PACK(ack_buf, 0, ts_recv_ns, 1 if is_success else 0)
                 sock.sendto(ack_buf, addr)
+
+                w_recv = link.w0
+                gen_records.append((total_gen_attempts, ts_recv_ns, e2r_ns, w_recv, 1 if is_success else 0))
 
                 if is_success:
                     link.ready = True
@@ -306,11 +317,19 @@ def run_repeater(args):
         sock_b.close()
 
     with open(out_path, "w") as f:
-        f.write("round,ts_swap_ns,werner_a,werner_b,werner_result,pswap_success_bit\n")
-        for r in records:
-            f.write(f"{r[0]},{r[1]},{r[2]:.6f},{r[3]:.6f},{r[4]:.6f},{r[5]}\n")
+            f.write("round,ts_swap_ns,werner_a,werner_b,werner_result,pswap_success_bit\n")
+            for r in records:
+                f.write(f"{r[0]},{r[1]},{r[2]:.6f},{r[3]:.6f},{r[4]:.6f},{r[5]}\n")
     chown_output_path(out_path)
+
+    with open(out_gen_path, "w") as f:
+            f.write("count,ts_recv,e2r_ns,w_recv,bit_success\n")
+            for r in gen_records:
+                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]:.6f},{r[4]}\n")
+    chown_output_path(out_gen_path)
+
     print(f"[Repeater] Saved {len(records)} swaps -> {out_path}")
+    print(f"[Repeater] Saved {len(gen_records)} gen attempts -> {out_gen_path}")
 
 
 # ───────────────────────────── Client (A/B) ─────────────────────────────
@@ -322,8 +341,12 @@ def run_client(args):
 
     folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
               f"/pgen{str(args.pgen).replace('.', '_')}")
+    
     prefix = "client_lab" if args.node_id == "A" else "client_teleco"
     out_path = get_unique_filepath(folder, prefix)
+    
+    gen_prefix = f"{prefix}_gen"
+    out_gen_path = get_unique_filepath(folder, gen_prefix)
 
     # ── Socket: kernel timestamping enabled ──
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -368,6 +391,8 @@ def run_client(args):
     gen_buf = bytearray(TS_SIZE)
     rx_buf = bytearray(PAYLOAD_SIZE + 64)
     records = []
+    # --- [NUEVO] Registros de intentos individuales de generación ---
+    gen_records = []
 
     time_ns = time.time_ns
     perf_ns = time.perf_counter_ns
@@ -378,6 +403,7 @@ def run_client(args):
     gc.disable()
 
     round_idx = 0
+    total_gen_attempts = 0
     try:
         while running and round_idx < args.count:
             attempts = 0
@@ -388,6 +414,7 @@ def run_client(args):
             t_gen_start_ns = time_ns()
             while running:
                 attempts += 1
+                total_gen_attempts += 1
                 ts_emit = time_ns()
                 TS_PACK(gen_buf, 0, ts_emit, 1)
 
@@ -396,6 +423,8 @@ def run_client(args):
                 try:
                     n, ancdata, _flags, _addr = recvmsg_into([rx_buf], anc_size)
                 except (socket.timeout, OSError):
+                    w_rtt = 1.0
+                    gen_records.append((total_gen_attempts, ts_emit, 0, w_rtt, 0))
                     continue
 
                 if n != TS_SIZE:
@@ -466,9 +495,16 @@ def run_client(args):
             )
     chown_output_path(out_path)
 
+    with open(out_gen_path, "w") as f:
+        f.write("count,ts_gen,ts_rtt,w_rtt,bit_success_gen\n")
+        for r in gen_records:
+            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]:.6f},{r[4]}\n")
+    chown_output_path(out_gen_path)
+
     ok = sum(1 for r in records if r[10])
     print(f"[Client {args.node_id}] {len(records)} rounds "
           f"({ok} pswap successful). CSV -> {out_path}")
+    print(f"[Client {args.node_id}] {len(gen_records)} total gen attempts -> {out_gen_path}")
 
 
 # ─────────────────────────────────── CLI ───────────────────────────────────
