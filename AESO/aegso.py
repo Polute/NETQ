@@ -432,6 +432,7 @@ def run_client(args):
                 gen_rtt_ns = perf_ns() - t0
 
                 _, pgen_bit = TS_UNPACK(rx_buf, 0)
+                gen_records.append((total_gen_attempts, ts_emit, gen_rtt_ns, 1.0, 1 if pgen_bit else 0))
                 if pgen_bit:
                     pgen_ok = True
                     # Kernel timestamp for ACK arrival (if available)

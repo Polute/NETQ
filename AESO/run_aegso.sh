@@ -8,19 +8,10 @@ usage() {
 Usage:
   ./run_aegso.sh <role> <node-id> <dest-ip>
 
-Timing (all nodes share PTP clock -> same schedule):
-  SLOT          seconds per combo slot   (default 70)
-  EXEC_TIMEOUT  timeout per execution    (default 60s)
-  REP_OFFSET    repeater start offset in slot (default 0)
-  CLIENT_OFFSET clients start offset in slot  (default 1)
-
-Launch all three within one SLOT window -> they lockstep.
-Repeater starts 1s before clients (OFFSET=0 vs OFFSET=1).
-
 Examples:
-  SLOT=70 bash run_aegso.sh repeater - 192.168.0.226
-  SLOT=70 bash run_aegso.sh client A  192.168.0.226
-  SLOT=70 bash run_aegso.sh client B  192.168.0.226
+  bash run_aegso.sh repeater - 192.168.0.226
+  bash run_aegso.sh client A  192.168.0.226
+  bash run_aegso.sh client B  192.168.0.226
 EOF
   exit 1
 }
@@ -46,7 +37,7 @@ case "$ROLE" in
     ;;
 esac
 
-PY="${PY:-$SCRIPT_DIR/aegso_2.py}"
+PY="${PY:-$SCRIPT_DIR/aegso_3.py}"
 PYTHON="${PYTHON:-$(command -v python3 || echo /usr/bin/python3)}"
 
 if [[ ! -f "$PY" ]]; then
@@ -57,7 +48,7 @@ if [[ "$PY" != /* ]]; then
   PY="$(pwd)/$PY"
 fi
 
-# ── Run configuration ──
+# ── Execution Configuration ──
 COUNT="${COUNT:-2000}"
 ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-0.5}"
 SWAP_WAIT_TIMEOUT="${SWAP_WAIT_TIMEOUT:-3.0}"
@@ -75,25 +66,21 @@ CPU_REP="${CPU_REP:-1}"
 CPU_A="${CPU_A:-1}"
 CPU_B="${CPU_B:-1}"
 
-# Líneas esperadas (2000 registros + 1 cabecera)
-EXPECTED_LINES=$(( COUNT + 10000 ))
+# ── Cycle Wait Configuration ──
+# Full cycle duration: 600 seconds per combo
+CYCLE_WAIT=600
+EXEC_TIMEOUT="600s"
 
-# ── Lockstep timing (shared via PTP wall clock) ──
-# Ampliado a 70s para dar margen de 60s de ejecución + 10s de sincronización/limpieza
-SLOT="${SLOT:-70}"
-EXEC_TIMEOUT="${EXEC_TIMEOUT:-60s}"
-REP_OFFSET="${REP_OFFSET:-0}"
-CLIENT_OFFSET="${CLIENT_OFFSET:-1}"
-
-if [[ "$ROLE" == "client" ]]; then
-  OFFSET="$CLIENT_OFFSET"
-else
-  OFFSET="$REP_OFFSET"
+# Define initial startup delays depending on node role
+if [[ "$ROLE" == "repeater" ]]; then
+  START_DELAY=0
+elif [[ "$ROLE" == "client" ]]; then
+  case "$NODE_ID" in
+    A|a) START_DELAY=5 ;;
+    B|b) START_DELAY=10 ;;
+    *)   echo "For client, node-id must be A or B" >&2; exit 1 ;;
+  esac
 fi
-
-# First slot boundary: next multiple of SLOT on the shared clock.
-NOW0="$(date +%s)"
-BASE=$(( (NOW0 / SLOT + 1) * SLOT ))
 
 read -r -a PGENS  <<< "${PGENS:-1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1}"
 read -r -a PSWAPS <<< "${PSWAPS:-1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1}"
@@ -107,7 +94,6 @@ if [[ "$ROLE" == "client" ]]; then
   case "$NODE_ID" in
     A|a) NODE_ID="A"; CPU="$CPU_A"; PORT="$PORT_A" ;;
     B|b) NODE_ID="B"; CPU="$CPU_B"; PORT="$PORT_B" ;;
-    *)   echo "For client, node-id must be A or B" >&2; exit 1 ;;
   esac
   if [[ "$DEST_IP" == "-" || -z "$DEST_IP" ]]; then
     echo "For client, dest-ip must be the repeater IP" >&2
@@ -122,7 +108,7 @@ fi
 
 cd "$SCRIPT_DIR"
 
-# Envía SIGINT a los 60s y evita abortar el script Bash si devuelve código != 0
+# Execute Python script with a safety timeout of 600s
 run_python() {
   echo "[run_aegso] CMD: timeout --signal=SIGINT $EXEC_TIMEOUT $*"
   timeout --signal=SIGINT "$EXEC_TIMEOUT" "$PYTHON" "$PY" "$@" || true
@@ -130,55 +116,29 @@ run_python() {
 
 total=$(( ${#PGENS[@]} * ${#PSWAPS[@]} ))
 combo_idx=0
-active_slot_idx=0
+is_first_run=true
 
-echo "[run_aegso] role=$ROLE node=${NODE_ID:--} base=$BASE slot=$SLOT offset=$OFFSET combos=$total"
+echo "[run_aegso] role=$ROLE node=${NODE_ID:--} cycle_wait=${CYCLE_WAIT}s initial_delay=${START_DELAY}s combos=$total"
 
+# Loop over all pgen and pswap combinations
 for pgen in "${PGENS[@]}"; do
   for pswap in "${PSWAPS[@]}"; do
     combo_idx=$((combo_idx + 1))
 
-    # Formatear ruta del CSV correspondiente al nodo
-    pswap_str="${pswap//./_}"
-    pgen_str="${pgen//./_}"
-    folder="aegso_report_pswap${pswap_str}/pgen${pgen_str}"
-
-    if [[ "$ROLE" == "client" ]]; then
-      if [[ "$NODE_ID" == "A" ]]; then
-        target_csv="${folder}/client_lab_1.csv"
-      else
-        target_csv="${folder}/client_teleco_1.csv"
-      fi
-    else
-      target_csv="${folder}/repeater_swap_1.csv"
-    fi
-
-    # Verificación de ejecución previa exitosa
-    if [[ -f "$target_csv" ]]; then
-      lines=$(wc -l < "$target_csv" 2>/dev/null || echo 0)
-      if (( lines >= EXPECTED_LINES )); then
-        echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> OMITIDO (completado con $lines líneas)"
-        continue
+    # Apply initial start delay only before the very first execution
+    if [ "$is_first_run" = true ]; then
+      is_first_run=false
+      if (( START_DELAY > 0 )); then
+        echo "[run_aegso] Applying initial start delay of ${START_DELAY}s for $ROLE ${NODE_ID:--}..."
+        sleep "$START_DELAY"
       fi
     fi
 
-    # Incrementar índice de slots ejecutados para mantener sincronización PTP
-    active_slot_idx=$((active_slot_idx + 1))
-
-    # Sincronización temporal basada en el reloj de pared PTP
-    slot_start=$(( BASE + (active_slot_idx - 1) * SLOT + OFFSET ))
-    now="$(date +%s)"
-    delta=$(( slot_start - now ))
-
     echo "============================================================"
-    if (( delta > 0 )); then
-      echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> slot $slot_start (wait ${delta}s)"
-      sleep "$delta"
-    else
-      echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> slot $slot_start (overrun, now)"
-    fi
+    echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> EXECUTING"
     echo "============================================================"
 
+    # Run client or repeater based on role
     if [[ "$ROLE" == "client" ]]; then
       run_python client \
         --node-id "$NODE_ID" \
@@ -212,6 +172,11 @@ for pgen in "${PGENS[@]}"; do
         --sock-buf "$SOCK_BUF" \
         --busy-poll-us "$BUSY_POLL_US"
     fi
+
+    # Wait for 600 seconds before running the next combination
+    echo "[run_aegso] Waiting ${CYCLE_WAIT}s to complete the cycle..."
+    sleep "$CYCLE_WAIT"
+
   done
 done
 
