@@ -28,7 +28,12 @@ Outputs (in 'analysis_AEGSO/'):
   8. Swap Coincidences & Successes Heatmap (pgen × pswap, YlOrRd colormap)
   9. Memory Exposure Density Heatmap (t_exp vs E_N binned density + theoretical decay)
   10. Mean Memory Time Heatmap (pgen × pswap, YlOrRd colormap)
-  11. Summary table → stdout + .txt
+  11. Summary table → stdout + .txt (per pswap)
+  12. Summary table by pgen at Pswap=1.0 → stdout + .txt
+
+Plots 4 and 4b share data, divisor M and the W=0-for-failed convention:
+  4  = (1/M) sum(E_N(i)/t_gen(i))   [e-bits/s], weighted by attempt duration
+  4b = (1/M) sum(E_N(i))             [e-bits/attempt], unweighted, in [0, 1]
 """
 
 import argparse
@@ -135,6 +140,14 @@ REQUIRED_COLS = {
 }
 
 GEN_REQUIRED_COLS = {"count", "ts_gen", "ts_rtt", "w_rtt", "bit_success_gen"}
+
+# A generation attempt preceded by a gap longer than this is the first attempt
+# after the client woke up from a SWAP_WAIT_TIMEOUT stall. The real stall gap is
+# ~3000 ms, well separated from the normal in-round / inter-round gap (0.1-1.1
+# ms), so the threshold sits between the two populations. Those attempts pay a
+# cold-start penalty (~2x the in-run rtt) and drag the harmonic mean down, so
+# they are reported separately instead of being silently mixed into R_unit.
+STALL_GAP_MS = 2000.0
 
 
 def load_client_csv(filepath: str) -> pd.DataFrame:
@@ -273,15 +286,21 @@ def plot_pswap_vs_rate_10_lines(
     w0: float,
     outdir: str,
     t_coh_ns: float = 1.0e6,
-    n_expected_attempts: int = 2000,
+    n_expected_attempts: int | None = None,
+    df_gen: pd.DataFrame | None = None,
 ):
-  """Plot 3: Individual Rate corrected by fixed total swap attempts (N = 2000).
+  """Plot 3: Individual Rate normalised by the real number of generation attempts.
 
-  Formula: Rate = (1 / N_expected_attempts) * sum(E_N(i) / t_gen(i)) over
+  Formula: Rate = (1 / N_attempts(pgen, pswap)) * sum(E_N(i) / t_gen(i)) over
   successful swaps.
+
+  N_attempts is read from the *_gen CSVs (one row = one generation attempt) when
+  df_gen is provided, which keeps the divisor consistent with plot 4. Otherwise
+  it falls back to n_expected_attempts, and then to the number of recorded
+  rounds in the cell.
   """
   path = os.path.join(
-      outdir, f"03_pswap_vs_rate_10lines_n2000_{label}.png"
+      outdir, f"03_pswap_vs_rate_10lines_{label}.png"
   )
   _style()
 
@@ -318,11 +337,23 @@ def plot_pswap_vs_rate_10_lines(
     if len(ok_sub) > 0:
       # Sum of individual rates (E_N / t_gen) for successful swaps
       r_indiv_sum = (ok_sub["en"] / ok_sub["t_gen_s"]).sum()
-
-      # Correct by dividing over the fixed 2000 total swap attempts
-      rate_corrected = r_indiv_sum / float(n_expected_attempts)
     else:
-      rate_corrected = 0.0
+      r_indiv_sum = 0.0
+
+    # Divide by the number of generation attempts actually recorded for the cell
+    if df_gen is not None and not df_gen.empty:
+      n_attempts = float(
+          (
+              (df_gen["pgen"] == pgen_val)
+              & (df_gen["pswap"] == pswap_val)
+          ).sum()
+      )
+    elif n_expected_attempts is not None:
+      n_attempts = float(n_expected_attempts)
+    else:
+      n_attempts = float(len(sub))
+
+    rate_corrected = r_indiv_sum / n_attempts if n_attempts > 0 else 0.0
 
     records.append({
         "pgen": pgen_val,
@@ -353,7 +384,7 @@ def plot_pswap_vs_rate_10_lines(
       fontsize=11,
   )
   ax.set_title(
-      f"Individual Rate Corrected by $N={n_expected_attempts}$ Attempts vs"
+      f"Individual Rate per Generation Attempt vs"
       f" $P_{{swap}}$ ({label})",
       fontsize=12,
       fontweight="bold",
@@ -375,11 +406,15 @@ def plot_rate_heatmap_pswap(
     label: str,
     outdir: str,
     target_pswap: float = 1.0,
-    n_expected_attempts: float = 2000.0,
+    n_expected_attempts: float | None = None,
 ):
     """
     Plot 4: Heatmap (pgen × Tcoh) at target Pswap=1.0 using generation attempts data:
     Columns: count, ts_gen, ts_rtt, w_rtt, bit_success_gen
+
+    Every row of a *_gen CSV is one generation attempt (successful or not), so the
+    number of attempts logged for each (pswap, pgen) cell is used as the rate
+    divisor. n_expected_attempts only overrides it when explicitly given.
     """
     path = os.path.join(outdir, f"04_rate_heatmap_rtt_pswap{target_pswap:.1f}_{label}.png")
     _style()
@@ -400,18 +435,31 @@ def plot_rate_heatmap_pswap(
     rate_matrix = np.zeros((len(TCOH_VALUES_NS), len(pgens)))
 
     for j, pgen_val in enumerate(pgens):
-        # Filter successful generation attempts
-        df_pg = df_p[(df_p["pgen"] == pgen_val) & (df_p["bit_success_gen"] == 1)]
-        if df_pg.empty:
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        if df_cell.empty:
             continue
 
-        rtt_vals = df_pg["ts_rtt"].values  # in ns
+        # Divisor: attempts actually logged for this (pswap, pgen) cell
+        n_attempts = (
+            float(n_expected_attempts)
+            if n_expected_attempts is not None
+            else float(len(df_cell))
+        )
+        if n_attempts <= 0:
+            continue
+
+        rtt_vals = df_cell["ts_rtt"].values  # in ns
         rtt_sec = np.where(rtt_vals > 0, rtt_vals / 1e9, 1e-9)
 
-        if "w_rtt" in df_pg.columns:
-            w0_vals = df_pg["w_rtt"].values
+        if "w_rtt" in df_cell.columns:
+            w0_vals = df_cell["w_rtt"].values.astype(float)
         else:
             w0_vals = np.ones_like(rtt_vals)
+
+        # A failed generation yields no state, so W = 0 and therefore E_N = 0:
+        # it only enters the rate through the divisor M. The CSVs log W = 1 even
+        # for the failed attempts, so this has to be imposed here.
+        w0_vals = np.where(df_cell["bit_success_gen"].values == 1, w0_vals, 0.0)
 
         # Sweep over Tcoh values
         for i, t_coh in enumerate(TCOH_VALUES_NS):
@@ -426,7 +474,7 @@ def plot_rate_heatmap_pswap(
             en_exp[w_exp <= (1.0 / 3.0)] = 0.0
             en_exp[en_exp < 0.3] = 0.0
 
-            indiv_rate = np.sum(en_exp / rtt_sec) / n_expected_attempts
+            indiv_rate = np.sum(en_exp / rtt_sec) / n_attempts
             rate_matrix[i, j] = indiv_rate
 
     plt.figure(figsize=(10, 6))
@@ -456,6 +504,104 @@ def plot_rate_heatmap_pswap(
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"   [+] Plot 4 Heatmap saved: {path}")
+
+
+def plot_en_mean_heatmap_pswap(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    outdir: str,
+    target_pswap: float = 1.0,
+):
+    """
+    Plot 4b: Heatmap (pgen × Tcoh) at target Pswap=1.0 showing the mean
+    entanglement per attempt, <E_N> = (1/M) * sum(E_N(i)).
+
+    Same data and same divisor M as plot 4, but without the 1/t_gen weighting:
+    this is the arithmetic mean of E_N over all logged generation attempts, so
+    it stays inside [0, 1] by construction. Failed generations contribute
+    E_N = 0 (W = 0), which the CSVs do not record directly.
+    """
+    path = os.path.join(outdir, f"04b_en_mean_heatmap_pswap{target_pswap:.1f}_{label}.png")
+    _style()
+
+    if df_gen_master.empty or "pgen" not in df_gen_master.columns or "pswap" not in df_gen_master.columns:
+        return
+
+    available_pswaps = df_gen_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_gen_master[df_gen_master["pswap"] == best_pswap].copy()
+
+    if df_p.empty:
+        return
+
+    pgens = sorted(df_p["pgen"].unique())
+    en_matrix = np.zeros((len(TCOH_VALUES_NS), len(pgens)))
+
+    for j, pgen_val in enumerate(pgens):
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        if df_cell.empty:
+            continue
+
+        n_attempts = float(len(df_cell))
+        if n_attempts <= 0:
+            continue
+
+        rtt_vals = df_cell["ts_rtt"].values  # in ns
+
+        if "w_rtt" in df_cell.columns:
+            w0_vals = df_cell["w_rtt"].values.astype(float)
+        else:
+            w0_vals = np.ones_like(rtt_vals)
+
+        # Same convention as plot 4: a failed generation yields no state, so
+        # W = 0 and E_N = 0. The CSVs log W = 1 even for failed attempts.
+        w0_vals = np.where(df_cell["bit_success_gen"].values == 1, w0_vals, 0.0)
+
+        for i, t_coh in enumerate(TCOH_VALUES_NS):
+            if np.isinf(t_coh):
+                w_exp = w0_vals
+            else:
+                w_exp = w0_vals * np.exp(-rtt_vals / t_coh)
+
+            en_exp = compute_en(w_exp)
+
+            en_exp[w_exp <= (1.0 / 3.0)] = 0.0
+            en_exp[en_exp < 0.3] = 0.0
+
+            en_matrix[i, j] = np.sum(en_exp) / n_attempts
+
+    plt.figure(figsize=(10, 6))
+    pgens_str = [f"{p:.1f}" for p in pgens]
+
+    sns.heatmap(
+        en_matrix,
+        annot=True,
+        fmt=".3f",
+        cmap="YlOrRd",
+        vmin=0.0,
+        vmax=1.0,
+        xticklabels=pgens_str,
+        yticklabels=TCOH_LABELS,
+        cbar_kws={"label": r"Mean Entanglement $\langle E_N \rangle$  [e-bits / attempt]"}
+    )
+
+    plt.xlabel(r"Generation Probability ($p_{\mathrm{gen}}$)", fontsize=11, labelpad=10)
+    plt.ylabel(r"Coherence Time ($T_{\mathrm{coh}}$)", fontsize=11, labelpad=10)
+    plt.title(
+        r"Mean Entanglement per Attempt $\langle E_N \rangle = \frac{1}{M} \sum E_N(i)$" + "\n" +
+        f"(Pswap = {best_pswap:.1f}, {label}, $E_N = 0$ if $w \\leq 1/3$)",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"   [+] Plot 4b EN-mean Heatmap saved: {path}")
+
 
 def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float, outdir: str, t_coh_ns: float = 1.0e6):
     """
@@ -773,6 +919,139 @@ def print_summary(pswap_data: dict, sorted_pswaps: list, label: str,
     print(f"  [+] {fpath}")
 
 
+def print_summary_pgen_at_pswap1(df_master: pd.DataFrame,
+                                df_gen_master: pd.DataFrame,
+                                label: str,
+                                w0: float,
+                                outdir: str,
+                                target_pswap: float = 1.0):
+    """Summary aggregated by pgen, restricted to Pswap = target_pswap.
+
+    Rates follow the same convention as plot 4: the divisor M is the number of
+    generation attempts logged in the *_gen CSVs, and a failed generation counts
+    as W = 0 (E_N = 0), so it only enters through M.
+
+    R_per_att = (1/M) * sum(E_N(i)/t_gen(i))   -> must grow linearly with pgen
+    R_unit    = sum(E_N(i)/t_gen(i)) / n_ok    -> hardware constant, flat in pgen
+    R_unit_w  = same, restricted to attempts with no preceding stall
+    R_60s     = sum(E_N) / SIMULATION_DURATION_S (comparable to print_summary)
+
+    R_unit is contaminated whenever a run is dominated by SWAP_WAIT_TIMEOUT
+    stalls: the first attempt after waking costs ~2x the in-run rtt, and since
+    R_unit averages 1/t_rtt, that inflates the denominator's share. frac_post
+    flags how much of the run is affected; R_unit_w is the clean constant.
+    """
+    div = "=" * 134
+    title = f"AEGSO METRICS by pgen – {label}  (W0={w0:.2f}, Pswap={target_pswap:.1f})"
+
+    headers = [
+        "pgen", "M_att", "n_ok", "frac_ok", "pgen_Navg", "t_gen_µs",
+        "t_exp_µs", "t_total_µs", "gen_rtt_µs", "W_repeater", "EN_mean",
+        "R_per_att", "R_unit", "frac_post", "R_unit_w", "R_60s",
+    ]
+
+    if df_master.empty:
+        print(f"  [!] No data for {label}")
+        return
+
+    pgens = sorted(
+        set(df_master["pgen"].unique())
+        | (set(df_gen_master["pgen"].unique()) if not df_gen_master.empty else set())
+    )
+
+    def _f(v, spec):
+        return format(v, spec) if v is not None and np.isfinite(v) else "n/a"
+
+    rows = []
+    for p in pgens:
+        df = df_master[(df_master["pgen"] == p)
+                       & (df_master["pswap"] == target_pswap)]
+        df_ok = df[df["pswap_success_bit"] == 1] if not df.empty else df
+
+        gen = pd.DataFrame()
+        if not df_gen_master.empty:
+            gen = df_gen_master[(df_gen_master["pgen"] == p)
+                                & (df_gen_master["pswap"] == target_pswap)]
+
+        n_att = len(gen)
+        n_ok_gen = int((gen["bit_success_gen"] == 1).sum()) if n_att else 0
+        frac_ok = (n_ok_gen / n_att) if n_att else np.nan
+
+        n_avg = df["gen_attempts"].mean() if "gen_attempts" in df.columns and not df.empty else np.nan
+        t_gen_us = df_ok["t_gen_total_ns"].mean() / 1e3 if not df_ok.empty else np.nan
+        t_exp_us = df_ok["t_exp_ns"].mean() / 1e3 if not df_ok.empty else np.nan
+        t_tot_us = df_ok["t_total_ns"].mean() / 1e3 if not df_ok.empty else np.nan
+        rtt_us = df_ok["gen_rtt_ns"].mean() / 1e3 if not df_ok.empty else np.nan
+        w_rep = df_ok["werner"].mean() if not df_ok.empty else np.nan
+
+        en_mean, rate_60 = np.nan, np.nan
+        if not df_ok.empty:
+            w_exp = compute_w_experimental(df_ok["t_exp_ns"].values, 1.0e6, w0=w0)
+            en = compute_en(w_exp)
+            en[w_exp <= (1.0 / 3.0)] = 0.0
+            en[en < 0.3] = 0.0
+            en_mean = en.mean()
+            rate_60 = en.sum() / SIMULATION_DURATION_S
+
+        r_per_att, r_unit = np.nan, np.nan
+        if n_att:
+            w = gen["w_rtt"].values.astype(float)
+            ok = gen["bit_success_gen"].values == 1
+            w = np.where(ok, w, 0.0)
+            rtt = gen["ts_rtt"].values
+            rtt_sec = np.where(rtt > 0, rtt / 1e9, 1e-9)
+            en_g = compute_en(w)
+            en_g[w <= (1.0 / 3.0)] = 0.0
+            en_g[en_g < 0.3] = 0.0
+            indiv_sum = np.sum(en_g / rtt_sec)
+            r_per_att = indiv_sum / n_att
+            r_unit = indiv_sum / n_ok_gen if n_ok_gen else np.nan
+
+            # Split off the post-stall cold starts: an attempt preceded by a
+            # gap > STALL_GAP_MS is the first one after the client woke up.
+            ts = gen["ts_gen"].values.astype(float)
+            gap_ms = np.concatenate([[0.0], np.diff(ts) / 1e6])
+            warm = gap_ms < STALL_GAP_MS
+            if n_ok_gen:
+                frac_post = 1.0 - warm[ok].mean()
+            warm_ok = ok & warm
+            r_unit_w = (np.sum(en_g[warm_ok] / rtt_sec[warm_ok]) / warm_ok.sum()
+                        if warm_ok.any() else np.nan)
+        else:
+            frac_post, r_unit_w = np.nan, np.nan
+
+        rows.append([
+            f"{p:.2f}", f"{n_att:d}", f"{n_ok_gen:d}", _f(frac_ok, ".3f"),
+            _f(n_avg, ".2f"), _f(t_gen_us, ".2f"), _f(t_exp_us, ".2f"),
+            _f(t_tot_us, ".2f"), _f(rtt_us, ".2f"), _f(w_rep, ".4f"),
+            _f(en_mean, ".6f"), _f(r_per_att, ".1f"), _f(r_unit, ".1f"),
+            _f(frac_post, ".2f"), _f(r_unit_w, ".1f"), _f(rate_60, ".2f"),
+        ])
+
+    if not rows:
+        print(f"  [!] No data at Pswap={target_pswap:.1f} for {label}")
+        return
+
+    widths = [max(len(h), max(len(r[i]) for r in rows)) + 2
+              for i, h in enumerate(headers)]
+    lines = [div, title.center(len(div)), div]
+    lines.append("".join(f"{h:^{widths[i]}}" for i, h in enumerate(headers)))
+    lines.append("-" * len(div))
+    for r in rows:
+        lines.append("".join(f"{v:^{widths[i]}}" for i, v in enumerate(r)))
+    lines.append(div)
+
+    table = "\n".join(lines)
+    print(f"\n{table}\n")
+
+    fpath = os.path.join(
+        outdir, f"summary_pgen_at_pswap{target_pswap:.1f}_{label}.txt"
+    )
+    with open(fpath, "w") as f:
+        f.write(table + "\n")
+    print(f"  [+] {fpath}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -932,8 +1211,11 @@ def main():
             "$gen\\_rtt$ [µs]", f"Generation RTT vs $p_{{swap}}$ ({mode_label})",
             mode_key, OUTPUT_DIR, f"02b_gen_rtt_vs_pswap_{mode_key}.png"
         )
-        plot_pswap_vs_rate_10_lines(df_master, mode_key, w0, OUTPUT_DIR)
+        plot_pswap_vs_rate_10_lines(
+            df_master, mode_key, w0, OUTPUT_DIR, df_gen=df_gen_master
+        )
         plot_rate_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
+        plot_en_mean_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_rate_pgen_pswap_heatmap(df_master, mode_key, w0, OUTPUT_DIR)
         plot_rtt_hist(all_rtt, mode_key, OUTPUT_DIR)
         plot_pswap_success_rate(pswap_rates, sorted_pswaps, mode_key, OUTPUT_DIR)
@@ -943,6 +1225,10 @@ def main():
 
         # ── Summary ──
         print_summary(pswap_data, sorted_pswaps, mode_key, w0, OUTPUT_DIR)
+        print_summary_pgen_at_pswap1(
+            df_master, df_gen_master, mode_key, w0, OUTPUT_DIR,
+            target_pswap=1.0,
+        )
 
         print(f"\n  [*] Filter P{args.percentile:.0f} | {len(sorted_pswaps)} pswap | {mode_label}")
 
