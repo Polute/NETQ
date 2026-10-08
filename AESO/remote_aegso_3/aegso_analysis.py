@@ -302,149 +302,150 @@ def plot_pswap_vs_rate_10_lines(
     n_expected_attempts: int | None = None,
     df_gen: pd.DataFrame | None = None,
 ):
-  """Plot 3: Individual Rate normalised by the real number of generation attempts.
-
-  Formula: Rate = (1 / N_attempts(pgen, pswap)) * sum(E_N(i) / t_gen(i)) over
-  successful swaps.
-
-  N_attempts is read from the *_gen CSVs (one row = one generation attempt) when
-  df_gen is provided, which keeps the divisor consistent with plot 4. Otherwise
-  it falls back to n_expected_attempts, and then to the number of recorded
-  rounds in the cell.
-
-  Error bars show the sample standard deviation of the per-attempt rates inside
-  each (pgen, pswap) cell. Failed/unrecorded attempts contribute 0, matching the
-  corrected mean rate normalisation by N_attempts. The lower bar is clipped at 0
-  because negative rates are not physical.
-  """
-  path = os.path.join(
-      outdir, f"03_pswap_vs_rate_10lines_{label}.png"
-  )
-  _style()
-
-  if (
-      df_master.empty
-      or "pgen" not in df_master.columns
-      or "pswap" not in df_master.columns
-  ):
-    return
-
-  df_calc = df_master.copy()
-
-  # 1. Convert individual generation time to seconds
-  df_calc["t_gen_s"] = df_calc["t_gen_total_ns"] / 1e9
-
-  # 2. Compute Werner state fidelity and Log-Negativity (E_N)
-  df_calc["w_exp"] = compute_w_experimental(
-      df_calc["t_exp_ns"].values, t_coh_ns, w0=w0
-  )
-  
-  # Condición física: W <= 1/3 implica E_N = 0
-  en_exp = compute_en(df_calc["w_exp"].values)
-  en_exp[df_calc["w_exp"].values <= (1.0 / 3.0)] = 0.0
-  en_exp[en_exp < 0.3] = 0.0
-  df_calc["en"] = en_exp
-  valid_t = np.isfinite(df_calc["t_gen_s"]) & (df_calc["t_gen_s"] > 0)
-  df_calc["rate_indiv"] = 0.0
-  df_calc.loc[valid_t, "rate_indiv"] = (
-      df_calc.loc[valid_t, "en"] / df_calc.loc[valid_t, "t_gen_s"]
-  )
-
-  records = []
-
-  # Group by pgen and pswap
-  for (pgen_val, pswap_val), sub in df_calc.groupby(["pgen", "pswap"]):
-    # Filter only successful swaps (M)
-    ok_sub = sub[sub["pswap_success_bit"] == 1]
-
-    if len(ok_sub) > 0:
-      # Sum of individual rates (E_N / t_gen) for successful swaps
-      r_indiv_sum = ok_sub["rate_indiv"].sum()
-      r_indiv_values = ok_sub["rate_indiv"].values
-    else:
-      r_indiv_sum = 0.0
-      r_indiv_values = np.array([], dtype=float)
-
-    # Divide by the number of generation attempts actually recorded for the cell
-    if df_gen is not None and not df_gen.empty:
-      n_attempts = float(
-          (
-              (df_gen["pgen"] == pgen_val)
-              & (df_gen["pswap"] == pswap_val)
-          ).sum()
-      )
-    elif n_expected_attempts is not None:
-      n_attempts = float(n_expected_attempts)
-    else:
-      n_attempts = float(len(sub))
-
-    rate_corrected = r_indiv_sum / n_attempts if n_attempts > 0 else 0.0
-    rate_std = sample_std_with_zeros(r_indiv_values, n_attempts)
-    lower_err = min(rate_std, rate_corrected)
-    upper_err = rate_std
-
-    records.append({
-        "pgen": pgen_val,
-        "pswap": pswap_val,
-        "rate_corrected": rate_corrected,
-        "rate_std": rate_std,
-        "rate_err_low": lower_err,
-        "rate_err_high": upper_err,
-    })
-
-  grouped = pd.DataFrame(records)
-  pgen_unique = sorted(grouped["pgen"].unique())
-
-  fig, ax = plt.subplots(figsize=(9, 6))
-  mean_colors = plt.cm.viridis(np.linspace(0, 1, max(len(pgen_unique), 1)))
-  std_colors = plt.cm.viridis(np.linspace(0, 1, max(len(pgen_unique), 1)))
-
-  for idx, pgen_val in enumerate(pgen_unique):
-    sub = grouped[grouped["pgen"] == pgen_val].sort_values("pswap")
-    pswap_vals = sub["pswap"].to_numpy()
-    mean_vals = sub["rate_corrected"].to_numpy()
-    sigma_top = mean_vals + sub["rate_err_high"].to_numpy()
-
-    ax.plot(
-        pswap_vals,
-        mean_vals,
-        "o-",
-        color=mean_colors[idx],
-        linewidth=2,
-        label=f"$p_{{gen}} = {pgen_val:.1f}$ mean",
+    """Plot 3: Individual Rate normalised by the real number of generation attempts."""
+    path = os.path.join(
+        outdir, f"03_pswap_vs_rate_10lines_{label}.png"
     )
-    ax.plot(
-        pswap_vals,
-        sigma_top,
-        "^-",
-        color=std_colors[idx],
-        linewidth=1.8,
-        alpha=0.9,
-        label=f"$p_{{gen}} = {pgen_val:.1f}$ mean + $\sigma$",
+    _style()
+
+    if (
+        df_master.empty
+        or "pgen" not in df_master.columns
+        or "pswap" not in df_master.columns
+    ):
+        return
+
+    df_calc = df_master.copy()
+
+    df_calc["t_gen_s"] = df_calc["t_gen_total_ns"] / 1e9
+
+    df_calc["w_exp"] = compute_w_experimental(
+        df_calc["t_exp_ns"].values, t_coh_ns, w0=w0
     )
 
-  ax.set_xlabel(r"Swap Probability ($P_{\mathrm{swap}}$)", fontsize=11)
-  ax.set_ylabel(
-      r"Corrected Rate $\langle R_{\mathrm{indiv}} \rangle$ [e-bits / s]",
-      fontsize=11,
-  )
-  ax.set_title(
-      f"Individual Rate per Generation Attempt vs"
-      f" $P_{{swap}}$ ({label})",
-      fontsize=12,
-      fontweight="bold",
-  )
-  ax.grid(True, linestyle="--", alpha=0.5)
-  ax.legend(
-      title=r"Probability $p_{\mathrm{gen}}$",
-      bbox_to_anchor=(1.05, 1),
-      loc="upper left",
-  )
+    en_exp = compute_en(df_calc["w_exp"].values)
+    en_exp[df_calc["w_exp"].values <= (1.0 / 3.0)] = 0.0
+    en_exp[en_exp < 0.3] = 0.0
+    df_calc["en"] = en_exp
+    valid_t = np.isfinite(df_calc["t_gen_s"]) & (df_calc["t_gen_s"] > 0)
+    df_calc["rate_indiv"] = 0.0
+    df_calc.loc[valid_t, "rate_indiv"] = (
+        df_calc.loc[valid_t, "en"] / df_calc.loc[valid_t, "t_gen_s"]
+    )
 
-  plt.tight_layout()
-  plt.savefig(path, dpi=300, bbox_inches="tight")
-  plt.close(fig)
-  print(f"   [+] Fixed plot saved: {path}")
+    records = []
+
+    for (pgen_val, pswap_val), sub in df_calc.groupby(["pgen", "pswap"]):
+        ok_sub = sub[sub["pswap_success_bit"] == 1]
+        if len(ok_sub) > 0:
+            r_indiv_sum = ok_sub["rate_indiv"].sum()
+            r_indiv_values = ok_sub["rate_indiv"].values
+        else:
+            r_indiv_sum = 0.0
+            r_indiv_values = np.array([], dtype=float)
+
+        if df_gen is not None and not df_gen.empty:
+            n_attempts = float(
+                ((df_gen["pgen"] == pgen_val) & (df_gen["pswap"] == pswap_val)).sum()
+            )
+        elif n_expected_attempts is not None:
+            n_attempts = float(n_expected_attempts)
+        else:
+            n_attempts = float(len(sub))
+
+        if n_attempts > 0:
+            rate_corrected = r_indiv_sum / n_attempts
+            rate_std = sample_std_with_zeros(r_indiv_values, n_attempts)
+        else:
+            rate_corrected = 0.0
+            rate_std = 0.0
+
+        records.append({
+            "pgen": pgen_val,
+            "pswap": pswap_val,
+            "rate_corrected": rate_corrected,
+            "rate_std": rate_std,
+            "r_indiv_values": r_indiv_values,
+            "n_attempts": n_attempts,
+        })
+
+    grouped = pd.DataFrame(records)
+    pgen_unique = sorted(grouped["pgen"].unique())
+
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+    cmap = plt.cm.viridis
+
+    for idx, pgen_val in enumerate(pgen_unique):
+        sub = grouped[grouped["pgen"] == pgen_val].sort_values("pswap")
+        pswap_vals = sub["pswap"].to_numpy()
+        mean_vals = sub["rate_corrected"].to_numpy()
+        rate_std_vals = sub["rate_std"].to_numpy()
+
+        for _, row in sub.iterrows():
+            rv = row["r_indiv_values"]
+            n = int(round(row["n_attempts"])) if row["n_attempts"] > 0 else len(rv)
+            if n <= 0:
+                allv = rv
+            else:
+                nz = max(0, n - len(rv))
+                allv = np.concatenate([rv, np.zeros(nz)]) if nz else rv
+            ax.scatter(
+                np.full_like(allv, row["pswap"]),
+                allv,
+                s=10,
+                alpha=0.15,
+                color=cmap(idx / max(len(pgen_unique) - 1, 1)) if len(pgen_unique) > 1 else cmap(0.5),
+                edgecolors="none",
+                zorder=1,
+            )
+
+        y_low = np.maximum(0.0, mean_vals - rate_std_vals)
+        y_high = mean_vals + rate_std_vals
+        ax.fill_between(
+            pswap_vals,
+            y_low,
+            y_high,
+            color=cmap(idx / max(len(pgen_unique) - 1, 1)) if len(pgen_unique) > 1 else cmap(0.5),
+            alpha=0.25,
+            linewidth=0,
+            zorder=2,
+        )
+
+        ax.plot(
+            pswap_vals,
+            mean_vals,
+            "o-",
+            color=cmap(idx / max(len(pgen_unique) - 1, 1)) if len(pgen_unique) > 1 else cmap(0.5),
+            linewidth=2.2,
+            markersize=6,
+            label=f"$p_{{gen}} = {pgen_val:.1f}$",
+            zorder=3,
+        )
+
+    ax.set_xlabel(r"Swap Probability ($P_{\mathrm{swap}}$)", fontsize=11)
+    ax.set_ylabel(
+        r"Individual Rate $R_{\mathrm{indiv}} = E_N / t_{\mathrm{gen}}$ [e-bits / s] (per attempt)",
+        fontsize=11,
+    )
+    ax.set_title(
+        f"Individual Rate per Generation Attempt vs $P_{{swap}}$ ({label})\n"
+        r"Points = individual attempts (0 for failed), line = mean, band = mean ± $\sigma$ (lower $\geq 0$)",
+        fontsize=12,
+        fontweight="bold",
+    )
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(
+        title=r"Probability $p_{\mathrm{gen}}$",
+        bbox_to_anchor=(1.05, 1),
+        loc="upper left",
+    )
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"   [+] Fixed plot saved: {path}")
+
 
 def plot_rate_heatmap_pswap(
     df_gen_master: pd.DataFrame,

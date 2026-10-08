@@ -21,13 +21,13 @@ Outputs (in 'analysis_AEGSO/'):
   2. t_swap vs pswap (Scatter points only, non-negative error bars)
   2b. gen_rtt vs pswap (Scatter points only, non-negative error bars)
   3. Pswap vs Entanglement Rate (10 lines, one per pgen)
-  4. Individual Rate Heatmap (pgen × Tcoh for fixed Pswap=1.0)
-  5. 60s-Normalized Rate Heatmap (pgen × pswap, YlOrRd colormap)
+  4. Individual Rate Heatmap (pgen x Tcoh for fixed Pswap=1.0)
+  5. 60s-Normalized Rate Heatmap (pgen x pswap, YlOrRd colormap)
   6. gen_rtt histogram
   7. pswap success rate bar chart
-  8. Swap Coincidences & Successes Heatmap (pgen × pswap, YlOrRd colormap)
+  8. Swap Coincidences & Successes Heatmap (pgen x pswap, YlOrRd colormap)
   9. Memory Exposure Density Heatmap (t_exp vs E_N binned density + theoretical decay)
-  10. Mean Memory Time Heatmap (pgen × pswap, YlOrRd colormap)
+  10. Mean Memory Time Heatmap (pgen x pswap, YlOrRd colormap)
   11. Summary table → stdout + .txt (per pswap)
   12. Summary table by pgen at Pswap=1.0 → stdout + .txt
 
@@ -409,7 +409,7 @@ def plot_rate_heatmap_pswap(
     n_expected_attempts: float | None = None,
 ):
     """
-    Plot 4: Heatmap (pgen × Tcoh) at target Pswap=1.0 using generation attempts data:
+    Plot 4: Heatmap (pgen x Tcoh) at target Pswap=1.0 using generation attempts data:
     Columns: count, ts_gen, ts_rtt, w_rtt, bit_success_gen
 
     Every row of a *_gen CSV is one generation attempt (successful or not), so the
@@ -513,7 +513,7 @@ def plot_en_mean_heatmap_pswap(
     target_pswap: float = 1.0,
 ):
     """
-    Plot 4b: Heatmap (pgen × Tcoh) at target Pswap=1.0 showing the mean
+    Plot 4b: Heatmap (pgen x Tcoh) at target Pswap=1.0 showing the mean
     entanglement per attempt, <E_N> = (1/M) * sum(E_N(i)).
 
     Same data and same divisor M as plot 4, but without the 1/t_gen weighting:
@@ -606,7 +606,7 @@ def plot_en_mean_heatmap_pswap(
 def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float, outdir: str, t_coh_ns: float = 1.0e6):
     """
     Plot 5: Heatmap of normalized entanglement rate [e-bits/s] over a 60-second execution window
-    across (pgen × pswap) grid using YlOrRd colormap.
+    across (pgen x pswap) grid using YlOrRd colormap.
     """
     path = os.path.join(outdir, f"05_rate_pgen_pswap_heatmap_{label}.png")
     _style()
@@ -646,7 +646,7 @@ def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float,
     )
     ax.set_xlabel("$p_{swap}$")
     ax.set_ylabel("$p_{gen}$")
-    ax.set_title(f"Normalized Entanglement Rate over 60s ($p_{{gen}}$ × $p_{{swap}}$) – {label}")
+    ax.set_title(f"Normalized Entanglement Rate over 60s ($p_{{gen}}$ x $p_{{swap}}$) – {label}")
     ax.invert_yaxis()
 
     plt.tight_layout()
@@ -701,7 +701,7 @@ def plot_pswap_success_rate(pswap_rates, pswaps, label, outdir):
 
 def plot_pswap_pgen_attempts_success_heatmap(df_master: pd.DataFrame, label: str, outdir: str):
     """
-    Plot 8: Heatmap of swap attempts (coincidences) across (pgen × pswap) grid
+    Plot 8: Heatmap of swap attempts (coincidences) across (pgen x pswap) grid
     colored with YlOrRd, displaying only successful swap counts inside cells.
     """
     path = os.path.join(outdir, f"08_pswap_pgen_attempts_heatmap_{label}.png")
@@ -740,7 +740,7 @@ def plot_pswap_pgen_attempts_success_heatmap(df_master: pd.DataFrame, label: str
     )
     ax.set_xlabel("$p_{swap}$")
     ax.set_ylabel("$p_{gen}$")
-    ax.set_title(f"Swap Attempts & Successful Swaps ($p_{{gen}}$ × $p_{{swap}}$) – {label}")
+    ax.set_title(f"Swap Attempts & Successful Swaps ($p_{{gen}}$ x $p_{{swap}}$) – {label}")
     ax.invert_yaxis()
 
     plt.tight_layout()
@@ -812,7 +812,7 @@ def plot_texp_en_density_heatmap(df_master: pd.DataFrame, label: str, w0: float,
 
 def plot_texp_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, outdir: str):
     """
-    Plot 10: Heatmap of Mean Memory Exposure Time <t_exp> in µs across (pgen × pswap) grid
+    Plot 10: Heatmap of Mean Memory Exposure Time <t_exp> in µs across (pgen x pswap) grid
     using YlOrRd colormap.
     """
     path = os.path.join(outdir, f"10_mean_texp_pgen_pswap_heatmap_{label}.png")
@@ -846,7 +846,7 @@ def plot_texp_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, outdir: st
     )
     ax.set_xlabel("$p_{swap}$")
     ax.set_ylabel("$p_{gen}$")
-    ax.set_title(f"Tiempo Medio de Espera en Memoria ($p_{{gen}}$ × $p_{{swap}}$) – {label}")
+    ax.set_title(f"Tiempo Medio de Espera en Memoria ($p_{{gen}}$ x $p_{{swap}}$) – {label}")
     ax.invert_yaxis()
 
     plt.tight_layout()
