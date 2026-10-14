@@ -164,6 +164,26 @@ def get_unique_filepath(folder, prefix, extension=".csv"):
         n += 1
 
 
+def atomic_write_csv(path, header, rows, formatter):
+    """Write a CSV through a temporary file and atomically replace the target."""
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(header)
+            for row in rows:
+                f.write(formatter(row))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        chown_output_path(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def resource_werner_ns(age_ns, t1_ns, w0):
     age_ns = max(0.0, float(age_ns))
     if t1_ns <= 0:
@@ -396,7 +416,7 @@ def run_repeater(args):
 
 def run_client(args):
     role_str = "Receiver" if args.is_receiver else "Sender"
-    print(f"[ROL]: {role_str}")
+    print(f"[ROLE]: {role_str}")
 
     ptp_offset_ns = read_ptp_offset()
     if ptp_offset_ns:
@@ -418,31 +438,6 @@ def run_client(args):
         sock, args.sock_buf, args.busy_poll_us, kernel_timestamp=True
     )
 
-    server_addr = (args.repeater_host, args.repeater_port)
-    client_id = 1 if args.node_id == "A" else 2
-
-    # ── Register + wait for READY ──
-    sock.settimeout(5.0)
-    ready = False
-    for _reg in range(200):
-        sock.sendto(REG_PACK(REG_FORMAT, client_id), server_addr)
-        try:
-            data, _ = sock.recvfrom(64)
-            if len(data) == 1 and data[0] == 0x01:
-                ready = True
-                break
-        except (socket.timeout, OSError):
-            time.sleep(0.05)
-
-    if not ready:
-        print(f"[Client {args.node_id}] ERROR: No READY signal. Aborting.")
-        sock.close()
-        return
-
-    print(f"[Client {args.node_id}] READY. Starting {args.count} swap rounds...")
-    sock.settimeout(args.attempt_timeout)
-
-    apply_cpu_rt(args.cpu, args.rt_priority)
     running = True
 
     def _stop(signum, frame):
@@ -450,6 +445,40 @@ def run_client(args):
         running = False
 
     signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    server_addr = (args.repeater_host, args.repeater_port)
+    client_id = 1 if args.node_id == "A" else 2
+
+    # ── Register + wait for READY ──
+    sock.settimeout(5.0)
+    ready = False
+    for _reg in range(200):
+        if not running:
+            break
+        try:
+            sock.sendto(REG_PACK(REG_FORMAT, client_id), server_addr)
+            data, _ = sock.recvfrom(64)
+            if len(data) == 1 and data[0] == 0x01:
+                ready = True
+                break
+        except (socket.timeout, InterruptedError, OSError):
+            if not running:
+                break
+            time.sleep(0.05)
+
+    if not ready:
+        if running:
+            print(f"[Client {args.node_id}] ERROR: No READY signal. Aborting.")
+        else:
+            print(f"[Client {args.node_id}] Stop signal received during registration.")
+        sock.close()
+        return
+
+    print(f"[Client {args.node_id}] READY. Starting {args.count} swap rounds...")
+    sock.settimeout(args.attempt_timeout)
+
+    apply_cpu_rt(args.cpu, args.rt_priority)
 
     gen_buf = bytearray(TS_SIZE)
     ack_buf = bytearray(TS_SIZE)
@@ -466,7 +495,7 @@ def run_client(args):
     cfg = LINK_CONFIG[args.node_id]
     effective_pgen = effective_generation_probability(args.pgen, cfg["length_km"], cfg["latt_km"])
 
-    # Impresión en pantalla del cambio en PGEN
+    # Print the effective generation probability after attenuation.
     print(f"[PGEN TRANSFORM]: {args.pgen:.6g} -> {effective_pgen:.6g} (Link {args.node_id}: {cfg['length_km']}km, Latt={cfg['latt_km']:.2f}km)")
 
     gc_was_enabled = gc.isenabled()
@@ -579,24 +608,26 @@ def run_client(args):
         if gc_was_enabled:
             gc.enable()
 
-    with open(out_path, "w") as f:
-        f.write(
+    atomic_write_csv(
+        out_path,
+        (
             "round,gen_attempts,t_gen_total_ns,gen_rtt_ns,"
             "ts_gen_success_ns,ts_swap_ns,swap_to_recv_ns,t_exp_ns,"
             "werner,pgen_success_bit,pswap_success_bit\n"
-        )
-        for r in records:
-            f.write(
-                f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},"
-                f"{r[8]:.6f},{r[9]},{r[10]}\n"
-            )
-    chown_output_path(out_path)
+        ),
+        records,
+        lambda r: (
+            f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},"
+            f"{r[8]:.6f},{r[9]},{r[10]}\n"
+        ),
+    )
 
-    with open(out_gen_path, "w") as f:
-        f.write("count,ts_gen,ts_rtt,w_rtt,bit_success_gen\n")
-        for r in gen_records:
-            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]:.6f},{r[4]}\n")
-    chown_output_path(out_gen_path)
+    atomic_write_csv(
+        out_gen_path,
+        "count,ts_gen,ts_rtt,w_rtt,bit_success_gen\n",
+        gen_records,
+        lambda r: f"{r[0]},{r[1]},{r[2]},{r[3]:.6f},{r[4]}\n",
+    )
 
     ok = sum(1 for r in records if r[10])
     print(f"[Client {args.node_id}] {len(records)} rounds "
