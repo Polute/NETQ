@@ -551,7 +551,189 @@ def plot_rate_heatmap_pswap(
     plt.close()
     print(f"  [+] Plot 4 Heatmap saved: {path}")
 
+def plot_rate_vs_pgen_by_tau(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    outdir: str,
+    target_pswap: float = 1.0,
+):
+    """
+    Line plot: X-axis = pgen, Y-axis = Entanglement Rate,
+    with one curve for each tau (T_coh) value and standard deviation (sigma) bands.
+    Strictly based on the calculation logic of Plot 4 rows.
+    """
+    path = os.path.join(outdir, f"4c_rate_vs_pgen_by_tau_pswap{target_pswap:.1f}_{label}.png")
+    _style()
 
+    if df_gen_master.empty or "pgen" not in df_gen_master.columns or "pswap" not in df_gen_master.columns:
+        return
+
+    available_pswaps = df_gen_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_gen_master[df_gen_master["pswap"] == best_pswap].copy()
+
+    if df_p.empty:
+        return
+
+    pgens = sorted(df_p["pgen"].unique())
+
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+    cmap = plt.cm.viridis
+
+    # Iterate over each tau (T_coh) value, which correspond to Plot 4 rows
+    for idx, (t_coh, tcoh_label) in enumerate(zip(TCOH_VALUES_NS, TCOH_LABELS)):
+        means = []
+        stds = []
+
+        for pgen_val in pgens:
+            df_cell = df_p[df_p["pgen"] == pgen_val]
+            if df_cell.empty:
+                means.append(0.0)
+                stds.append(0.0)
+                continue
+
+            n_attempts = float(len(df_cell))
+            if n_attempts <= 0:
+                means.append(0.0)
+                stds.append(0.0)
+                continue
+
+            rtt_vals = df_cell["ts_rtt"].values  # in ns
+            rtt_sec = np.where(rtt_vals > 0, rtt_vals / 1e9, 1e-9)
+
+            if "w_rtt" in df_cell.columns:
+                w0_vals = df_cell["w_rtt"].values.astype(float)
+            else:
+                w0_vals = np.ones_like(rtt_vals)
+
+            # Plot 4 convention: failed attempt -> W = 0, E_N = 0
+            w0_vals = np.where(df_cell["bit_success_gen"].values == 1, w0_vals, 0.0)
+
+            if np.isinf(t_coh):
+                w_exp = w0_vals
+            else:
+                w_exp = w0_vals * np.exp(-rtt_vals / t_coh)
+
+            en_exp = compute_en(w_exp)
+            en_exp[w_exp <= (1.0 / 3.0)] = 0.0
+            en_exp[en_exp < 0.3] = 0.0
+
+            # Individual rates per attempt
+            indiv_rates = en_exp / rtt_sec
+
+            # Mean and standard deviation (including zeros for failed attempts)
+            mean_rate = np.sum(indiv_rates) / n_attempts
+            std_rate = sample_std_with_zeros(indiv_rates, n_attempts)
+
+            means.append(mean_rate)
+            stds.append(std_rate)
+
+        means = np.array(means)
+        stds = np.array(stds)
+        y_low = np.maximum(0.0, means - stds)
+        y_high = means + stds
+
+        color = cmap(idx / max(len(TCOH_VALUES_NS) - 1, 1))
+
+        # Standard deviation shading and mean curve plotting
+        ax.fill_between(pgens, y_low, y_high, color=color, alpha=0.15, linewidth=0)
+        ax.plot(
+            pgens, means, "o-", color=color, linewidth=2, markersize=5,
+            label=f"$T_{{coh}}$ ($\tau$) = {tcoh_label}"
+        )
+
+    ax.set_xlabel(r"Generation Probability ($p_{\mathrm{gen}}$)", fontsize=11)
+    ax.set_ylabel(r"Entanglement Rate $\langle R_{\mathrm{indiv}} \rangle$ [e-bits / s]", fontsize=11)
+    ax.set_title(
+        f"Entanglement Rate vs $p_{{\mathrm{{gen}}}}$ by Coherence $\tau$ ($T_{{coh}}$)\n"
+        f"(Derived from Plot 4, $P_{{\mathrm{{swap}}}} = {best_pswap:.1f}$, with standard deviation $\\sigma$)",
+        fontsize=12,
+        fontweight="bold"
+    )
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(title="Coherence ($\tau$)", bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  [+] Rate vs pgen by Tau plot saved to: {path}")
+    
+def plot_en_distribution_by_pgen(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    target_pswap: float = 1.0,
+):
+    """
+    Generates plots inside 'analysis_AEGSO/4d_en_distributions' grouping 
+    the E_N distributions to cleanly compare different pgen values.
+    """
+    outdir = os.path.join(OUTPUT_DIR, "4d_en_distributions")
+    os.makedirs(outdir, exist_ok=True)
+    _style()
+
+    if df_gen_master.empty or "pgen" not in df_gen_master.columns or "pswap" not in df_gen_master.columns:
+        return
+
+    available_pswaps = df_gen_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_gen_master[df_gen_master["pswap"] == best_pswap].copy()
+
+    if df_p.empty:
+        return
+
+    pgens = sorted(df_p["pgen"].unique())
+
+    path = os.path.join(outdir, f"4d_en_distribution_all_pgens_{label}.png")
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    cmap = plt.cm.viridis
+    for idx, pgen_val in enumerate(pgens):
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        if df_cell.empty:
+            continue
+
+        rtt_vals = df_cell["ts_rtt"].values  # in ns
+        if "w_rtt" in df_cell.columns:
+            w0_vals = df_cell["w_rtt"].values.astype(float)
+        else:
+            w0_vals = np.ones_like(rtt_vals)
+
+        # Convention: failed attempt -> W = 0, E_N = 0
+        w0_vals = np.where(df_cell["bit_success_gen"].values == 1, w0_vals, 0.0)
+
+        # Default T_coh = 1 ms for global view
+        w_exp = w0_vals * np.exp(-rtt_vals / 1.0e6)
+        en_exp = compute_en(w_exp)
+        en_exp[w_exp <= (1.0 / 3.0)] = 0.0
+        en_exp[en_exp < 0.3] = 0.0
+
+        color = cmap(idx / max(len(pgens) - 1, 1))
+        ax.hist(
+            en_exp, bins=30, alpha=0.4, color=color,
+            label=f"$p_{{gen}} = {pgen_val:.1f}$", edgecolor="none"
+        )
+
+    ax.set_xlabel(r"Entanglement $E_N$ [e-bits] (0 = Failures / No State)")
+    ax.set_ylabel(r"Number of Attempts")
+    ax.set_title(
+        f"Distribution of $E_N$ per Attempt (Comparison of $p_{{gen}}$)\n"
+        f"($P_{{\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
+        fontsize=12,
+        fontweight="bold"
+    )
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(title="$p_{gen}$", fontsize=9, loc="upper right")
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [+] Unified Plot 4d saved to: {path}")
 def plot_en_mean_heatmap_pswap(
     df_gen_master: pd.DataFrame,
     label: str,
@@ -1270,6 +1452,8 @@ def main():
         )
         plot_rate_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_en_mean_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
+        plot_rate_vs_pgen_by_tau(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
+        plot_en_distribution_by_pgen(df_gen_master, mode_key, target_pswap=1.0)
         plot_rate_pgen_pswap_heatmap(df_master, mode_key, w0, OUTPUT_DIR)
         plot_rtt_hist(all_rtt, mode_key, OUTPUT_DIR)
         plot_pswap_success_rate(pswap_rates, sorted_pswaps, mode_key, OUTPUT_DIR)
