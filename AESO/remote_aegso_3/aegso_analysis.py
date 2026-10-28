@@ -645,10 +645,16 @@ def plot_rate_vs_pgen_by_tau(
         )
 
     ax.set_xlabel(r"Generation Probability ($p_{\mathrm{gen}}$)", fontsize=11)
-    ax.set_ylabel(r"Entanglement Rate $\langle R_{\mathrm{indiv}} \rangle$ [e-bits / s]", fontsize=11)
+    ax.set_ylabel(
+        r"Effective EPR Generation Rate per Attempt "
+        r"$\langle R_{\mathrm{gen}} \rangle$ [e-bits / s]",
+        fontsize=11,
+    )
     ax.set_title(
-        f"Entanglement Rate vs $p_{{\mathrm{{gen}}}}$ by Coherence $\tau$ ($T_{{coh}}$)\n"
-        f"(Derived from Plot 4, $P_{{\mathrm{{swap}}}} = {best_pswap:.1f}$, with standard deviation $\\sigma$)",
+        rf"Effective EPR Generation vs $p_{{\mathrm{{gen}}}}$ by Coherence "
+        f"$\\tau$ ($T_{{\\mathrm{{coh}}}}$)\n"
+        f"(Repeater link availability, $P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$; "
+        f"mean $\\pm\\sigma$)",
         fontsize=12,
         fontweight="bold"
     )
@@ -714,26 +720,111 @@ def plot_en_distribution_by_pgen(
 
         color = cmap(idx / max(len(pgens) - 1, 1))
         ax.hist(
-            en_exp, bins=30, alpha=0.4, color=color,
+            en_exp, bins=np.linspace(0.0, 1.0, 31), alpha=0.4, color=color,
             label=f"$p_{{gen}} = {pgen_val:.1f}$", edgecolor="none"
         )
 
-    ax.set_xlabel(r"Entanglement $E_N$ [e-bits] (0 = Failures / No State)")
-    ax.set_ylabel(r"Number of Attempts")
+    ax.set_xlabel(
+        r"Generated EPR Entanglement $E_N$ [e-bits] "
+        r"(0 = failed generation / unavailable link)"
+    )
+    ax.set_ylabel(r"Number of Generation Attempts")
     ax.set_title(
-        f"Distribution of $E_N$ per Attempt (Comparison of $p_{{gen}}$)\n"
-        f"($P_{{\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
+        f"Distribution of Generated EPR Entanglement $E_N$ per Attempt\n"
+        f"(Repeater link availability; $T_{{\\mathrm{{coh}}}} = 1$ ms, "
+        f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
         fontsize=12,
         fontweight="bold"
     )
     ax.grid(True, linestyle="--", alpha=0.3)
     ax.legend(title="$p_{gen}$", fontsize=9, loc="upper right")
+    ax.set_xlim(0.0, 1.0)
     ax.set_ylim(bottom=0)
 
     plt.tight_layout()
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  [+] Unified Plot 4d saved to: {path}")
+
+
+def plot_en_distribution_individual_by_pgen(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    target_pswap: float = 1.0,
+):
+    """Generate one 4d distribution plot per pgen, with one curve per Tcoh."""
+    outdir = os.path.join(OUTPUT_DIR, "4d_en_distributions")
+    os.makedirs(outdir, exist_ok=True)
+    _style()
+
+    required = {"pgen", "pswap", "ts_rtt", "bit_success_gen"}
+    if df_gen_master.empty or not required.issubset(df_gen_master.columns):
+        return
+
+    available_pswaps = df_gen_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_gen_master[df_gen_master["pswap"] == best_pswap].copy()
+    if df_p.empty:
+        return
+
+    bins = np.linspace(0.0, 1.0, 31)
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(TCOH_VALUES_NS)))
+
+    for pgen_val in sorted(df_p["pgen"].unique()):
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        rtt_vals = df_cell["ts_rtt"].to_numpy(dtype=float)
+        if "w_rtt" in df_cell.columns:
+            w0_vals = df_cell["w_rtt"].to_numpy(dtype=float)
+        else:
+            w0_vals = np.ones_like(rtt_vals)
+        w0_vals = np.where(df_cell["bit_success_gen"].to_numpy() == 1, w0_vals, 0.0)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for color, t_coh, tcoh_label in zip(colors, TCOH_VALUES_NS, TCOH_LABELS):
+            if np.isinf(t_coh):
+                w_exp = w0_vals
+            else:
+                w_exp = w0_vals * np.exp(-rtt_vals / t_coh)
+
+            en_exp = compute_en(w_exp)
+            en_exp[w_exp <= (1.0 / 3.0)] = 0.0
+            en_exp[en_exp < 0.3] = 0.0
+            ax.hist(
+                en_exp,
+                bins=bins,
+                alpha=0.35,
+                color=color,
+                label=rf"$T_{{coh}} = {tcoh_label}$",
+                edgecolor="none",
+            )
+
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel(
+            r"Generated EPR Entanglement $E_N$ [e-bits] "
+            r"(0 = failed generation / unavailable link)"
+        )
+        ax.set_ylabel("Number of Generation Attempts (Successes and Failures)")
+        ax.set_title(
+            f"Generated EPR Entanglement Distribution per Attempt\n"
+            f"($p_{{gen}} = {pgen_val:.1f}$, "
+            f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
+            fontsize=12,
+            fontweight="bold",
+        )
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.legend(title="$T_{coh}$", fontsize=9, loc="upper right")
+        plt.tight_layout()
+        path = os.path.join(
+            outdir, f"4d_en_dist_pgen_{pgen_val:.1f}_{label}.png"
+        )
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [+] Individual 4d plot saved to: {path}")
+
+
 def plot_en_mean_heatmap_pswap(
     df_gen_master: pd.DataFrame,
     label: str,
@@ -833,8 +924,8 @@ def plot_en_mean_heatmap_pswap(
 
 def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float, outdir: str, t_coh_ns: float = 1.0e6):
     """
-    Plot 5: Heatmap of normalized entanglement rate [e-bits/s] over a 60-second execution window
-    across (pgen x pswap) grid using YlOrRd colormap.
+    Plot 5: Heatmap of observed entanglement rate [e-bits/s] over the
+    timestamp span recorded for each (pgen, pswap) run.
     """
     path = os.path.join(outdir, f"05_rate_pgen_pswap_heatmap_{label}.png")
     _style()
@@ -854,12 +945,21 @@ def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float,
     df_calc["en_ok"] = np.where(df_calc["pswap_success_bit"] == 1, df_calc["en"], 0.0)
 
     grouped = df_calc.groupby(["pgen", "pswap"]).agg(
-        total_en=("en_ok", "sum")
+        total_en=("en_ok", "sum"),
+        first_ts_ns=("ts_swap_ns", "min"),
+        last_ts_ns=("ts_swap_ns", "max"),
     ).reset_index()
 
-    grouped["rate_60s"] = grouped["total_en"] / SIMULATION_DURATION_S
+    grouped["duration_s"] = (
+        grouped["last_ts_ns"] - grouped["first_ts_ns"]
+    ) / 1.0e9
+    grouped["rate_observed"] = np.where(
+        grouped["duration_s"] > 0,
+        grouped["total_en"] / grouped["duration_s"],
+        np.nan,
+    )
 
-    rate_pivot = grouped.pivot(index="pgen", columns="pswap", values="rate_60s")
+    rate_pivot = grouped.pivot(index="pgen", columns="pswap", values="rate_observed")
 
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.heatmap(
@@ -867,14 +967,14 @@ def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float,
         annot=True,
         fmt=".2f",
         cmap="YlOrRd",
-        cbar_kws={"label": r"Normalized Rate $\langle R_{60s} \rangle$ [e-bits/s]"},
+        cbar_kws={"label": r"Observed Rate [e-bits/s]"},
         ax=ax,
         linewidths=0.5,
         linecolor="gray"
     )
     ax.set_xlabel("$p_{swap}$")
     ax.set_ylabel("$p_{gen}$")
-    ax.set_title(f"Normalized Entanglement Rate over 60s ($p_{{gen}}$ x $p_{{swap}}$) – {label}")
+    ax.set_title(f"Observed Entanglement Rate ($p_{{gen}}$ x $p_{{swap}}$) – {label}")
     ax.invert_yaxis()
 
     plt.tight_layout()
@@ -1454,6 +1554,9 @@ def main():
         plot_en_mean_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_rate_vs_pgen_by_tau(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_en_distribution_by_pgen(df_gen_master, mode_key, target_pswap=1.0)
+        plot_en_distribution_individual_by_pgen(
+            df_gen_master, mode_key, target_pswap=1.0
+        )
         plot_rate_pgen_pswap_heatmap(df_master, mode_key, w0, OUTPUT_DIR)
         plot_rtt_hist(all_rtt, mode_key, OUTPUT_DIR)
         plot_pswap_success_rate(pswap_rates, sorted_pswaps, mode_key, OUTPUT_DIR)

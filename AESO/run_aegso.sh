@@ -37,7 +37,7 @@ case "$ROLE" in
     ;;
 esac
 
-PY="${PY:-$SCRIPT_DIR/aegso_3.py}"
+PY="${PY:-$SCRIPT_DIR/aegso.py}"
 PYTHON="${PYTHON:-$(command -v python3 || echo /usr/bin/python3)}"
 
 if [[ ! -f "$PY" ]]; then
@@ -49,9 +49,9 @@ if [[ "$PY" != /* ]]; then
 fi
 
 # ── Execution Configuration ──
-COUNT="${COUNT:-2000}"
+COUNT="${COUNT:-1000000000}"
 ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-0.5}"
-SWAP_WAIT_TIMEOUT="${SWAP_WAIT_TIMEOUT:-3.0}"
+SWAP_WAIT_TIMEOUT="${SWAP_WAIT_TIMEOUT:-0.05}"
 REGISTER_TIMEOUT="${REGISTER_TIMEOUT:-60.0}"
 SOCK_BUF="${SOCK_BUF:-65536}"
 BUSY_POLL_US="${BUSY_POLL_US:-50}"
@@ -66,10 +66,9 @@ CPU_REP="${CPU_REP:-1}"
 CPU_A="${CPU_A:-1}"
 CPU_B="${CPU_B:-1}"
 
-# ── Cycle Wait Configuration ──
-# Full cycle duration: 600 seconds per combo
-CYCLE_WAIT=600
-EXEC_TIMEOUT="600s"
+EXEC_DURATION="${EXEC_DURATION:-60}"
+EXEC_TIMEOUT="${EXEC_DURATION}s"
+COMBO_WAIT="${COMBO_WAIT:-40}"
 
 # Define initial startup delays depending on node role
 if [[ "$ROLE" == "repeater" ]]; then
@@ -82,6 +81,7 @@ elif [[ "$ROLE" == "client" ]]; then
   esac
 fi
 
+# Full pgen x pswap sweep. Both variables remain overridable for later experiments.
 read -r -a PGENS  <<< "${PGENS:-1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1}"
 read -r -a PSWAPS <<< "${PSWAPS:-1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1}"
 
@@ -108,17 +108,36 @@ fi
 
 cd "$SCRIPT_DIR"
 
-# Execute Python script with a safety timeout of 600s
+# Execute each combination for a fixed duration, then wait before advancing.
 run_python() {
-  echo "[run_aegso] CMD: timeout --signal=SIGINT $EXEC_TIMEOUT $*"
-  timeout --signal=SIGINT "$EXEC_TIMEOUT" "$PYTHON" "$PY" "$@" || true
+  echo "[run_aegso] CMD: timeout --signal=SIGINT --kill-after=5s $EXEC_TIMEOUT $PYTHON $PY $*"
+  set +e
+  timeout --signal=SIGINT --kill-after=5s "$EXEC_TIMEOUT" "$PYTHON" "$PY" "$@"
+  status=$?
+  set -e
+  case "$status" in
+    0)
+      return 0
+      ;;
+    124|130|137|143)
+      echo "[run_aegso] Execution limit reached; continuing with the next combination."
+      return 0
+      ;;
+    2)
+      return 2
+      ;;
+    *)
+      echo "[run_aegso] Execution failed with status $status." >&2
+      return "$status"
+      ;;
+  esac
 }
 
 total=$(( ${#PGENS[@]} * ${#PSWAPS[@]} ))
 combo_idx=0
 is_first_run=true
 
-echo "[run_aegso] role=$ROLE node=${NODE_ID:--} cycle_wait=${CYCLE_WAIT}s initial_delay=${START_DELAY}s combos=$total"
+echo "[run_aegso] role=$ROLE node=${NODE_ID:--} exec_timeout=${EXEC_TIMEOUT} combo_wait=${COMBO_WAIT}s initial_delay=${START_DELAY}s combos=$total"
 
 # Loop over all pgen and pswap combinations
 for pgen in "${PGENS[@]}"; do
@@ -138,44 +157,62 @@ for pgen in "${PGENS[@]}"; do
     echo "[run_aegso] ($combo_idx/$total) pgen=$pgen pswap=$pswap -> EXECUTING"
     echo "============================================================"
 
-    # Run client or repeater based on role
-    if [[ "$ROLE" == "client" ]]; then
-      run_python client \
-        --node-id "$NODE_ID" \
-        --repeater-host "$DEST_IP" \
-        --repeater-port "$PORT" \
-        --count "$COUNT" \
-        --pgen "$pgen" \
-        --pswap "$pswap" \
-        --attempt-timeout "$ATTEMPT_TIMEOUT" \
-        --swap-wait-timeout "$SWAP_WAIT_TIMEOUT" \
-        --cpu "$CPU" \
-        --rt-priority "$RT_PRIORITY" \
-        --sock-buf "$SOCK_BUF" \
-        --busy-poll-us "$BUSY_POLL_US"
-    else
-      run_python repeater \
-        --listen-host-a "$LISTEN_HOST" \
-        --listen-port-a "$PORT_A" \
-        --listen-host-b "$LISTEN_HOST" \
-        --listen-port-b "$PORT_B" \
-        --count "$COUNT" \
-        --pgen "$pgen" \
-        --pswap "$pswap" \
-        --werner-a0 "$WERNER_A0" \
-        --werner-b0 "$WERNER_B0" \
-        --werner-threshold "$WERNER_THRESHOLD" \
-        --coherence-ns "$COHERENCE_NS" \
-        --register-timeout "$REGISTER_TIMEOUT" \
-        --cpu "$CPU_REP" \
-        --rt-priority "$RT_PRIORITY" \
-        --sock-buf "$SOCK_BUF" \
-        --busy-poll-us "$BUSY_POLL_US"
-    fi
+    run_current_combo() {
+      if [[ "$ROLE" == "client" ]]; then
+        run_python client \
+          --node-id "$NODE_ID" \
+          --repeater-host "$DEST_IP" \
+          --repeater-port "$PORT" \
+          --count "$COUNT" \
+          --duration-seconds "$EXEC_DURATION" \
+          --pgen "$pgen" \
+          --pswap "$pswap" \
+          --attempt-timeout "$ATTEMPT_TIMEOUT" \
+          --swap-wait-timeout "$SWAP_WAIT_TIMEOUT" \
+          --cpu "$CPU" \
+          --rt-priority "$RT_PRIORITY" \
+          --sock-buf "$SOCK_BUF" \
+          --busy-poll-us "$BUSY_POLL_US"
+      else
+        run_python repeater \
+          --listen-host-a "$LISTEN_HOST" \
+          --listen-port-a "$PORT_A" \
+          --listen-host-b "$LISTEN_HOST" \
+          --listen-port-b "$PORT_B" \
+          --count "$COUNT" \
+          --duration-seconds "$EXEC_DURATION" \
+          --pgen "$pgen" \
+          --pswap "$pswap" \
+          --werner-a0 "$WERNER_A0" \
+          --werner-b0 "$WERNER_B0" \
+          --werner-threshold "$WERNER_THRESHOLD" \
+          --coherence-ns "$COHERENCE_NS" \
+          --register-timeout "$REGISTER_TIMEOUT" \
+          --cpu "$CPU_REP" \
+          --rt-priority "$RT_PRIORITY" \
+          --sock-buf "$SOCK_BUF" \
+          --busy-poll-us "$BUSY_POLL_US"
+      fi
+    }
 
-    # Wait for 600 seconds before running the next combination
-    echo "[run_aegso] Waiting ${CYCLE_WAIT}s to complete the cycle..."
-    sleep "$CYCLE_WAIT"
+    while true; do
+      set +e
+      run_current_combo
+      status=$?
+      set -e
+      if [[ "$status" -eq 2 ]]; then
+        echo "[run_aegso] No READY for pgen=$pgen pswap=$pswap; retrying same combination in 2s."
+        sleep 2
+        continue
+      fi
+      if [[ "$status" -ne 0 ]]; then
+        exit "$status"
+      fi
+      break
+    done
+
+    echo "[run_aegso] Waiting ${COMBO_WAIT}s before the next combination..."
+    sleep "$COMBO_WAIT"
 
   done
 done

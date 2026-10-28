@@ -175,11 +175,6 @@ class _Link:
 
 
 def run_repeater(args):
-    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
-              f"/pgen{str(args.pgen).replace('.', '_')}")
-    out_path = get_unique_filepath(folder, "repeater_swap")
-    out_gen_path = get_unique_filepath(folder, "repeater_gen")
-
     sock_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_a.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     enable_low_latency_socket(sock_a, args.sock_buf, args.busy_poll_us, False)
@@ -192,17 +187,51 @@ def run_repeater(args):
 
     links = {"A": _Link(args.werner_a0), "B": _Link(args.werner_b0)}
     sockets = {"A": sock_a, "B": sock_b}
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _stop)
+
+    def _wait_for_registration(sock):
+        deadline = time.monotonic() + args.register_timeout
+        while running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(0.1, remaining))
+            try:
+                return sock.recvfrom(64)
+            except socket.timeout:
+                continue
+            except (InterruptedError, OSError):
+                if not running:
+                    return None, None
+                raise
+        return None, None
 
     try:
-        sock_a.settimeout(args.register_timeout)
-        sock_b.settimeout(args.register_timeout)
         print(f"[Repeater] Waiting for A on port {args.listen_port_a}...")
-        data, addr = sock_a.recvfrom(64)
+        data, addr = _wait_for_registration(sock_a)
+        if addr is None:
+            if running:
+                print("[Repeater] Timeout awaiting A. Aborting.")
+            print("[Repeater] Interrupted before READY: 0 swaps, "
+                  f"0/{args.count} swaps target, 0 generation attempts.")
+            return 2
         links["A"].addr = addr
         print(f"[Repeater] A registered from {addr}")
 
         print(f"[Repeater] Waiting for B on port {args.listen_port_b}...")
-        data, addr = sock_b.recvfrom(64)
+        data, addr = _wait_for_registration(sock_b)
+        if addr is None:
+            if running:
+                print("[Repeater] Timeout awaiting B. Aborting.")
+            print("[Repeater] Interrupted before READY: 0 swaps, "
+                  f"0/{args.count} swaps target, 0 generation attempts.")
+            return 2
         links["B"].addr = addr
         print(f"[Repeater] B registered from {addr}")
     except socket.timeout:
@@ -215,6 +244,11 @@ def run_repeater(args):
     sock_b.sendto(READY_SIG, links["B"].addr)
     print(f"[Repeater] READY sent. Starting swaps.")
 
+    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
+              f"/pgen{str(args.pgen).replace('.', '_')}")
+    out_path = get_unique_filepath(folder, "repeater_swap")
+    out_gen_path = get_unique_filepath(folder, "repeater_gen")
+
     sock_a.setblocking(False)
     sock_b.setblocking(False)
 
@@ -223,14 +257,6 @@ def run_repeater(args):
     sel.register(sock_b, selectors.EVENT_READ, "B")
 
     apply_cpu_rt(args.cpu, args.rt_priority)
-    running = True
-
-    def _stop(signum, frame):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, _stop)
-
     pgen = args.pgen
     pswap = args.pswap
     threshold = args.werner_threshold
@@ -249,8 +275,17 @@ def run_repeater(args):
 
     round_idx = 0
     total_gen_attempts = 0
+    deadline = (
+        time.monotonic() + args.duration_seconds
+        if args.duration_seconds is not None
+        else None
+    )
     try:
-        while running and round_idx < args.count:
+        while (
+            running
+            and (deadline is None or time.monotonic() < deadline)
+            and round_idx < args.count
+        ):
             for key, _ in sel.select(timeout=0.005):
                 side = key.data
                 sock = sockets[side]
@@ -329,24 +364,29 @@ def run_repeater(args):
     chown_output_path(out_gen_path)
 
     print(f"[Repeater] Saved {len(records)} swaps -> {out_path}")
+    gen_successes = sum(r[4] for r in gen_records)
+    print(f"[Repeater] Swaps: {len(records)}/{args.count} completed. "
+          f"Generation: {gen_successes} successes / {len(gen_records)} attempts.")
     print(f"[Repeater] Saved {len(gen_records)} gen attempts -> {out_gen_path}")
 
 
 # ───────────────────────────── Client (A/B) ─────────────────────────────
 
 def run_client(args):
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _stop)
+
     ptp_offset_ns = read_ptp_offset()
     if ptp_offset_ns:
         print(f"[Client {args.node_id}] PTP Offset: {ptp_offset_ns} ns")
 
-    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
-              f"/pgen{str(args.pgen).replace('.', '_')}")
-    
     prefix = "client_lab" if args.node_id == "A" else "client_teleco"
-    out_path = get_unique_filepath(folder, prefix)
-    
     gen_prefix = f"{prefix}_gen"
-    out_gen_path = get_unique_filepath(folder, gen_prefix)
 
     # ── Socket: kernel timestamping enabled ──
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -359,35 +399,39 @@ def run_client(args):
     client_id = 1 if args.node_id == "A" else 2
 
     # ── Register + wait for READY (unconnected → no ECONNREFUSED) ──
-    sock.settimeout(5.0)
+    sock.settimeout(0.1)
     ready = False
     for _reg in range(200):
+        if not running:
+            break
         sock.sendto(REG_PACK(REG_FORMAT, client_id), server_addr)
         try:
             data, _ = sock.recvfrom(64)
             if len(data) == 1 and data[0] == 0x01:
                 ready = True
                 break
-        except (socket.timeout, OSError):
+        except (socket.timeout, InterruptedError, OSError):
+            if not running:
+                break
             time.sleep(0.05)
 
     if not ready:
-        print(f"[Client {args.node_id}] ERROR: No READY signal. Aborting.")
+        if running:
+            print(f"[Client {args.node_id}] ERROR: No READY signal. Aborting.")
+        print(f"[Client {args.node_id}] Interrupted before READY: 0 swaps, "
+              f"0/{args.count} swaps target, 0 generation attempts.")
         sock.close()
-        return
+        return 2
+
+    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
+              f"/pgen{str(args.pgen).replace('.', '_')}")
+    out_path = get_unique_filepath(folder, prefix)
+    out_gen_path = get_unique_filepath(folder, gen_prefix)
 
     print(f"[Client {args.node_id}] READY. Starting {args.count} swap rounds...")
     sock.settimeout(args.attempt_timeout)
 
     apply_cpu_rt(args.cpu, args.rt_priority)
-    running = True
-
-    def _stop(signum, frame):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, _stop)
-
     gen_buf = bytearray(TS_SIZE)
     rx_buf = bytearray(PAYLOAD_SIZE + 64)
     records = []
@@ -406,6 +450,8 @@ def run_client(args):
     total_gen_attempts = 0
     try:
         while running and round_idx < args.count:
+            # A swap timeout must not leak into the next generation attempt.
+            sock.settimeout(args.attempt_timeout)
             attempts = 0
             gen_rtt_ns = 0
             pgen_ok = False
@@ -422,7 +468,9 @@ def run_client(args):
                 sock.sendto(gen_buf, server_addr)
                 try:
                     n, ancdata, _flags, _addr = recvmsg_into([rx_buf], anc_size)
-                except (socket.timeout, OSError):
+                except (socket.timeout, InterruptedError, OSError):
+                    if not running:
+                        break
                     w_rtt = 1.0
                     gen_records.append((total_gen_attempts, ts_emit, 0, w_rtt, 0))
                     continue
@@ -448,7 +496,7 @@ def run_client(args):
             sock.settimeout(args.swap_wait_timeout)
             try:
                 n, ancdata, _flags, _addr = recvmsg_into([rx_buf], anc_size)
-            except (socket.timeout, OSError):
+            except (socket.timeout, InterruptedError, OSError):
                 continue  # EPR expired → regenerate
 
             if n != PAYLOAD_SIZE:
@@ -476,7 +524,6 @@ def run_client(args):
                 pswap_bit    # pswap_success_bit (0 or 1)
             ))
             round_idx += 1
-            sock.settimeout(args.attempt_timeout)
 
     finally:
         sock.close()
@@ -505,6 +552,9 @@ def run_client(args):
     ok = sum(1 for r in records if r[10])
     print(f"[Client {args.node_id}] {len(records)} rounds "
           f"({ok} pswap successful). CSV -> {out_path}")
+    gen_successes = sum(r[4] for r in gen_records)
+    print(f"[Client {args.node_id}] Swaps: {len(records)}/{args.count} completed. "
+          f"Generation: {gen_successes} successes / {len(gen_records)} attempts.")
     print(f"[Client {args.node_id}] {len(gen_records)} total gen attempts -> {out_gen_path}")
 
 
@@ -521,11 +571,12 @@ def parse_args():
     cli.add_argument("--repeater-host", required=True)
     cli.add_argument("--repeater-port", type=int, required=True)
     cli.add_argument("--count", type=int, default=2000)
+    cli.add_argument("--duration-seconds", type=float, default=None)
     cli.add_argument("--pswap", type=float, default=1.00)
     cli.add_argument("--pgen", type=float, default=1.0,
                      help="For directory naming only; repeater rolls pgen.")
     cli.add_argument("--attempt-timeout", type=float, default=0.5)
-    cli.add_argument("--swap-wait-timeout", type=float, default=3.0)
+    cli.add_argument("--swap-wait-timeout", type=float, default=0.05)
     cli.add_argument("--cpu", type=int, default=None)
     cli.add_argument("--rt-priority", type=int, default=50)
     cli.add_argument("--sock-buf", type=int, default=65536)
@@ -537,6 +588,7 @@ def parse_args():
     rep.add_argument("--listen-host-b", default="0.0.0.0")
     rep.add_argument("--listen-port-b", type=int, default=7402)
     rep.add_argument("--count", type=int, default=2000)
+    rep.add_argument("--duration-seconds", type=float, default=None)
     rep.add_argument("--pgen", type=float, default=1.0)
     rep.add_argument("--pswap", type=float, default=1.00)
     rep.add_argument("--werner-a0", type=float, default=1.0)
@@ -555,10 +607,10 @@ def parse_args():
 def main():
     args = parse_args()
     if args.role == "client":
-        run_client(args)
+        return run_client(args)
     elif args.role == "repeater":
-        run_repeater(args)
+        return run_repeater(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)
