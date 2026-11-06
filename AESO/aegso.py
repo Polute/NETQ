@@ -448,6 +448,9 @@ def run_client(args):
 
     round_idx = 0
     total_gen_attempts = 0
+    swaps_received_out_of_phase = 0
+    swaps_discarded = 0
+    swap_timeouts = 0
     try:
         while running and round_idx < args.count:
             # A swap timeout must not leak into the next generation attempt.
@@ -455,6 +458,7 @@ def run_client(args):
             attempts = 0
             gen_rtt_ns = 0
             pgen_ok = False
+            pending_swap = None
 
             # ── PHASE 1: Generation Loop ──
             t_gen_start_ns = time_ns()
@@ -475,7 +479,13 @@ def run_client(args):
                     gen_records.append((total_gen_attempts, ts_emit, 0, w_rtt, 0))
                     continue
 
+                if n == PAYLOAD_SIZE:
+                    pending_swap = (bytes(rx_buf[:PAYLOAD_SIZE]), ancdata)
+                    swaps_received_out_of_phase += 1
+                    continue
+
                 if n != TS_SIZE:
+                    swaps_discarded += 1
                     continue
                 gen_rtt_ns = perf_ns() - t0
 
@@ -493,20 +503,26 @@ def run_client(args):
                 break
 
             # ── PHASE 2: Wait for Swap ──
-            sock.settimeout(args.swap_wait_timeout)
-            try:
-                n, ancdata, _flags, _addr = recvmsg_into([rx_buf], anc_size)
-            except (socket.timeout, InterruptedError, OSError):
-                continue  # EPR expired → regenerate
+            if pending_swap is None:
+                sock.settimeout(args.swap_wait_timeout)
+                try:
+                    n, ancdata, _flags, _addr = recvmsg_into([rx_buf], anc_size)
+                except (socket.timeout, InterruptedError, OSError):
+                    swap_timeouts += 1
+                    continue  # EPR expired → regenerate
 
-            if n != PAYLOAD_SIZE:
-                continue
+                if n != PAYLOAD_SIZE:
+                    swaps_discarded += 1
+                    continue
+                swap_data = bytes(rx_buf[:PAYLOAD_SIZE])
+            else:
+                swap_data, ancdata = pending_swap
 
             # Kernel timestamp for swap arrival (if available)
             ts_swap_kernel = parse_kernel_timestamp_ns(ancdata)
             ts_recv_ns = ts_swap_kernel if ts_swap_kernel else time_ns()
 
-            ts_swap_ns, werner, pswap_bit = PAYLOAD_UNPACK(rx_buf, 0)
+            ts_swap_ns, werner, pswap_bit = PAYLOAD_UNPACK(swap_data, 0)
             swap_to_recv_ns = max(0, ts_recv_ns - ts_swap_ns)
             t_exp_ns = max(0, ts_swap_ns - ts_gen_success_ns)
 
@@ -556,6 +572,9 @@ def run_client(args):
     print(f"[Client {args.node_id}] Swaps: {len(records)}/{args.count} completed. "
           f"Generation: {gen_successes} successes / {len(gen_records)} attempts.")
     print(f"[Client {args.node_id}] {len(gen_records)} total gen attempts -> {out_gen_path}")
+    print(f"[Client {args.node_id}] Swap diagnostics: "
+          f"{swaps_received_out_of_phase} received during generation, "
+          f"{swaps_discarded} discarded, {swap_timeouts} wait timeouts.")
 
 
 # ─────────────────────────────────── CLI ───────────────────────────────────

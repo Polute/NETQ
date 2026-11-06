@@ -1,0 +1,286 @@
+EXPLICACION DE LOS TIMEOUTS Y DE LA ANOMALIA EN pswap=0.7
+==========================================================
+
+1. INTERPRETACION DE LOS DATOS OBSERVADOS
+------------------------------------------
+
+En las dos ultimas combinaciones del cliente B se obtuvo:
+
+    pgen=0.1, pswap=0.2
+        26 rondas completadas
+        3 swaps exitosos
+        529 generaciones correctas / 5139 intentos
+
+    pgen=0.1, pswap=0.1
+        36 rondas completadas
+        3 swaps exitosos
+        538 generaciones correctas / 5551 intentos
+
+La fraccion de generaciones correctas es aproximadamente la esperada:
+
+    529 / 5139 = 0.103
+    538 / 5551 = 0.097
+
+Esto confirma que pgen esta funcionando alrededor de 0.1.
+
+La fraccion de swaps exitosos observada es:
+
+    pswap=0.2: 3 / 26 = 0.115
+    pswap=0.1: 3 / 36 = 0.083
+
+Estas cifras no permiten concluir que pswap falle. El numero de swaps es
+demasiado pequeño: con solo 26 o 36 muestras, tres exitos pueden aparecer
+por variacion estadistica. Hace falta analizar el fichero del repetidor y
+las dos caras de cada ejecucion, no solo el log del cliente B.
+
+La limitacion principal en esas celdas es pgen=0.1. El cliente necesita,
+en media, unas diez peticiones para conseguir una generacion correcta.
+Ademas, A y B deben conseguirla dentro de una ventana compatible para que
+el repetidor pueda hacer el swap. Por eso hay miles de intentos de
+generacion, pero muy pocas rondas completadas.
+
+
+2. TIMEOUT DE SWAP GRANDE: 3 SEGUNDOS
+--------------------------------------
+
+Despues de recibir un ACK de generacion correcto, el cliente espera el
+resultado del swap. Con:
+
+    swap_wait_timeout = 3.0 s
+
+si el swap no llega, el cliente queda bloqueado durante aproximadamente
+3 segundos antes de volver a la fase de generacion.
+
+La secuencia es:
+
+    1. El cliente recibe un ACK de generacion correcto.
+    2. El repetidor no puede hacer el swap inmediatamente, porque el otro
+       enlace todavia no esta preparado, la EPR del otro enlace expira o
+       el paquete se retrasa.
+    3. El cliente permanece esperando, aunque ya no pueda progresar.
+    4. Tras 3 segundos vence el timeout.
+    5. El cliente descarta la EPR y empieza otra generacion.
+
+Durante esos 3 segundos no se generan nuevas peticiones. El rendimiento
+queda dominado por los stalls, no por el tiempo de red ni por el RTT
+normal. Esto explica los huecos de aproximadamente 3 segundos observados
+en los datos antiguos y puede producir anomalias en rates, plots y
+comparaciones entre valores de pgen o pswap.
+
+
+3. TIMEOUT DE SWAP PEQUENO: 50 MILISEGUNDOS
+--------------------------------------------
+
+Con:
+
+    swap_wait_timeout = 0.05 s
+
+el cliente abandona rapidamente una EPR que no ha sido emparejada. La
+ventaja es que desaparecen los stalls largos y el sistema puede intentar
+otra generacion en 50 ms.
+
+Sin embargo, el margen es mucho menor. Un retraso puntual de scheduling,
+kernel, cola UDP o procesamiento del repetidor puede superar 50 ms. En
+ese caso, el cliente puede abandonar su EPR justo antes de que llegue el
+swap. Si el paquete queda en el socket, puede ser leido durante la
+siguiente fase de generacion.
+
+Con la implementacion antigua, ese paquete tenia un tamano distinto al
+ACK de generacion y se descartaba. El cliente y el repetidor podian
+avanzar entonces en fases distintas. El efecto se ve como:
+
+    - menos rondas completadas;
+    - mas generaciones por swap;
+    - tasas no monotonicamente ordenadas;
+    - anomalias especialmente visibles en pswap=0.7;
+    - posible dependencia del resultado respecto al scheduling y al azar.
+
+El problema no es que pswap=0.7 tenga una probabilidad fisica incorrecta.
+pswap solo decide si tiene exito un intento de swap que ya ha sido
+posible. La perdida de rendimiento aparece antes: algunos intentos o
+resultados de swap no se contabilizan correctamente por la desincronizacion
+entre las fases de los clientes.
+
+
+4. COMPORTAMIENTO ACTUAL: GUARDAR UN SWAP PENDIENTE
+---------------------------------------------------
+
+La version actual conserva el protocolo original y el timeout de 50 ms,
+pero corrige el caso de un swap recibido durante la espera del ACK de
+generacion.
+
+La secuencia actual es:
+
+    1. El cliente envia una peticion de generacion.
+    2. Si recibe un ACK, calcula su RTT de generacion como antes.
+    3. Si recibe un paquete de swap mientras espera ese ACK, no lo
+       descarta. Guarda el contenido y los datos auxiliares en pending_swap.
+    4. Cuando llega el ACK de generacion correcto, procesa el paquete
+       pendiente inmediatamente.
+    5. Si no habia paquete pendiente, espera hasta 50 ms por el swap.
+
+El timestamp del swap se conserva desde el momento de recepcion:
+
+    pending_swap = (bytes_del_paquete, ancdata)
+
+Por tanto, al procesarlo no se inventa una nueva hora de llegada. Se
+reutiliza el timestamp del kernel asociado a la recepcion original.
+Las metricas mantienen su significado:
+
+    gen_rtt_ns       RTT completo de GEN y ACK.
+    ts_swap_ns       instante de emision del swap en el repetidor.
+    swap_to_recv_ns  instante de recepcion del swap menos ts_swap_ns.
+    t_exp_ns         emision del swap menos recepcion del ACK de generacion.
+
+Ademas, el cliente imprime diagnosticos de:
+
+    - swaps recibidos durante la fase de generacion;
+    - paquetes descartados;
+    - timeouts esperando el swap.
+
+Esos contadores permiten comprobar si pswap=0.7 estaba afectado por
+paquetes fuera de fase o por timeouts reales.
+
+
+5. LIMITACION QUE TODAVIA DEBE TENERSE EN CUENTA
+------------------------------------------------
+
+Esta version conserva el formato original y no incluye un identificador
+de ronda. Por ello puede guardar un swap que pertenece a una ronda
+anterior si llega retrasado. En condiciones normales, con retrasos de
+solo unos microsegundos, el comportamiento es correcto y evita perder
+el swap. Para una identificacion perfecta de rondas seria necesario
+introducir un identificador en los mensajes, pero eso debe hacerse en
+otra fase y validando primero todos los tiempos.
+
+
+6. COMO VALIDAR pswap=0.7
+--------------------------
+
+Para comprobar la causa de la anomalia hay que repetir las celdas con:
+
+    - una sola ejecucion, sin dos barridos simultaneos;
+    - la misma version de aegso.py en A, B y el repetidor;
+    - los tres logs completos;
+    - los CSV de ambos clientes y del repetidor;
+    - los diagnosticos de swaps fuera de fase y timeouts;
+    - varias repeticiones por celda, no una sola muestra.
+
+La comprobacion principal debe ser:
+
+    swaps_exitosos / intentos_de_swap ~= pswap
+
+Si esta proporcion es correcta pero el numero total de rondas es bajo,
+el problema esta en la sincronizacion o en los timeouts, no en la
+probabilidad pswap.
+
+
+7. SOBRE pswap=0.7 FRENTE A pswap=0.6 CON TIMEOUT DE 3 s
+----------------------------------------------------------
+
+El timeout de 3 segundos puede hacer que una ejecucion produzca menos
+rondas completadas y, por tanto, menos EPR observadas en los CSV. Sin
+embargo, no debe afirmarse que pswap=0.7 provoque directamente mas esperas
+que pswap=0.6.
+
+En este protocolo, cuando A y B estan preparados, el repetidor:
+
+    1. decide el resultado aleatorio usando pswap;
+    2. envia un paquete de resultado a ambos clientes tanto si el bit es
+       1 como si es 0;
+    3. libera ambos enlaces para la siguiente ronda.
+
+Por eso, un fallo de pswap no deberia producir un timeout de 3 segundos.
+El cliente termina la ronda al recibir el resultado, independientemente
+de que pswap haya tenido exito. El timeout largo aparece cuando el swap
+no llega porque los enlaces no estaban preparados simultaneamente, una
+EPR expiro, hubo desincronizacion de fases o se perdio/retraso el paquete.
+
+La explicacion correcta de una celda pswap=0.7 con menos EPR que pswap=0.6
+es, por tanto:
+
+    - el timeout de 3 s amplifica cualquier bloqueo de sincronizacion;
+    - el numero de rondas depende de cuantos bloqueos ocurren durante los
+      60 s;
+    - esas esperas dependen de la secuencia temporal de A y B, del
+      scheduling, de la red y del azar de pgen;
+    - dos ejecuciones con el mismo pgen pueden tener distinto numero de
+      stalls;
+    - con pocas rondas, la diferencia puede aparecer de forma
+      no-monotona: 0.7 menos que 0.6.
+
+En resumen, el timeout de 3 s explica como una mala sincronizacion se
+convierte en una gran perdida de rendimiento, pero pswap=0.7 no deberia
+ser la causa directa de esa mala sincronizacion. Para demostrar que la
+causa es un artefacto de sincronizacion hay que comparar, para ambas
+celdas, el numero de intentos de swap del repetidor, los resultados
+exitosos y fallidos, los intervalos entre swaps y el numero de stalls.
+
+
+8. COMO DOS pgen INDEPENDIENTES SE AFECTAN ENTRE SI
+----------------------------------------------------
+
+La probabilidad de exito de cada intento de generacion es independiente:
+
+    P(gen_A correcto) = pgen
+    P(gen_B correcto) = pgen
+
+Pero el rendimiento de las dos lineas no es independiente, porque el
+protocolo tiene una barrera entre generacion y swap. Cada cliente ejecuta
+estas fases:
+
+    Fase 1:
+        envia peticiones de generacion hasta recibir un ACK correcto;
+
+    Fase 2:
+        deja de enviar peticiones y espera el resultado del swap.
+
+Por tanto, cuando A consigue generar correctamente:
+
+    1. A deja de generar inmediatamente.
+    2. A conserva su EPR preparada en el repetidor.
+    3. A no vuelve a intentar otra generacion hasta recibir el resultado
+       del swap o hasta que expire su timeout.
+    4. Mientras tanto, B debe conseguir una generacion correcta.
+    5. El repetidor solo puede hacer el swap cuando A y B estan preparados
+       al mismo tiempo y sus EPR siguen siendo validas.
+
+Esto convierte las dos probabilidades independientes en un sistema
+acoplado temporalmente. El resultado de A no cambia la probabilidad
+instantanea de B, pero si cambia el estado en el que B esta intentando
+generar: A queda esperando y la siguiente ronda no puede comenzar hasta
+que B tenga exito y se produzca el swap.
+
+Ejemplo con pgen=0.6:
+
+    - A puede tener exito en el primer intento y quedar bloqueado esperando.
+    - B puede fallar varias veces antes de tener exito.
+    - Durante esos fallos A no genera nuevas EPR; sigue ocupada en la ronda.
+    - Cuando B finalmente tiene exito, ambas EPR pueden estar listas y se
+      hace el swap, o una de ellas puede haber quedado fuera de la ventana
+      de coherencia.
+    - Si la EPR expira o el swap no se recibe, A espera hasta 3 s antes de
+      regenerar.
+
+Con pgen=0.7 ocurre el mismo mecanismo, pero cambia la distribucion
+temporal de los exitos. Una ejecucion concreta puede producir mas casos
+en los que un cliente queda preparado mucho antes que el otro. Esos casos
+generan esperas, expiraciones y regeneraciones, y pueden reducir el numero
+de swaps observados durante los 60 s. En otra ejecucion, la coincidencia
+temporal puede ser mejor y el resultado se invierte.
+
+La relacion correcta no es:
+
+    pgen_A y pgen_B dejan de ser probabilisticamente independientes
+
+sino:
+
+    pgen_A y pgen_B siguen siendo independientes como eventos de
+    generacion, pero sus tasas de rondas quedan acopladas por la barrera
+    de espera del swap.
+
+Esta barrera explica como puede aparecer una celda pgen=0.7 con menos
+EPR/rondas que pgen=0.6 en una muestra concreta. El contador de
+generaciones exitosas puede seguir siendo monotono con pgen, mientras que
+el numero de swaps depende adicionalmente de cuanto tiempo pasa cada
+cliente esperando al otro y de cuantos timeouts de 3 s se producen.
