@@ -147,8 +147,6 @@ def generate_summary_table(pswap_data_dict, sorted_pswaps, mode_key, mode_label,
         tr_ns = df_swap['swap_to_recv_ns'].values
         w_vals = compute_w_experimental(tr_ns, t_coh_ref_ns, w0=w0_val)
         en_vals = compute_log_negativity(w_vals)
-        en_vals[en_vals < 0.3] = 0.0  # Truncamiento a 0 si es menor a 0.3 e-bits
-        
         EN_mean = float(np.mean(en_vals))
         Rate_indiv_mean = float(np.mean(en_vals / df_swap['t_swap_s'].values))
         

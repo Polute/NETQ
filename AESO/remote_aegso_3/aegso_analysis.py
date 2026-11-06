@@ -723,37 +723,55 @@ def plot_en_distribution_by_pgen(
             out=np.zeros_like(en_exp, dtype=float),
             where=rtt_s > 0,
         )
-        finite_rates = rate_indiv[np.isfinite(rate_indiv)]
-        if finite_rates.size == 0:
-            continue
-
-        rate_distributions.append((pgen_val, rate_indiv))
+        finite_rates = rate_indiv[np.isfinite(rate_indiv) & (rate_indiv > 0)]
+        zero_count = int(np.count_nonzero(np.isfinite(rate_indiv) & (rate_indiv == 0)))
+        rate_distributions.append((pgen_val, finite_rates, zero_count))
 
     if not rate_distributions:
         plt.close(fig)
         return
-    finite_rates = np.concatenate([rates for _, rates in rate_distributions])
+    positive_distributions = [
+        rates for _, rates, _ in rate_distributions if rates.size > 0
+    ]
+    if not positive_distributions:
+        plt.close(fig)
+        return
+    finite_rates = np.concatenate(positive_distributions)
     max_rate = max(float(finite_rates.max()), 1.0)
     bins = np.linspace(0.0, max_rate, 31)
-    for idx, (pgen_val, rate_indiv) in enumerate(rate_distributions):
+    zero_summary = []
+    for idx, (pgen_val, rate_indiv, zero_count) in enumerate(rate_distributions):
         color = cmap(idx / max(len(rate_distributions) - 1, 1))
+        if rate_indiv.size == 0:
+            zero_summary.append(rf"$p_{{gen}}={pgen_val:.1f}$: {zero_count}")
+            continue
         ax.hist(
             rate_indiv, bins=bins, alpha=0.4, color=color,
             label=f"$p_{{gen}} = {pgen_val:.1f}$", edgecolor="none"
         )
+        zero_summary.append(rf"$p_{{gen}}={pgen_val:.1f}$: {zero_count}")
 
     ax.set_xlabel(
         r"Individual rate $R_i = E_N(i) / t_{\mathrm{rtt}}(i)$ [e-bits/s]"
     )
     ax.set_ylabel(r"Number of Generation Attempts")
     ax.set_title(
-        f"Distribution of Individual EPR Rates $E_N/t_{{\\mathrm{{exp}}}}$\n"
+        f"Distribution of Individual EPR Rates $E_N/t_{{\\mathrm{{rtt}}}}$\n"
         f"(Repeater link availability; $T_{{\\mathrm{{coh}}}} = 1$ ms, "
         f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
         fontsize=12,
         fontweight="bold"
     )
     ax.grid(True, linestyle="--", alpha=0.3)
+    ax.text(
+        0.02, 0.98,
+        "Zero-rate attempts ($E_N/t_{rtt}=0$):\n" + "\n".join(zero_summary),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+    )
     ax.legend(title="$p_{gen}$", fontsize=9, loc="upper right")
     ax.set_xlim(0.0, max_rate)
     ax.set_ylim(bottom=0)
@@ -787,6 +805,7 @@ def plot_en_distribution_individual_by_pgen(
         return
 
     colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(TCOH_VALUES_NS)))
+    plotted_tcoh_labels = {"Inf", "1 min", "1 s", "500 ms", "1 ms", "500 µs", "250 µs"}
 
     for pgen_val in sorted(df_p["pgen"].unique()):
         df_cell = df_p[df_p["pgen"] == pgen_val]
@@ -816,15 +835,34 @@ def plot_en_distribution_individual_by_pgen(
                 out=np.zeros_like(en_exp, dtype=float),
                 where=rtt_s > 0,
             )
-            rate_distributions.append((rate_indiv, color, tcoh_label))
+            finite_rates = rate_indiv[
+                np.isfinite(rate_indiv) & (rate_indiv > 0)
+            ]
+            zero_count = int(
+                np.count_nonzero(np.isfinite(rate_indiv) & (rate_indiv == 0))
+            )
+            if tcoh_label not in plotted_tcoh_labels:
+                rate_distributions.append(
+                    (np.array([]), color, tcoh_label, zero_count)
+                )
+                continue
+            rate_distributions.append(
+                (finite_rates, color, tcoh_label, zero_count)
+            )
 
         if not rate_distributions:
             plt.close(fig)
             continue
-        finite_rates = np.concatenate([rates for rates, _, _ in rate_distributions])
+        finite_rates = np.concatenate(
+            [rates for rates, _, _, _ in rate_distributions if rates.size > 0]
+        )
         max_rate = max(float(finite_rates.max()), 1.0)
         bins = np.linspace(0.0, max_rate, 31)
-        for rate_indiv, color, tcoh_label in rate_distributions:
+        zero_summary = []
+        for rate_indiv, color, tcoh_label, zero_count in rate_distributions:
+            if rate_indiv.size == 0:
+                zero_summary.append(rf"$T_{{coh}}={tcoh_label}$: {zero_count}")
+                continue
             ax.hist(
                 rate_indiv,
                 bins=bins,
@@ -833,21 +871,32 @@ def plot_en_distribution_individual_by_pgen(
                 label=rf"$T_{{coh}} = {tcoh_label}$",
                 edgecolor="none",
             )
+            zero_summary.append(rf"$T_{{coh}}={tcoh_label}$: {zero_count}")
 
         ax.set_ylim(bottom=0)
         ax.set_xlim(0.0, max_rate)
         ax.set_xlabel(
             r"Individual rate $R_i = E_N(i) / t_{\mathrm{rtt}}(i)$ [e-bits/s]"
         )
-        ax.set_ylabel("Number of Generation Attempts (Successes and Failures)")
+        ax.set_ylabel("Number of Positive-rate Generation Attempts")
         ax.set_title(
-            f"Individual EPR Rate Distribution $E_N/t_{{\\mathrm{{exp}}}}$\n"
+            f"Individual EPR Rate Distribution $E_N/t_{{\\mathrm{{rtt}}}}$\n"
             f"($p_{{gen}} = {pgen_val:.1f}$, "
             f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
             fontsize=12,
             fontweight="bold",
         )
         ax.grid(True, linestyle="--", alpha=0.3)
+        ax.text(
+            0.02, 0.98,
+            "Zero-rate attempts ($E_N/t_{rtt}=0$):\n"
+            + "\n".join(zero_summary),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+        )
         ax.legend(title="$T_{coh}$", fontsize=9, loc="upper right")
         plt.tight_layout()
         path = os.path.join(
@@ -856,6 +905,116 @@ def plot_en_distribution_individual_by_pgen(
         plt.savefig(path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"  [+] Individual 4d plot saved to: {path}")
+
+
+def plot_en_rate_tgen_individual_by_pgen(
+    df_master: pd.DataFrame,
+    label: str,
+    target_pswap: float = 1.0,
+):
+    """Generate 4e distributions using the effective generation time t_gen."""
+    outdir = os.path.join(OUTPUT_DIR, "4e_en_tgen_distributions")
+    os.makedirs(outdir, exist_ok=True)
+
+    required = {
+        "pgen", "pswap", "pgen_success_bit", "t_exp_ns", "t_gen_total_ns"
+    }
+    if df_master.empty or not required.issubset(df_master.columns):
+        return
+
+    available_pswaps = df_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_master[
+        (df_master["pswap"] == best_pswap)
+        & (df_master["pgen_success_bit"] == 1)
+    ].copy()
+    if df_p.empty:
+        return
+
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(TCOH_VALUES_NS)))
+    plotted_tcoh_labels = {
+        "Inf", "1 min", "1 s", "500 ms", "1 ms", "500 µs", "250 µs"
+    }
+
+    for pgen_val in sorted(df_p["pgen"].unique()):
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        t_exp_ns = df_cell["t_exp_ns"].to_numpy(dtype=float)
+        t_gen_s = df_cell["t_gen_total_ns"].to_numpy(dtype=float) / 1e9
+        valid = np.isfinite(t_exp_ns) & np.isfinite(t_gen_s) & (t_gen_s > 0)
+        t_exp_ns = t_exp_ns[valid]
+        t_gen_s = t_gen_s[valid]
+        if t_gen_s.size == 0:
+            continue
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        rate_distributions = []
+        for color, t_coh, tcoh_label in zip(
+            colors, TCOH_VALUES_NS, TCOH_LABELS
+        ):
+            w_exp = compute_w_experimental(t_exp_ns, t_coh, w0=1.0)
+            en_exp = compute_en(w_exp)
+            rate = np.divide(
+                en_exp, t_gen_s,
+                out=np.zeros_like(en_exp, dtype=float),
+                where=t_gen_s > 0,
+            )
+            finite_positive = rate[np.isfinite(rate) & (rate > 0)]
+            zero_count = int(np.count_nonzero(np.isfinite(rate) & (rate == 0)))
+            if tcoh_label not in plotted_tcoh_labels:
+                finite_positive = np.array([])
+            rate_distributions.append(
+                (finite_positive, color, tcoh_label, zero_count)
+            )
+
+        positive = [rates for rates, _, _, _ in rate_distributions if rates.size]
+        if not positive:
+            plt.close(fig)
+            continue
+        max_rate = max(float(np.concatenate(positive).max()), 1.0)
+        bins = np.linspace(0.0, max_rate, 31)
+        zero_summary = []
+        for rates, color, tcoh_label, zero_count in rate_distributions:
+            zero_summary.append(rf"$T_{{coh}}={tcoh_label}$: {zero_count}")
+            if rates.size:
+                ax.hist(
+                    rates, bins=bins, alpha=0.35, color=color,
+                    label=rf"$T_{{coh}} = {tcoh_label}$", edgecolor="none"
+                )
+
+        ax.set_xlim(0.0, max_rate)
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel(
+            r"Effective rate $R_i = E_N(i) / t_{\mathrm{gen}}(i)$ [e-bits/s]"
+        )
+        ax.set_ylabel("Number of Successful Generation Rounds")
+        ax.set_title(
+            f"Effective EPR Rate Distribution $E_N/t_{{\\mathrm{{gen}}}}$\n"
+            f"($p_{{gen}} = {pgen_val:.1f}$, "
+            f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
+            fontsize=12,
+            fontweight="bold",
+        )
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.text(
+            0.02, 0.98,
+            "Zero-rate rounds ($E_N/t_{gen}=0$):\n"
+            + "\n".join(zero_summary),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+        )
+        ax.legend(title="$T_{coh}$", fontsize=9, loc="upper right")
+        plt.tight_layout()
+        path = os.path.join(
+            outdir, f"4e_en_tgen_pgen_{pgen_val:.1f}_{label}.png"
+        )
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [+] Individual 4e plot saved to: {path}")
 
 
 def plot_en_mean_heatmap_pswap(
@@ -1366,7 +1525,6 @@ def print_summary_pgen_at_pswap1(df_master: pd.DataFrame,
             rtt_sec = np.where(rtt > 0, rtt / 1e9, 1e-9)
             en_g = compute_en(w)
             en_g[w <= (1.0 / 3.0)] = 0.0
-            en_g[en_g < 0.3] = 0.0
             indiv_sum = np.sum(en_g / rtt_sec)
             r_per_att = indiv_sum / n_att
             r_unit = indiv_sum / n_ok_gen if n_ok_gen else np.nan
@@ -1583,6 +1741,9 @@ def main():
         plot_en_distribution_by_pgen(df_gen_master, mode_key, target_pswap=1.0)
         plot_en_distribution_individual_by_pgen(
             df_gen_master, mode_key, target_pswap=1.0
+        )
+        plot_en_rate_tgen_individual_by_pgen(
+            df_master, mode_key, target_pswap=1.0
         )
         plot_rate_pgen_pswap_heatmap(df_master, mode_key, w0, OUTPUT_DIR)
         plot_rtt_hist(all_rtt, mode_key, OUTPUT_DIR)

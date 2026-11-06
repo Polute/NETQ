@@ -133,8 +133,6 @@ def generate_summary_table(pgen_data_dict, sorted_pgens, mode_key, mode_label, t
         tr_ns = df_gen['e2r_ns'].values if mode_key == 'one_way' else df_gen['rtt_ns'].values
         w_vals = compute_w_experimental(tr_ns, t_coh_ref_ns, w0=w0_val)
         en_vals = compute_log_negativity(w_vals)
-        en_vals[en_vals < 0.3] = 0.0
-        
         EN_mean = float(np.mean(en_vals))
         Rate_indiv_mean = float(np.mean(en_vals / df_gen['t_gen_s'].values))
         
@@ -411,10 +409,7 @@ def main():
                 # Plot 4: E_N promedio por cada éxito
                 en_success_means_matrix[row_idx, col_idx] = np.mean(en_vals_raw)
 
-                # Rate matrix (con truncamiento)
-                en_vals = en_vals_raw.copy()
-                en_vals[en_vals < 0.3] = 0.0 
-                rate_matrix[row_idx, col_idx] = np.mean(en_vals / t_gen_s)
+                rate_matrix[row_idx, col_idx] = np.mean(en_vals_raw / t_gen_s)
 
         pgens_str = [f"{p:.1f}" for p in sorted_pgens]
         df_raw_pivot = pd.DataFrame(raw_en_means_matrix, index=TCOH_LABELS, columns=pgens_str)
