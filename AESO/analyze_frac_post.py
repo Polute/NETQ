@@ -21,11 +21,9 @@ to 1 - frac(warm_successes), for successful attempts only.
 
 import argparse
 import csv
-import glob
 import json
 import os
 import re
-import statistics
 import sys
 
 
@@ -93,22 +91,11 @@ def infer_filename_csvs(root):
         for filename in filenames:
             if not filename.lower().endswith(".csv"):
                 continue
-            if "_gen" not in filename.lower():
+            filename_lower = filename.lower()
+            if "_gen" not in filename_lower or filename_lower.startswith("repeater_"):
                 continue
             matches.append(os.path.join(directory, filename))
     return sorted(matches)
-
-
-def mean(values):
-    return statistics.fmean(values) if values else None
-
-
-def median(values):
-    return statistics.median(values) if values else None
-
-
-def pstdev(values):
-    return statistics.pstdev(values) if len(values) > 1 else 0.0
 
 
 def analyze_csv(path, stall_threshold_ms, forced_pswap, forced_pgen):
@@ -157,7 +144,9 @@ def analyze_csv(path, stall_threshold_ms, forced_pswap, forced_pgen):
     m_prime = (1.0 - frac_post) * n_attempts
 
     max_gap_ms = max(successful_gaps) if successful_gaps else 0.0
-    mean_success_gap_ms = mean(successful_gaps)
+    mean_success_gap_ms = (
+        sum(successful_gaps) / len(successful_gaps) if successful_gaps else None
+    )
 
     pswap = forced_pswap if forced_pswap is not None else infer_parameter(path, "pswap")
     pgen = forced_pgen if forced_pgen is not None else infer_parameter(path, "pgen")
@@ -179,108 +168,54 @@ def analyze_csv(path, stall_threshold_ms, forced_pswap, forced_pgen):
     }
 
 
-def format_optional(value):
-    if value is None:
-        return ""
-    return "%.3f" % value
-
-
-def write_individual_csv(output_path, records):
-    fieldnames = [
-        "file", "node", "pswap", "pgen", "M_attempts", "n_successes",
-        "warm_successes", "post_stall_successes", "frac_post", "M_prime",
-        "mean_success_gap_ms", "max_success_gap_ms", "stall_threshold_ms",
+def print_console_table(records, root):
+    """Print one formatted row per CSV, keeping frac_post as a table column."""
+    headers = [
+        "pgen", "pswap", "node", "CSV", "M_att", "n_ok", "frac_ok",
+        "frac_post", "M'",
     ]
-    with open(output_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for record in records:
-            row = dict(record)
-            for field in ("pswap", "pgen", "frac_post", "M_prime",
-                          "mean_success_gap_ms", "max_success_gap_ms",
-                          "stall_threshold_ms"):
-                row[field] = format_optional(row[field])
-            writer.writerow(row)
-
-
-def write_group_csv(output_path, records):
-    groups = {}
+    rows = []
     for record in records:
-        key = (record["pswap"], record["pgen"], record["node"])
-        groups.setdefault(key, []).append(record)
+        try:
+            relative_path = os.path.relpath(record["file"], root)
+        except ValueError:
+            relative_path = record["file"]
+        rows.append([
+            "n/a" if record["pgen"] is None else "%.2f" % record["pgen"],
+            "n/a" if record["pswap"] is None else "%.2f" % record["pswap"],
+            record["node"],
+            relative_path,
+            str(record["M_attempts"]),
+            str(record["n_successes"]),
+            "%.3f" % (
+                record["n_successes"] / record["M_attempts"]
+                if record["M_attempts"] else 0.0
+            ),
+            "%.3f" % record["frac_post"],
+            "%.1f" % record["M_prime"],
+        ])
 
-    fieldnames = [
-        "pswap", "pgen", "node", "n_csv",
-        "M_attempts_total", "n_successes_total",
-        "frac_post_mean", "frac_post_median", "frac_post_std",
-        "frac_post_min", "frac_post_max", "frac_post_range",
-        "M_prime_mean", "M_prime_median", "post_successes_total",
-        "warm_successes_total",
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
     ]
+    border = "-" * (sum(widths) + 3 * len(widths) + 1)
 
-    with open(output_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for key in sorted(groups, key=lambda item:
-                          ((item[0] is None, item[0] if item[0] is not None else 0),
-                           (item[1] is None, item[1] if item[1] is not None else 0),
-                           item[2])):
-            pswap, pgen, node = key
-            group = groups[key]
-            values = [record["frac_post"] for record in group]
-            m_prime_values = [record["M_prime"] for record in group]
-            row = {
-                "pswap": "" if pswap is None else "%.3f" % pswap,
-                "pgen": "" if pgen is None else "%.3f" % pgen,
-                "node": node,
-                "n_csv": len(group),
-                "M_attempts_total": sum(record["M_attempts"] for record in group),
-                "n_successes_total": sum(record["n_successes"] for record in group),
-                "frac_post_mean": "%.6f" % mean(values),
-                "frac_post_median": "%.6f" % median(values),
-                "frac_post_std": "%.6f" % pstdev(values),
-                "frac_post_min": "%.6f" % min(values),
-                "frac_post_max": "%.6f" % max(values),
-                "frac_post_range": "%.6f" % (max(values) - min(values)),
-                "M_prime_mean": "%.3f" % mean(m_prime_values),
-                "M_prime_median": "%.3f" % median(m_prime_values),
-                "post_successes_total": sum(record["post_stall_successes"] for record in group),
-                "warm_successes_total": sum(record["warm_successes"] for record in group),
-            }
-            writer.writerow(row)
+    def format_row(values):
+        return "| " + " | ".join(
+            value.ljust(widths[index]) for index, value in enumerate(values)
+        ) + " |"
 
-
-def write_console_summary(records):
-    print("\nPost-stall fraction analysis")
-    print("===========================")
-    print("M = generation attempts")
-    print("frac_post = successful attempts with gap >= threshold / successful attempts")
-    print("M_prime = (1 - frac_post) * M")
-    print("")
-
-    groups = {}
-    for record in records:
-        key = (record["pswap"], record["pgen"], record["node"])
-        groups.setdefault(key, []).append(record)
-
-    for key in sorted(groups, key=lambda item:
-                      ((item[0] is None, item[0] if item[0] is not None else 0),
-                       (item[1] is None, item[1] if item[1] is not None else 0),
-                       item[2])):
-        pswap, pgen, node = key
-        group = groups[key]
-        values = [record["frac_post"] for record in group]
-        print("pswap=%s pgen=%s node=%s n_csv=%d M=%d frac_post mean=%.6f median=%.6f std=%.6f range=[%.6f, %.6f]" %
-              ("" if pswap is None else "%.3f" % pswap,
-               "" if pgen is None else "%.3f" % pgen,
-               node,
-               len(group),
-               sum(record["M_attempts"] for record in group),
-               mean(values),
-               median(values),
-               pstdev(values),
-               min(values),
-               max(values)))
+    print("\nPost-stall fraction by generation CSV")
+    print("frac_post = post-stall successes / successful generations")
+    print("M' = (1 - frac_post) * M_att; stall threshold = %.1f ms\n" %
+          (records[0]["stall_threshold_ms"] if records else 0.0))
+    print(border)
+    print(format_row(headers))
+    print(border)
+    for row in rows:
+        print(format_row(row))
+    print(border)
 
 
 def build_parser():
@@ -292,11 +227,6 @@ def build_parser():
         nargs="?",
         default=".",
         help="CSV file or directory tree to scan (default: current directory)",
-    )
-    parser.add_argument(
-        "-o", "--output-dir",
-        default="frac_post_analysis",
-        help="Directory for generated CSV reports",
     )
     parser.add_argument(
         "--stall-threshold-ms",
@@ -344,18 +274,17 @@ def main():
         except (OSError, ValueError) as error:
             failures.append((csv_path, str(error)))
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    individual_path = os.path.join(args.output_dir, "frac_post_individual.csv")
-    grouped_path = os.path.join(args.output_dir, "frac_post_by_pswap_pgen.csv")
-
-    write_individual_csv(individual_path, records)
-    write_group_csv(grouped_path, records)
-    write_console_summary(records)
-
-    print("\nIndividual report: %s" % individual_path)
-    print("Grouped report:    %s" % grouped_path)
-    print("Files analysed:    %d" % len(records))
-    print("Files failed:      %d" % len(failures))
+    records.sort(key=lambda record: (
+        record["pswap"] is None,
+        record["pswap"] if record["pswap"] is not None else 0.0,
+        record["pgen"] is None,
+        record["pgen"] if record["pgen"] is not None else 0.0,
+        record["node"],
+        record["file"],
+    ))
+    print_console_table(records, os.path.abspath(args.root))
+    print("\nCSV files analysed: %d" % len(records))
+    print("CSV files skipped:  %d" % len(failures))
 
     for csv_path, error in failures:
         print("  FAIL %s: %s" % (csv_path, error), file=sys.stderr)

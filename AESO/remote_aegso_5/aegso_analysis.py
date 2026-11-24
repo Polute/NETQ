@@ -325,7 +325,6 @@ def plot_pswap_vs_rate_10_lines(
 
     en_exp = compute_en(df_calc["w_exp"].values)
     en_exp[df_calc["w_exp"].values <= (1.0 / 3.0)] = 0.0
-    en_exp[en_exp < 0.3] = 0.0
     df_calc["en"] = en_exp
     valid_t = np.isfinite(df_calc["t_gen_s"]) & (df_calc["t_gen_s"] > 0)
     df_calc["rate_indiv"] = 0.0
@@ -465,7 +464,8 @@ def plot_rate_heatmap_pswap(
     path = os.path.join(outdir, f"04_rate_heatmap_rtt_pswap{target_pswap:.1f}_{label}.png")
     _style()
 
-    if df_gen_master.empty or "pgen" not in df_gen_master.columns or "pswap" not in df_gen_master.columns:
+    required = {"pgen", "pswap", "ts_rtt", "bit_success_gen"}
+    if df_gen_master.empty or not required.issubset(df_gen_master.columns):
         return
 
     available_pswaps = df_gen_master["pswap"].unique()
@@ -518,7 +518,6 @@ def plot_rate_heatmap_pswap(
             
             # Aplicar filtro de umbral para Werner state parameter W <= 1/3
             en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-            en_exp[en_exp < 0.3] = 0.0
 
             indiv_rate = np.sum(en_exp / rtt_sec) / n_attempts
             rate_matrix[i, j] = indiv_rate
@@ -618,7 +617,6 @@ def plot_rate_vs_pgen_by_tau(
 
             en_exp = compute_en(w_exp)
             en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-            en_exp[en_exp < 0.3] = 0.0
 
             # Individual rates per attempt
             indiv_rates = en_exp / rtt_sec
@@ -698,47 +696,84 @@ def plot_en_distribution_by_pgen(
     fig, ax = plt.subplots(figsize=(10, 6))
 
     cmap = plt.cm.viridis
+    rate_distributions = []
     for idx, pgen_val in enumerate(pgens):
         df_cell = df_p[df_p["pgen"] == pgen_val]
         if df_cell.empty:
             continue
 
-        rtt_vals = df_cell["ts_rtt"].values  # in ns
+        rtt_vals = df_cell["ts_rtt"].to_numpy(dtype=float)
+        rtt_s = rtt_vals / 1.0e9
         if "w_rtt" in df_cell.columns:
-            w0_vals = df_cell["w_rtt"].values.astype(float)
+            w0_vals = df_cell["w_rtt"].to_numpy(dtype=float)
         else:
             w0_vals = np.ones_like(rtt_vals)
+        w0_vals = np.where(
+            df_cell["bit_success_gen"].to_numpy() == 1, w0_vals, 0.0
+        )
 
-        # Convention: failed attempt -> W = 0, E_N = 0
-        w0_vals = np.where(df_cell["bit_success_gen"].values == 1, w0_vals, 0.0)
-
-        # Default T_coh = 1 ms for global view
+        # Same E_N calculation as plot 4; retain every attempt separately.
         w_exp = w0_vals * np.exp(-rtt_vals / 1.0e6)
         en_exp = compute_en(w_exp)
         en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-        en_exp[en_exp < 0.3] = 0.0
 
-        color = cmap(idx / max(len(pgens) - 1, 1))
+        rate_indiv = np.divide(
+            en_exp,
+            rtt_s,
+            out=np.zeros_like(en_exp, dtype=float),
+            where=rtt_s > 0,
+        )
+        finite_rates = rate_indiv[np.isfinite(rate_indiv) & (rate_indiv > 0)]
+        zero_count = int(np.count_nonzero(np.isfinite(rate_indiv) & (rate_indiv == 0)))
+        rate_distributions.append((pgen_val, finite_rates, zero_count))
+
+    if not rate_distributions:
+        plt.close(fig)
+        return
+    positive_distributions = [
+        rates for _, rates, _ in rate_distributions if rates.size > 0
+    ]
+    if not positive_distributions:
+        plt.close(fig)
+        return
+    finite_rates = np.concatenate(positive_distributions)
+    max_rate = max(float(finite_rates.max()), 1.0)
+    bins = np.linspace(0.0, max_rate, 31)
+    zero_summary = []
+    for idx, (pgen_val, rate_indiv, zero_count) in enumerate(rate_distributions):
+        color = cmap(idx / max(len(rate_distributions) - 1, 1))
+        if rate_indiv.size == 0:
+            zero_summary.append(rf"$p_{{gen}}={pgen_val:.1f}$: {zero_count}")
+            continue
         ax.hist(
-            en_exp, bins=np.linspace(0.0, 1.0, 31), alpha=0.4, color=color,
+            rate_indiv, bins=bins, alpha=0.4, color=color,
             label=f"$p_{{gen}} = {pgen_val:.1f}$", edgecolor="none"
         )
+        zero_summary.append(rf"$p_{{gen}}={pgen_val:.1f}$: {zero_count}")
 
     ax.set_xlabel(
-        r"Generated EPR Entanglement $E_N$ [e-bits] "
-        r"(0 = failed generation / unavailable link)"
+        r"Individual rate $R_i = E_N(i) / t_{\mathrm{rtt}}(i)$ [e-bits/s]"
     )
     ax.set_ylabel(r"Number of Generation Attempts")
     ax.set_title(
-        f"Distribution of Generated EPR Entanglement $E_N$ per Attempt\n"
+        f"Distribution of Individual EPR Rates $E_N/t_{{\\mathrm{{rtt}}}}$\n"
         f"(Repeater link availability; $T_{{\\mathrm{{coh}}}} = 1$ ms, "
         f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
         fontsize=12,
         fontweight="bold"
     )
     ax.grid(True, linestyle="--", alpha=0.3)
+    ax.text(
+        0.02, 0.98,
+        "Zero-rate attempts ($E_N/t_{rtt}=0$):\n" + "\n".join(zero_summary),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+    )
     ax.legend(title="$p_{gen}$", fontsize=9, loc="upper right")
-    ax.set_xlim(0.0, 1.0)
+    ax.set_xlim(0.0, max_rate)
     ax.set_ylim(bottom=0)
 
     plt.tight_layout()
@@ -752,8 +787,52 @@ def plot_en_distribution_individual_by_pgen(
     label: str,
     target_pswap: float = 1.0,
 ):
-    """Generate one 4d distribution plot per pgen, with one curve per Tcoh."""
-    outdir = os.path.join(OUTPUT_DIR, "4d_en_distributions")
+    """Generate one 4d distribution plot for each pgen and retained Tcoh."""
+    _plot_rate_distributions_4d(
+        df_gen_master, label, target_pswap, "4d_en_distributions", 1.0, False
+    )
+
+
+def _effective_attempt_denominators(
+    df_gen_master: pd.DataFrame, target_pswap: float
+) -> dict[float, float]:
+    """Return M'=(1-frac_post)*M using the summary's >2 s stall rule."""
+    df_p = df_gen_master[
+        df_gen_master["pswap"]
+        == min(
+            df_gen_master["pswap"].unique(),
+            key=lambda value: abs(value - target_pswap),
+        )
+    ]
+    denominators = {}
+    for pgen_val, group in df_p.groupby("pgen"):
+        attempts = len(group)
+        if attempts == 0:
+            denominators[pgen_val] = 1.0
+            continue
+        timestamps = group["ts_gen"].to_numpy(dtype=float)
+        successful = group["bit_success_gen"].to_numpy() == 1
+        gaps_ms = np.concatenate([[0.0], np.diff(timestamps) / 1e6])
+        warm_successes = successful & (gaps_ms < STALL_GAP_MS)
+        success_count = int(successful.sum())
+        frac_post = (
+            1.0 - warm_successes.sum() / success_count
+            if success_count else 0.0
+        )
+        denominators[pgen_val] = max((1.0 - frac_post) * attempts, 1.0)
+    return denominators
+
+
+def _plot_rate_distributions_4d(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    target_pswap: float,
+    output_folder: str,
+    denominator_scale: float | dict[float, float],
+    scaled: bool,
+):
+    """Render one rate-distribution figure per pgen/Tcoh combination."""
+    outdir = os.path.join(OUTPUT_DIR, output_folder)
     os.makedirs(outdir, exist_ok=True)
     _style()
 
@@ -769,20 +848,29 @@ def plot_en_distribution_individual_by_pgen(
     if df_p.empty:
         return
 
-    bins = np.linspace(0.0, 1.0, 31)
-    colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(TCOH_VALUES_NS)))
+    retained_tcoh = [
+        (t, name) for t, name in zip(TCOH_VALUES_NS, TCOH_LABELS)
+        if t > 100.0e3 or np.isinf(t)
+    ]
 
     for pgen_val in sorted(df_p["pgen"].unique()):
         df_cell = df_p[df_p["pgen"] == pgen_val]
         rtt_vals = df_cell["ts_rtt"].to_numpy(dtype=float)
+        rtt_s = rtt_vals / 1.0e9
         if "w_rtt" in df_cell.columns:
             w0_vals = df_cell["w_rtt"].to_numpy(dtype=float)
         else:
             w0_vals = np.ones_like(rtt_vals)
-        w0_vals = np.where(df_cell["bit_success_gen"].to_numpy() == 1, w0_vals, 0.0)
+        w0_vals = np.where(
+            df_cell["bit_success_gen"].to_numpy() == 1, w0_vals, 0.0
+        )
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for color, t_coh, tcoh_label in zip(colors, TCOH_VALUES_NS, TCOH_LABELS):
+        scale = (
+            denominator_scale[pgen_val]
+            if isinstance(denominator_scale, dict)
+            else denominator_scale
+        )
+        for t_coh, tcoh_label in retained_tcoh:
             if np.isinf(t_coh):
                 w_exp = w0_vals
             else:
@@ -790,39 +878,69 @@ def plot_en_distribution_individual_by_pgen(
 
             en_exp = compute_en(w_exp)
             en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-            en_exp[en_exp < 0.3] = 0.0
-            ax.hist(
+            rate_indiv = np.divide(
                 en_exp,
-                bins=bins,
-                alpha=0.35,
-                color=color,
-                label=rf"$T_{{coh}} = {tcoh_label}$",
-                edgecolor="none",
+                rtt_s,
+                out=np.zeros_like(en_exp, dtype=float),
+                where=rtt_s > 0,
             )
+            zero_count = int(
+                np.count_nonzero(np.isfinite(rate_indiv) & (rate_indiv == 0))
+            )
+            positive_rates = rate_indiv[
+                np.isfinite(rate_indiv) & (rate_indiv > 0)
+            ] / scale
 
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(bottom=0)
-        ax.set_xlabel(
-            r"Generated EPR Entanglement $E_N$ [e-bits] "
-            r"(0 = failed generation / unavailable link)"
-        )
-        ax.set_ylabel("Number of Generation Attempts (Successes and Failures)")
-        ax.set_title(
-            f"Generated EPR Entanglement Distribution per Attempt\n"
-            f"($p_{{gen}} = {pgen_val:.1f}$, "
-            f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
-            fontsize=12,
-            fontweight="bold",
-        )
-        ax.grid(True, linestyle="--", alpha=0.3)
-        ax.legend(title="$T_{coh}$", fontsize=9, loc="upper right")
-        plt.tight_layout()
-        path = os.path.join(
-            outdir, f"4d_en_dist_pgen_{pgen_val:.1f}_{label}.png"
-        )
-        plt.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  [+] Individual 4d plot saved to: {path}")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            max_rate = max(float(positive_rates.max()), 1.0) if positive_rates.size else 1.0
+            if positive_rates.size:
+                ax.hist(
+                    positive_rates, bins=np.linspace(0.0, max_rate, 31),
+                    alpha=0.65, color="tab:blue", edgecolor="none"
+                )
+            rate_label = (
+                r"$R_i/M'$" if scaled else
+                r"$R_i = E_N(i)/t_{\mathrm{rtt}}(i)$"
+            )
+            ax.set_xlabel(f"Individual rate {rate_label} [e-bits/s]")
+            ax.set_ylabel("Number of Positive-rate Generation Attempts")
+            ax.set_title(
+                f"{'4d_2 normalized' if scaled else '4d'} EPR Rate Distribution\n"
+                f"($p_{{gen}} = {pgen_val:.1f}$, "
+                f"$T_{{coh}} = {tcoh_label}$, "
+                f"$P_{{\\mathrm{{swap}}}} = {best_pswap:.1f}$, {label})",
+                fontsize=12, fontweight="bold",
+            )
+            ax.grid(True, linestyle="--", alpha=0.3)
+            zero_label = (
+                r"Zero-rate attempts ($E_N/t_{rtt}=0$): "
+                if not scaled else
+                r"Zero-rate attempts ($E_N/(t_{rtt}M')=0$): "
+            )
+            ax.text(
+                0.02, 0.98, zero_label + str(zero_count),
+                transform=ax.transAxes, ha="left", va="top", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.4",
+                          facecolor="white", alpha=0.85),
+            )
+            if scaled:
+                ax.text(
+                    0.02, 0.84,
+                    rf"$M'={scale:.1f}$",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.4",
+                              facecolor="white", alpha=0.85),
+                )
+            plt.tight_layout()
+            suffix = "4d_2" if scaled else "4d"
+            path = os.path.join(
+                outdir,
+                f"{suffix}_en_dist_pgen_{pgen_val:.1f}_"
+                f"tcoh_{tcoh_label.replace(' ', '_')}_{label}.png",
+            )
+            plt.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [+] {suffix} plot saved to: {path}")
 
 
 def plot_en_mean_heatmap_pswap(
@@ -887,7 +1005,6 @@ def plot_en_mean_heatmap_pswap(
             en_exp = compute_en(w_exp)
 
             en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-            en_exp[en_exp < 0.3] = 0.0
 
             en_matrix[i, j] = np.sum(en_exp) / n_attempts
 
@@ -922,6 +1039,108 @@ def plot_en_mean_heatmap_pswap(
     print(f"  [+] Plot 4b EN-mean Heatmap saved: {path}")
 
 
+def plot_en_mean_heatmap_4f(
+    df_gen_master: pd.DataFrame,
+    label: str,
+    outdir: str,
+    target_pswap: float = 1.0,
+):
+    """Plot 4f: individual entanglement rate heatmap normalized by M'."""
+    path = os.path.join(
+        outdir, f"04f_en_mean_heatmap_mprime_pswap{target_pswap:.1f}_{label}.png"
+    )
+    _style()
+
+    required = {"pgen", "pswap", "bit_success_gen"}
+    if df_gen_master.empty or not required.issubset(df_gen_master.columns):
+        return
+
+    available_pswaps = df_gen_master["pswap"].unique()
+    if len(available_pswaps) == 0:
+        return
+    best_pswap = min(available_pswaps, key=lambda x: abs(x - target_pswap))
+    df_p = df_gen_master[df_gen_master["pswap"] == best_pswap].copy()
+    if df_p.empty:
+        return
+
+    denominators = _effective_attempt_denominators(df_gen_master, target_pswap)
+    pgens = sorted(df_p["pgen"].unique())
+    en_matrix = np.zeros((len(TCOH_VALUES_NS), len(pgens)))
+
+    for j, pgen_val in enumerate(pgens):
+        df_cell = df_p[df_p["pgen"] == pgen_val]
+        m_prime = denominators.get(pgen_val, 0.0)
+        if df_cell.empty or m_prime <= 0.0:
+            continue
+
+        if "t_gen_s" in df_cell.columns:
+            t_gen_s = df_cell["t_gen_s"].to_numpy(dtype=float)
+        elif "t_gen_total_ns" in df_cell.columns:
+            t_gen_s = df_cell["t_gen_total_ns"].to_numpy(dtype=float) / 1.0e9
+        elif "t_gen_ns" in df_cell.columns:
+            t_gen_s = df_cell["t_gen_ns"].to_numpy(dtype=float) / 1.0e9
+        elif "ts_rtt" in df_cell.columns:
+            t_gen_s = df_cell["ts_rtt"].to_numpy(dtype=float) / 1.0e9
+        else:
+            continue
+
+        rtt_ns = df_cell["ts_rtt"].to_numpy(dtype=float) if "ts_rtt" in df_cell.columns else t_gen_s * 1.0e9
+        rtt_vals = rtt_ns
+        valid_t_gen = np.isfinite(t_gen_s) & (t_gen_s > 0)
+        if "w_rtt" in df_cell.columns:
+            w0_vals = df_cell["w_rtt"].to_numpy(dtype=float)
+        else:
+            w0_vals = np.ones_like(rtt_vals)
+        w0_vals = np.where(
+            df_cell["bit_success_gen"].to_numpy() == 1, w0_vals, 0.0
+        )
+
+        for i, t_coh in enumerate(TCOH_VALUES_NS):
+            if np.isinf(t_coh):
+                w_exp = w0_vals
+            else:
+                w_exp = w0_vals * np.exp(-rtt_vals / t_coh)
+            en_exp = compute_en(w_exp)
+            en_exp[w_exp <= (1.0 / 3.0)] = 0.0
+            indiv_rate = np.divide(
+                en_exp,
+                t_gen_s,
+                out=np.zeros_like(en_exp, dtype=float),
+                where=valid_t_gen,
+            )
+            en_matrix[i, j] = np.sum(indiv_rate) / m_prime
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(
+        en_matrix,
+        annot=True,
+        fmt=".1f",
+        cmap="YlOrRd",
+        vmin=0.0,
+        xticklabels=[f"{p:.1f}" for p in pgens],
+        yticklabels=TCOH_LABELS,
+        cbar_kws={
+            "label": r"$\langle R_{\mathrm{indiv}}\rangle_{M'}$ [e-bits/s]"
+        },
+    )
+    plt.xlabel(r"Generation Probability ($p_{\mathrm{gen}}$)", fontsize=11, labelpad=10)
+    plt.ylabel(r"Coherence Time ($T_{\mathrm{coh}}$)", fontsize=11, labelpad=10)
+    plt.title(
+        r"Effective Individual Rate $\langle R_{\mathrm{indiv}}\rangle_{M'}"
+        r" = \frac{1}{M'} \sum_i \frac{E_N(i)}{t_{\mathrm{gen}}(i)}$" + "\n" +
+        f"(Pswap = {best_pswap:.1f}, {label}, "
+        r"$M'=(1-\mathrm{frac}_{\mathrm{post}})M$, "
+        r"$E_N=0$ if $w \leq 1/3$)",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  [+] Plot 4f M'-normalized EN heatmap saved: {path}")
+
+
 def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float, outdir: str, t_coh_ns: float = 1.0e6):
     """
     Plot 5: Heatmap of observed entanglement rate [e-bits/s] over the
@@ -939,7 +1158,6 @@ def plot_rate_pgen_pswap_heatmap(df_master: pd.DataFrame, label: str, w0: float,
     
     # Aplicar umbral físico
     en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-    en_exp[en_exp < 0.3] = 0.0
     
     df_calc["en"] = en_exp
     df_calc["en_ok"] = np.where(df_calc["pswap_success_bit"] == 1, df_calc["en"], 0.0)
@@ -1103,7 +1321,6 @@ def plot_texp_en_density_heatmap(df_master: pd.DataFrame, label: str, w0: float,
     
     en_exp = compute_en(w_exp)
     en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-    en_exp[en_exp < 0.3] = 0.0
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
@@ -1223,7 +1440,6 @@ def print_summary(pswap_data: dict, sorted_pswaps: list, label: str,
         w_exp = compute_w_experimental(df_ok["t_exp_ns"].values, 1.0e6, w0=w0)
         en = compute_en(w_exp)
         en[w_exp <= (1.0 / 3.0)] = 0.0
-        en[en < 0.3] = 0.0
 
         en_mean = en.mean()
         rate = en.sum() / SIMULATION_DURATION_S
@@ -1325,7 +1541,6 @@ def print_summary_pgen_at_pswap1(df_master: pd.DataFrame,
             w_exp = compute_w_experimental(df_ok["t_exp_ns"].values, 1.0e6, w0=w0)
             en = compute_en(w_exp)
             en[w_exp <= (1.0 / 3.0)] = 0.0
-            en[en < 0.3] = 0.0
             en_mean = en.mean()
             rate_60 = en.sum() / SIMULATION_DURATION_S
 
@@ -1338,7 +1553,6 @@ def print_summary_pgen_at_pswap1(df_master: pd.DataFrame,
             rtt_sec = np.where(rtt > 0, rtt / 1e9, 1e-9)
             en_g = compute_en(w)
             en_g[w <= (1.0 / 3.0)] = 0.0
-            en_g[en_g < 0.3] = 0.0
             indiv_sum = np.sum(en_g / rtt_sec)
             r_per_att = indiv_sum / n_att
             r_unit = indiv_sum / n_ok_gen if n_ok_gen else np.nan
@@ -1529,7 +1743,6 @@ def main():
                 w_exp = compute_w_experimental(t_exp_ns, t_coh, w0=w0)
                 en_exp = compute_en(w_exp)
                 en_exp[w_exp <= (1.0 / 3.0)] = 0.0
-                en_exp[en_exp < 0.3] = 0.0
                 
                 en_means_mat[i, j] = en_exp.mean()
                 en_stds_mat[i, j]  = en_exp.std()
@@ -1552,6 +1765,9 @@ def main():
         )
         plot_rate_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_en_mean_heatmap_pswap(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
+        plot_en_mean_heatmap_4f(
+            df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0
+        )
         plot_rate_vs_pgen_by_tau(df_gen_master, mode_label, OUTPUT_DIR, target_pswap=1.0)
         plot_en_distribution_by_pgen(df_gen_master, mode_key, target_pswap=1.0)
         plot_en_distribution_individual_by_pgen(
