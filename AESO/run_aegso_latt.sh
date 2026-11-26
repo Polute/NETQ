@@ -144,6 +144,7 @@ for emit_mode in "${EMIT_MODES[@]}"; do
           --count "$COUNT"
           --pgen "$pgen"
           --pswap "$pswap"
+          --coherence-ns "$COHERENCE_NS"
           --attempt-timeout "$ATTEMPT_TIMEOUT"
           --swap-wait-timeout "$SWAP_WAIT_TIMEOUT"
           --cpu "$CPU"

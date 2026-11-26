@@ -153,6 +153,17 @@ def get_unique_filepath(folder, prefix, extension=".csv"):
         n += 1
 
 
+def tcoh_folder_name(coherence_ns):
+    if math.isinf(coherence_ns):
+        return "tcoh_inf"
+    value = float(coherence_ns)
+    if value.is_integer():
+        value = str(int(value))
+    else:
+        value = f"{value:g}"
+    return f"tcoh_ns{value}"
+
+
 def resource_werner_ns(age_ns, t1_ns, w0):
     age_ns = max(0.0, float(age_ns))
     if t1_ns <= 0:
@@ -244,8 +255,11 @@ def run_repeater(args):
     sock_b.sendto(READY_SIG, links["B"].addr)
     print(f"[Repeater] READY sent. Starting swaps.")
 
-    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
-              f"/pgen{str(args.pgen).replace('.', '_')}")
+    folder = os.path.join(
+        f"aegso_report_pswap{str(args.pswap).replace('.', '_')}",
+        f"pgen{str(args.pgen).replace('.', '_')}",
+        tcoh_folder_name(args.coherence_ns),
+    )
     out_path = get_unique_filepath(folder, "repeater_swap")
     out_gen_path = get_unique_filepath(folder, "repeater_gen")
 
@@ -423,8 +437,11 @@ def run_client(args):
         sock.close()
         return 2
 
-    folder = (f"aegso_report_pswap{str(args.pswap).replace('.', '_')}"
-              f"/pgen{str(args.pgen).replace('.', '_')}")
+    folder = os.path.join(
+        f"aegso_report_pswap{str(args.pswap).replace('.', '_')}",
+        f"pgen{str(args.pgen).replace('.', '_')}",
+        tcoh_folder_name(args.coherence_ns),
+    )
     out_path = get_unique_filepath(folder, prefix)
     out_gen_path = get_unique_filepath(folder, gen_prefix)
 
@@ -594,6 +611,8 @@ def parse_args():
     cli.add_argument("--pswap", type=float, default=1.00)
     cli.add_argument("--pgen", type=float, default=1.0,
                      help="For directory naming only; repeater rolls pgen.")
+    cli.add_argument("--coherence-ns", type=float, default=10000000.0,
+                     help="For directory naming only; repeater applies coherence.")
     cli.add_argument("--attempt-timeout", type=float, default=0.5)
     cli.add_argument("--swap-wait-timeout", type=float, default=0.05)
     cli.add_argument("--cpu", type=int, default=None)

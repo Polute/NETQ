@@ -22,6 +22,7 @@ Outputs (in 'analysis_AEGSO/'):
   2b. gen_rtt vs pswap (Scatter points only, non-negative error bars)
   3. Pswap vs Entanglement Rate (10 lines, one per pgen)
   4. Individual Rate Heatmap (pgen x Tcoh for fixed Pswap=1.0)
+  4f. Effective Individual Rate Heatmap normalized by M'
   5. 60s-Normalized Rate Heatmap (pgen x pswap, YlOrRd colormap)
   6. gen_rtt histogram
   7. pswap success rate bar chart
@@ -56,19 +57,19 @@ SIMULATION_DURATION_S = 60.0  # Normalized duration per simulation run
 
 TCOH_VALUES_NS = [
     np.inf,
-    60.0e9,    # 1 min
-    1.0e9,     # 1 s
-    500.0e6,   # 500 ms
+    100.0e6,   # 100 ms
+    5.0e6,     # 5 ms
     1.0e6,     # 1 ms
     500.0e3,   # 500 µs
+    400.0e3,   # 400 µs
     250.0e3,   # 250 µs
+    200.0e3,   # 200 µs
+    150.0e3,   # 150 µs
     100.0e3,   # 100 µs
-    50.0e3,    # 50 µs
-    1.0e3,     # 1 µs
 ]
 TCOH_LABELS = [
-    "Inf", "1 min", "1 s", "500 ms", "1 ms",
-    "500 µs", "250 µs", "100 µs", "50 µs", "1 µs",
+    "Inf", "100 ms", "5 ms", "1 ms", "500 µs", "400 µs",
+    "250 µs", "200 µs", "150 µs", "100 µs",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
